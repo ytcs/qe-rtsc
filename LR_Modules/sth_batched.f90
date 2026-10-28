@@ -112,6 +112,7 @@ CONTAINS
     COMPLEX(DP) :: key
     COMPLEX(DP), ALLOCATABLE :: dv(:,:), dr(:,:)
     LOGICAL :: reinit
+    REAL(DP) :: tscale
 #endif
     !
     done = .FALSE.
@@ -161,7 +162,10 @@ CONTAINS
     dv(:, :) = dvscfins(:, 1, :)
     dr(:, :) = drhoout(:, 1, :)
     sth_timing = sth_env_flag('RTSC_STH_TIME')
-    CALL sth_engine_solve(first_iter, thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
+    ! RTSC_STH_THRESH_SCALE (diagnostic only, changes the answer): the engine solves to scale*thresh
+    tscale = 1.d0
+    CALL env_real('RTSC_STH_THRESH_SCALE', tscale)
+    CALL sth_engine_solve(first_iter, tscale * thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
     drhoout(:, 1, :) = dr(:, :)
     DEALLOCATE(dv, dr)
     tot64 = tot64 + sth_n64; tot32 = tot32 + sth_n32
