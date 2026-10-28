@@ -74,6 +74,7 @@ set(sources
     ccg_psi.f90
     ccgsolve_all.f90
     ch_psi_all_complex.f90
+    sth_dump.f90
     response_kernels.f90
     efermi_shift.f90
     dfpt_kernels.f90)

@@ -78,6 +78,7 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    USE apply_dpot_mod,        ONLY : apply_dpot_bands
    USE lr_nc_mag,             ONLY : lr_apply_time_reversal
    USE incdrhoscf_mod,        ONLY : incdrhoscf, incdrhoscf_nc
+   USE sth_dump,              ONLY : sth_dump_begin, sth_dump_end
    !
    IMPLICIT NONE
    !
@@ -136,6 +137,9 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    !
    exclude_hubbard_ = .FALSE.
    IF (PRESENT(exclude_hubbard)) exclude_hubbard_ = exclude_hubbard
+   !
+   ! rtsc: optional offline dump of this call (RTSC_STH_DUMP); no effect when unset
+   CALL sth_dump_begin(first_iter, npert, lrdvpsi, iudvpsi, thresh, dvscfins, drhoout)
    !
    !  change the sign of the magnetic field if required
    !
@@ -284,6 +288,8 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
          ENDIF
       ENDDO ! ipert
    ENDDO ! ik
+   !
+   CALL sth_dump_end(npert, drhoout, tot_num_iter, tot_cg_calls)
    !
    CALL mp_sum(tot_num_iter, inter_pool_comm)
    CALL mp_sum(tot_cg_calls, inter_pool_comm)
