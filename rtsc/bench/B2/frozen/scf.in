@@ -1,0 +1,36 @@
+&control
+    calculation = 'scf'
+    prefix = 'Mg2IrH6'
+    pseudo_dir = '@PSEUDO@'
+    outdir = './'
+/
+&system
+    ibrav = 2
+    celldm(1) = 12.569178
+    nat = 9
+    ntyp = 3
+    ecutwfc = 80
+    occupations = 'smearing'
+    smearing = 'mp'
+    degauss = 0.02
+/
+&electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.7
+/
+ATOMIC_SPECIES
+ Mg 24.305 Mg_ONCV_PBE-1.2.upf
+ Ir 192.217 Ir_ONCV_PBE-1.2.upf
+ H 1.008 H_ONCV_PBE-1.2.upf
+ATOMIC_POSITIONS alat
+ Ir 0.0000000000 0.0000000000 0.0000000000
+ Mg 0.2500000000 0.2500000000 0.2500000000
+ Mg -0.2500000000 -0.2500000000 -0.2500000000
+ H 0.2586560000 0.0000000000 0.0000000000
+ H -0.2586560000 0.0000000000 0.0000000000
+ H 0.0000000000 0.2586560000 0.0000000000
+ H 0.0000000000 -0.2586560000 0.0000000000
+ H 0.0000000000 0.0000000000 0.2586560000
+ H 0.0000000000 0.0000000000 -0.2586560000
+K_POINTS automatic
+12 12 12 0 0 0

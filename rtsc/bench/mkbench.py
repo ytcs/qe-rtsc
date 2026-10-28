@@ -28,6 +28,28 @@ SYSTEMS = {
             smoke=dict(kscf=12, kq=3, kf=12, qf=6, temps=(20, 50), nstemp=2),
         ),
     ),
+    "B2": dict(
+        prefix="Mg2IrH6",
+        # Fm-3m, a = 6.6513 A from the SG15/PBE vc-relax (B2/Mg2IrH6_relaxed.cif); Ir-H = 1.7204 A.
+        cell="ibrav = 2\n    celldm(1) = 12.569178",
+        nat=9, ntyp=3,
+        species=[("Mg", 24.305, "Mg_ONCV_PBE-1.2.upf"), ("Ir", 192.217, "Ir_ONCV_PBE-1.2.upf"),
+                 ("H", 1.008, "H_ONCV_PBE-1.2.upf")],
+        units="alat",
+        positions=[("Ir", 0, 0, 0), ("Mg", 0.25, 0.25, 0.25), ("Mg", -0.25, -0.25, -0.25),
+                   ("H", 0.258656, 0, 0), ("H", -0.258656, 0, 0), ("H", 0, 0.258656, 0),
+                   ("H", 0, -0.258656, 0), ("H", 0, 0, 0.258656), ("H", 0, 0, -0.258656)],
+        ecutwfc=80, degauss=0.02, nbnd=40,
+        # Bands 1-12: Mg 2s2p + Ir 5s5p semicore. Bands 13-21: H-s bonding + Ir t2g (filled);
+        # 22-23: Ir-eg*/H-s antibonding, crossing E_F (10.95 eV). Band 24 starts at E_F+1.17 eV,
+        # so the frozen window stops at E_F+1.1 eV. H phonons reach ~250 meV: wscut 2 eV.
+        wannier=dict(nbndsub=11, dis_froz_max=12.05, exclude="1-12", proj=["Ir:d", "H:s"]),
+        wscut=2.0,
+        grids=dict(
+            frozen=dict(kscf=12, kq=4, kf=32, qf=16, temps=(60, 200), nstemp=8),
+            smoke=dict(kscf=6, kq=2, kf=8, qf=4, temps=(80, 160), nstemp=2),
+        ),
+    ),
 }
 
 
@@ -36,7 +58,7 @@ def species_block(s):
 
 
 def positions_block(s):
-    return "ATOMIC_POSITIONS crystal\n" + "".join(
+    return f"ATOMIC_POSITIONS {s.get('units', 'crystal')}\n" + "".join(
         f" {el} {x:.10f} {y:.10f} {z:.10f}\n" for el, x, y, z in s["positions"])
 
 
@@ -113,7 +135,7 @@ def epw(s, g):
   limag = .true.
   lpade = .true.
   conv_thr_iaxis = 1.0d-4
-  wscut = 1.0
+  wscut = {s.get('wscut', 1.0)}
   temps = {g["temps"][0]} {g["temps"][1]}
   nstemp = {g["nstemp"]}
   nsiter = 500
