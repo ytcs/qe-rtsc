@@ -135,7 +135,7 @@ def follow(s, ph, dim, q, band, calc, amp=0.15):
         disp.append(d)
     disp = np.array(disp)
     disp *= amp / max(np.linalg.norm(disp, axis=1).max(), 1e-12)
-    sc.translate_sites(list(range(len(sc))), disp, frac_coords=False, to_unit_cell=True)
+    sc = Structure(sc.lattice, sc.species, sc.cart_coords + disp, coords_are_cartesian=True, to_unit_cell=True)
     at, n, ok = relax(AseAtomsAdaptor.get_atoms(sc), calc)
     child = AseAtomsAdaptor.get_structure(at)
     try:
