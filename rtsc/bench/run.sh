@@ -2,6 +2,8 @@
 # Timed T_c pipeline (MILESTONE-1.md). Usage:
 #   run.sh <inputs dir> <bin dir> <workdir> [mpi ranks] [omp threads] [pool flags]
 # Writes <workdir>/timings.tsv: stage, seconds.
+# FROM=<stage> resumes at that stage (scf, ph, collect, nscf, epw) and appends to timings.tsv;
+# resumed runs are for debugging only and never count as a timed result.
 set -euo pipefail
 HERE=$(dirname "$(realpath "$0")")
 IN=$(realpath "$1"); BIN=$(realpath "$2"); W=$3; NP=${4:-1}; NT=${5:-1}; POOL=${6:-}
@@ -12,8 +14,9 @@ sed -i "s|@PSEUDO@|$PSEUDO_DIR|" *.in
 export OMP_NUM_THREADS=$NT
 MPI="mpirun --bind-to none -np $NP"
 prefix=$(grep -oP "prefix\s*=\s*'\K[^']+" scf.in)
-: > timings.tsv
-stage() { local name=$1; shift; local t0=$(date +%s.%N); "$@"; local t1=$(date +%s.%N)
+FROM=${FROM:-scf}; live=0
+[ "$FROM" = scf ] && : > timings.tsv || echo "# resumed from $FROM" >> timings.tsv
+stage() { local name=$1; shift; [ "$name" = "$FROM" ] && live=1; [ $live = 1 ] || return 0; local t0=$(date +%s.%N); "$@"; local t1=$(date +%s.%N)
           awk -v n="$name" -v a="$t0" -v b="$t1" 'BEGIN{printf "%s\t%.2f\n", n, b-a}' | tee -a timings.tsv; }
 T0=$(date +%s.%N)
 stage scf  bash -c "$MPI $BIN/pw.x $POOL -in scf.in > scf.out"
