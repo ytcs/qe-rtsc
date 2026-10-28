@@ -1824,6 +1824,18 @@
     WRITE(stdout, '(5x)')
     CALL print_clock('ELIASHBERG')
     CALL print_clock('eliash_gpu')
+    CALL print_clock('el_init')
+    CALL print_clock('el_readfreq')
+    CALL print_clock('el_readeig')
+    CALL print_clock('el_readkq')
+    CALL print_clock('el_readeph')
+    CALL print_clock('el_finda2f')
+    CALL print_clock('el_reada2f')
+    CALL print_clock('el_aniso')
+    CALL print_clock('qwindow')
+    CALL print_clock('write_ephmat')
+    CALL print_clock('write_dos')
+    CALL print_clock('write_phdos')
     !
     ! Real-Time Boltzmann Transport Equation
     WRITE(stdout, '(5x)')

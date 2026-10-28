@@ -781,7 +781,9 @@
     ! Store the result in the selecq.fmt file
     ! If the file exists, automatically restart from the file
     ! -----------------------------------------------------------------------
+    CALL start_clock('qwindow')
     CALL qwindow_wrap(totq, nrr_k, irvec_r, cufkk, cufkq)
+    CALL stop_clock('qwindow')
     !
     ! -----------------------------------------------------------------------
     ! Possible restart during step 1)
@@ -1464,10 +1466,14 @@
               CALL kqmap_fine
               CALL count_kpoints
               CALL file_open_ephmat(lrepmatw2_restart)
+              CALL start_clock('write_ephmat')
               CALL write_ephmat(iqq, iq, lrepmatw2_restart, first_cycle)
+              CALL stop_clock('write_ephmat')
               first_cycle = .FALSE.
             ELSE
+              CALL start_clock('write_ephmat')
               CALL write_ephmat(iqq, iq, lrepmatw2_restart, first_cycle)
+              CALL stop_clock('write_ephmat')
             ENDIF
           ENDIF
           !
@@ -1645,13 +1651,17 @@
       IF (dos_tetra) THEN
         CALL write_dos_tetra(ef, nelec)
       ELSE 
+        CALL start_clock('write_dos')
         CALL write_dos(ef, nelec)
+        CALL stop_clock('write_dos')
       ENDIF
     ENDIF
     IF (((.NOT. band_plot) .AND. eliashberg) .OR. a2f .OR. a2f_iso) THEN
       ! HM: In write_phdos, the frequencies will be calculated
       !     for all the q points, including points excluded in qwindow.
+      CALL start_clock('write_phdos')
       CALL write_phdos(nrr_q, irvec_q, ndegen_q, nrws, rws)
+      CALL stop_clock('write_phdos')
     ENDIF
     !
     IF (phonselfen) THEN
