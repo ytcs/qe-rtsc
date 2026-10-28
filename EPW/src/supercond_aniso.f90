@@ -1229,6 +1229,8 @@
       ENDIF
       !
       CALL memlt_eliashberg(itemp, 'imag')
+      ! rtsc: the GPU sum builds the kernel per (k,q) pair in shared memory, so akeri is not needed
+      IF (rtsc_eliash_gpu()) limag_fly = .TRUE.
       IF (.NOT. limag_fly) CALL kernel_aniso_iaxis(itemp)
       !
     ENDIF ! iter
@@ -1718,6 +1720,13 @@
     USE parallelism,       ONLY : fkbounds
     USE low_lvl,           ONLY : mem_size_eliashberg
     USE ep_constants,      ONLY : pi, zero, one
+#if defined (__CUDA)
+    USE epw_gpu_eliash,    ONLY : ege_fsr
+    USE supercond_common,  ONLY : g2
+    USE global_var,        ONLY : wf, gtemp
+    USE modes,             ONLY : nmodes
+    USE input,             ONLY : eps_acoustic
+#endif
     !
     IMPLICIT NONE
     !
@@ -1764,6 +1773,19 @@
     inv_dos = one / dosef
     !
     CALL fkbounds(nkfs, lower_bnd, upper_bnd)
+    !
+#if defined (__CUDA)
+    ! rtsc: GPU path (same sums, kernel rebuilt per pair in shared memory)
+    IF (rtsc_eliash_gpu()) THEN
+      CALL start_clock('eliash_gpu')
+      CALL ege_fsr(upper_bnd - lower_bnd + 1, lower_bnd, nkfs, nbndfs, MAXVAL(nqfs(:)), nmodes, &
+                   SIZE(wqf), nsiw(itemp), 2 * (wsn(nsiw(itemp)) + 1), g2, wf, ixkqf, ixqfs, nqfs, &
+                   ekfs, w0g, wqf, wsi, wsn, dwsi, adeltaip, naznormi, aznormi, adeltai, ef0, &
+                   fsthick, eps_acoustic, dosef, pi * gtemp(itemp), inv_dos, 2.d0 * muc * spin_fac)
+      CALL stop_clock('eliash_gpu')
+      RETURN
+    ENDIF
+#endif
     !
     ! get the size of required memory for inv_wsi
     imelt = nsiw(itemp)
@@ -6021,5 +6043,23 @@
     !-----------------------------------------------------------------------
     !
   !-----------------------------------------------------------------------
+    !
+    !-----------------------------------------------------------------------
+    LOGICAL FUNCTION rtsc_eliash_gpu()
+    !-----------------------------------------------------------------------
+    !! rtsc: .TRUE. when the GPU Eliashberg sum applies (FSR, uniform positive Matsubara
+    !! sampling, at most 1024 frequencies) and RTSC_EPW_ELIASH is not '0'.
+    USE input,            ONLY : fbw, positive_matsu, gridsamp
+    USE supercond_common, ONLY : nsiw
+    USE global_var,       ONLY : gtemp
+    CHARACTER(LEN = 16) :: v
+    rtsc_eliash_gpu = .FALSE.
+#if defined (__CUDA)
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH', v)
+    rtsc_eliash_gpu = (TRIM(v) /= '0') .AND. (.NOT. fbw) .AND. positive_matsu .AND. (gridsamp <= 1) &
+                      .AND. (MAXVAL(nsiw(:)) <= 1024)
+#endif
+    END FUNCTION rtsc_eliash_gpu
+    !
   END MODULE supercond_aniso
   !-----------------------------------------------------------------------

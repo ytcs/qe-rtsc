@@ -82,7 +82,7 @@
                             setup_rotate_wavefunction, write_qmap,          &
                             calc_rotation_gauge, rotate_wfn_deallocate
   USE pw2wan,        ONLY : compute_pmn_para
-  USE ep_coarse,     ONLY : ep_coarse_compute, dvscf_read
+  USE ep_coarse,     ONLY : ep_coarse_compute, dvscf_read, ep_coarse_gpu_ok
   USE noncollin_module, ONLY : m_loc, npol, noncolin, lspinorb, nspin_mag
   USE ldaU,          ONLY : lda_plus_u, Hubbard_lmax, lda_plus_u_kind
   USE ldaU_ph,       ONLY : dnsbare
@@ -1025,24 +1025,38 @@
         ALLOCATE(el_ph_mat(nbndep, nbndep, nk_loc, 3 * nat), STAT = ierr)
         IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating el_ph_mat', 1)
         el_ph_mat(:, :, :, :) = czero
-        DO irr = 1, nirr
-          npe = npert(irr)
-          ALLOCATE(dvscfins(dffts%nnr, nspin_mag, npe), STAT = ierr)
+        IF (ep_coarse_gpu_ok()) THEN
+          ! rtsc: all modes in one pass (NC: dvscf_read and ep_coarse_compute do not depend on
+          ! the irrep split), so the per-k work (wfc read, projectors, FFTs) is done once per q
+          ALLOCATE(dvscfins(dffts%nnr, nspin_mag, 3 * nat), STAT = ierr)
           IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating dvscfins', 1)
-          !
-          ! Read the dvscf from file and add the Ewald part.
-          CALL dvscf_read(imode0, iq_irr, nqc_irr, npe, xq0, dvscfins, timerev)
-          ! Reconstruct the EPC on the full BZ from the IBZ read from file.
+          CALL dvscf_read(0, iq_irr, nqc_irr, 3 * nat, xq0, dvscfins, timerev)
           CALL start_clock('ep_coarse_c')
-          CALL ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
+          CALL ep_coarse_compute(nirr, 3 * nat, 0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
                                  isym, xq0, nqc, el_ph_mat, epmatq, timerev)
           CALL stop_clock('ep_coarse_c')
-          !
-          !
           DEALLOCATE(dvscfins, STAT = ierr)
           IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating dvscfins', 1)
-          imode0 = imode0 + npe
-        ENDDO ! irr
+        ELSE
+          DO irr = 1, nirr
+            npe = npert(irr)
+            ALLOCATE(dvscfins(dffts%nnr, nspin_mag, npe), STAT = ierr)
+            IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating dvscfins', 1)
+            !
+            ! Read the dvscf from file and add the Ewald part.
+            CALL dvscf_read(imode0, iq_irr, nqc_irr, npe, xq0, dvscfins, timerev)
+            ! Reconstruct the EPC on the full BZ from the IBZ read from file.
+            CALL start_clock('ep_coarse_c')
+            CALL ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
+                                   isym, xq0, nqc, el_ph_mat, epmatq, timerev)
+            CALL stop_clock('ep_coarse_c')
+            !
+            !
+            DEALLOCATE(dvscfins, STAT = ierr)
+            IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating dvscfins', 1)
+            imode0 = imode0 + npe
+          ENDDO ! irr
+        ENDIF
         DEALLOCATE(el_ph_mat, STAT = ierr)
         IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating el_ph_mat', 1)
         !
@@ -1123,23 +1137,37 @@
           ALLOCATE(el_ph_mat(nbndep, nbndep, nk_loc, 3 * nat), STAT = ierr)
           IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating el_ph_mat', 1)
           el_ph_mat(:, :, :, :) = czero
-          DO irr = 1, nirr
-            npe = npert(irr)
-            ALLOCATE(dvscfins(dffts%nnr, nspin_mag, npe), STAT = ierr)
+          IF (ep_coarse_gpu_ok()) THEN
+            ! rtsc: all modes in one pass (NC: dvscf_read and ep_coarse_compute do not depend on
+            ! the irrep split), so the per-k work (wfc read, projectors, FFTs) is done once per q
+            ALLOCATE(dvscfins(dffts%nnr, nspin_mag, 3 * nat), STAT = ierr)
             IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating dvscfins', 1)
-            !
-            ! Read the dvscf from file and add the Ewald part.
-            CALL dvscf_read(imode0, iq_irr, nqc_irr, npe, xq0, dvscfins, timerev)
-            ! Reconstruct the EPC on the full BZ from the IBZ read from file.
+            CALL dvscf_read(0, iq_irr, nqc_irr, 3 * nat, xq0, dvscfins, timerev)
             CALL start_clock('ep_coarse_c')
-            CALL ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
+            CALL ep_coarse_compute(nirr, 3 * nat, 0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
                                    isym, xq0, nqc, el_ph_mat, epmatq, timerev)
             CALL stop_clock('ep_coarse_c')
-            !
             DEALLOCATE(dvscfins, STAT = ierr)
             IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating dvscfins', 1)
-            imode0 = imode0 + npe
-          ENDDO ! irr
+          ELSE
+            DO irr = 1, nirr
+              npe = npert(irr)
+              ALLOCATE(dvscfins(dffts%nnr, nspin_mag, npe), STAT = ierr)
+              IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating dvscfins', 1)
+              !
+              ! Read the dvscf from file and add the Ewald part.
+              CALL dvscf_read(imode0, iq_irr, nqc_irr, npe, xq0, dvscfins, timerev)
+              ! Reconstruct the EPC on the full BZ from the IBZ read from file.
+              CALL start_clock('ep_coarse_c')
+              CALL ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
+                                     isym, xq0, nqc, el_ph_mat, epmatq, timerev)
+              CALL stop_clock('ep_coarse_c')
+              !
+              DEALLOCATE(dvscfins, STAT = ierr)
+              IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating dvscfins', 1)
+              imode0 = imode0 + npe
+            ENDDO ! irr
+          ENDIF
           DEALLOCATE(el_ph_mat, STAT = ierr)
           IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating el_ph_mat', 1)
           !

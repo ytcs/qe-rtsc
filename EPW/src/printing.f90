@@ -1823,6 +1823,7 @@
     ! Eliashberg equations
     WRITE(stdout, '(5x)')
     CALL print_clock('ELIASHBERG')
+    CALL print_clock('eliash_gpu')
     !
     ! Real-Time Boltzmann Transport Equation
     WRITE(stdout, '(5x)')

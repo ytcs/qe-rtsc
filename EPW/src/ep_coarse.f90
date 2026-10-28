@@ -172,6 +172,23 @@
     !-----------------------------------------------------------------------
     END SUBROUTINE dvscf_read
     !-----------------------------------------------------------------------
+    LOGICAL FUNCTION ep_coarse_gpu_ok()
+    !-----------------------------------------------------------------------
+    !! rtsc: .TRUE. when the GPU path of ep_coarse_compute applies: CUDA build, norm-conserving,
+    !! collinear, no spin polarisation, no DFT+U, and RTSC_EPW_COARSE is not '0'.
+    USE uspp,             ONLY : okvan
+    USE noncollin_module, ONLY : noncolin, npol
+    USE ldaU,             ONLY : lda_plus_u
+    USE input,            ONLY : lsda
+    CHARACTER(LEN = 16) :: envval
+    ep_coarse_gpu_ok = .FALSE.
+#if defined (__CUDA)
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_COARSE', envval)
+    ep_coarse_gpu_ok = (TRIM(envval) /= '0') .AND. (.NOT. okvan) .AND. (.NOT. noncolin) .AND. &
+                       (.NOT. lda_plus_u) .AND. (TRIM(lsda) == 'none') .AND. (npol == 1)
+#endif
+    END FUNCTION ep_coarse_gpu_ok
+    !
     !---------------------------------------------------------------------
     SUBROUTINE ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym, eigv, &
                                  isym, xq0, nqc, el_ph_mat, epmatq, timerev)
@@ -388,7 +405,6 @@
     !! projector for S*atomic wavefunctions at k+q-point
     ! rtsc: GPU path (local part by Parseval on the GPU, nonlocal part by projections)
     LOGICAL :: use_gpu
-    CHARACTER(LEN = 16) :: envval
     INTEGER :: nt, na, mu, ih, jh, ikb, jkb, ijkb0
     INTEGER, ALLOCATABLE :: indk(:), indq(:)
     REAL(KIND = DP) :: xq_bak(3)
@@ -462,9 +478,7 @@
     ! rtsc: decide on the GPU path (NC, collinear, no spin, no DFT+U); RTSC_EPW_COARSE=0 disables it
     use_gpu = .FALSE.
 #if defined (__CUDA)
-    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_COARSE', envval)
-    use_gpu = (TRIM(envval) /= '0') .AND. (.NOT. okvan) .AND. (.NOT. noncolin) .AND. &
-              (.NOT. lda_plus_u) .AND. (TRIM(lsda) == 'none') .AND. (npol == 1)
+    use_gpu = ep_coarse_gpu_ok()
     IF (use_gpu) THEN
       ! total local perturbing potential per perturbation: dvscf + dV_loc^bare (k-independent)
       ALLOCATE(vtot(dffts%nnr, npe), deff(nhm, nhm, nat), becq(nkb, nbndep, 0:3), auxv(npwx, nkb), &
@@ -888,7 +902,7 @@
       !! dvqpsi_us3 + ZGEMM). Nonlocal part: vanilla dvqpsi_us_only3 builds
       !! dvpsi_nl = vkb ps1 + sum_a [(k+q+G)_a vkb] ps2_a; projecting on aux4 gives
       !! becq0^H ps1 + sum_a becq_a^H ps2_a with becq computed once per k (NC, no US terms).
-      INTEGER :: ipol_, ib, jb
+      INTEGER :: ipol_, ib
 #if defined (__CUDA)
       DO ig = 1, npw
         indk(ig) = dffts%nl(igk(ig))
@@ -910,13 +924,13 @@
         CALL ZGEMM('C', 'N', nkb, nbndep, npwq, cone, auxv, npwx, aux4, npwx, czero, &
                    becq(1, 1, ipol_), nkb)
       ENDDO
+      ! NC (no okvan): deff = deeq does not depend on the band energy, so compute it once per k
+      CALL compute_deff(deff, et_loc(ibndkept(1), ik))
       DO ipert = 1, npe
         mode = imode0 + ipert
         ps1(:, :) = czero
         ps2(:, :, :) = czero
         DO ib = 1, nbndep
-          jb = ibndkept(ib)
-          CALL compute_deff(deff, et_loc(jb, ik))
           ijkb0 = 0
           DO nt = 1, ntyp
             DO na = 1, nat
