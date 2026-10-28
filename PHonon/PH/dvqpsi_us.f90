@@ -68,7 +68,7 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
   !! counter on real mesh
   INTEGER :: ip, nnr, itmp
   !!
-  complex(DP) , allocatable :: dvlocin (:), aux2 (:)
+  complex(DP) , allocatable :: dvlocin (:), aux2 (:), aux3 (:)
   !
 #if defined(__CUDA)
   INTEGER, POINTER, DEVICE :: nl_d(:)
@@ -126,6 +126,42 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
   !
   !$acc update device(evc)
   !
+  IF (npol == 1 .AND. .NOT. dffts%has_task_groups) THEN
+     !
+     ! rtsc: all bands in one batched transform (same operations as the band loop below)
+     !
+     ALLOCATE(aux3(nnr * nbnd))
+     !$acc data create(aux3(1:nnr*nbnd)) present(dvlocin, dvpsi, igk_k, evc)
+     !$acc kernels
+     aux3(:) = (0.d0, 0.d0)
+     !$acc end kernels
+     !$acc parallel loop collapse(2)
+     do ibnd = 1, nbnd
+        do ig = 1, npw
+           aux3(nl_d(igk_k(ig,ikk)) + (ibnd-1)*nnr) = evc(ig, ibnd)
+        enddo
+     enddo
+     !$acc host_data use_device(aux3)
+     CALL invfft ('Wave', aux3, dffts, howmany=nbnd)
+     !$acc end host_data
+     !$acc parallel loop collapse(2)
+     do ibnd = 1, nbnd
+        do ir = 1, nnr
+           aux3(ir + (ibnd-1)*nnr) = aux3(ir + (ibnd-1)*nnr) * dvlocin(ir)
+        enddo
+     enddo
+     !$acc host_data use_device(aux3)
+     CALL fwfft ('Wave', aux3, dffts, howmany=nbnd)
+     !$acc end host_data
+     !$acc parallel loop collapse(2)
+     do ibnd = 1, nbnd
+        do ig = 1, npwq
+           dvpsi(ig, ibnd) = aux3(nl_d(igk_k(ig,ikq)) + (ibnd-1)*nnr)
+        enddo
+     enddo
+     !$acc end data
+     DEALLOCATE(aux3)
+  ELSE
   do ibnd = 1, nbnd
      do ip=1,npol
         !$acc kernels present(aux2)
@@ -175,6 +211,7 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
         end if
      enddo
   enddo
+  ENDIF
   !$acc end data
   !
   deallocate (aux2)
