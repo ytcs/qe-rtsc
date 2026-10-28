@@ -169,6 +169,8 @@
     DEALLOCATE(dvscfin, STAT = ierr)
     IF (ierr /= 0) CALL errore('dvscf_read', 'Error deallocating dvscfin', 1)
     !
+    CALL stop_clock('dvscf_read')  ! rtsc: was never stopped
+    !
     !-----------------------------------------------------------------------
     END SUBROUTINE dvscf_read
     !-----------------------------------------------------------------------

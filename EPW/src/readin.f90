@@ -131,6 +131,9 @@
   !
   IMPLICIT NONE
   !
+  CHARACTER(LEN = 16) :: rtsc_env
+  !! rtsc: environment switch
+  !
   LOGICAL :: exst
   !! Find if a file exists.
   CHARACTER(LEN = 256) :: outdir
@@ -1059,6 +1062,18 @@
   ENDIF
   !
   IF (etf_mem > 1 .OR. etf_mem < 0) CALL errore('readin', 'etf_mem can only be 0 or 1.', 1)
+#if defined (__CUDA)
+  ! rtsc: in the GPU build keep each pool's slice of epmatwp in (device) memory instead of
+  ! re-reading it from disk for every fine q (etf_mem = 1). Same interpolation, cuBLAS instead
+  ! of per-record ZAXPY. RTSC_EPW_ETFMEM=keep restores the input value.
+  IF (etf_mem == 1 .AND. (.NOT. lfast_kmesh)) THEN
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ETFMEM', rtsc_env)
+    IF (TRIM(rtsc_env) /= 'keep') THEN
+      etf_mem = 0
+      WRITE(stdout, '(/5x, a)') 'rtsc: etf_mem = 1 -> 0 (GPU build: epmatwp kept in memory)'
+    ENDIF
+  ENDIF
+#endif
   !
   IF (lwfpt) THEN
     ! ahc_nbnd and ahc_nbndskip are now read from ahc_info.dat (written by ph.x AHC).
