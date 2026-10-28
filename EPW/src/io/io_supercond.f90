@@ -2576,17 +2576,19 @@
     lrepmatw2_merge = lrepmatw2_merge + ind(my_pool_id + 1)
     !
     ! Save to file restart information in formatted way for possible restart
-    lrepmatw2_restart(:) = 0
-    lrepmatw2_restart(my_pool_id + 1) = lrepmatw2_merge
-    CALL mp_sum(lrepmatw2_restart, inter_pool_comm)
-    CALL mp_barrier(inter_pool_comm)
+    ! rtsc: only needed when restart.fmt is written (rtsc_sync, same q on every pool); vanilla
+    ! did this inter-pool mp_sum + barrier for every q
+    IF (rtsc_sync) THEN
+      lrepmatw2_restart(:) = 0
+      lrepmatw2_restart(my_pool_id + 1) = lrepmatw2_merge
+      CALL mp_sum(lrepmatw2_restart, inter_pool_comm)
+      CALL mp_barrier(inter_pool_comm)
+    ENDIF
     !
     IF (ind(my_pool_id + 1) > 0) THEN
       !WRITE(*, *) my_pool_id + 1, ind(my_pool_id + 1), lrepmatw2_merge
-      DO ifil = 1, ind(my_pool_id + 1)
-        !WRITE(iufileph, '(ES20.10)') tmp_g2(ifil)
-        WRITE(iufileph) tmp_g2(ifil)
-      ENDDO
+      ! rtsc: one WRITE for the whole q (stream access: same bytes as one WRITE per element)
+      WRITE(iufileph) tmp_g2(1:ind(my_pool_id + 1))
       !
       IF (rtsc_sync) FLUSH(iufileph)
       !
