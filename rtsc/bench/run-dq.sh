@@ -50,7 +50,9 @@ EOF
 stage q2r q2r
 export RTSC_DQ=1 RTSC_DQ_WPOT=$W/sub/w_pot/
 XR=$(env | grep -o '^RTSC_[A-Z0-9_]*' | sed 's/^/-x /' | tr '\n' ' ')
-stage ph2 run1 "$BIN"/ph.x -in ph.in > ph.out
+ph2() { rm -rf _ph0 $prefix.dyn* save   # a rerun must not pick up an earlier ph2's phsave
+        run1 "$BIN"/ph.x -in ph.in > ph.out; }
+stage ph2 ph2
 stage collect bash -c "
   rm -rf save; mkdir -p save; nq=\$(sed -n 2p $prefix.dyn0 | awk '{print \$1}')
   for i in \$(seq 1 \$nq); do
