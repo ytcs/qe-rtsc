@@ -19,7 +19,7 @@ MODULE sth_batched
   USE kinds, ONLY : DP
   IMPLICIT NONE
   PRIVATE
-  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs
+  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs, sth_batched_flush_end
   !
   LOGICAL, SAVE :: have_state = .FALSE.
   LOGICAL, SAVE :: pending = .FALSE.        ! engine dpsi not yet written to iudwf
@@ -109,7 +109,9 @@ CONTAINS
     reinit = first_iter .OR. .NOT. have_state .OR. .NOT. sth_engine_ready() .OR. npert /= st_npert &
              .OR. iudvpsi /= st_iudvpsi .OR. nksq /= st_nksq .OR. key /= st_key
     IF (reinit) THEN
-      CALL sth_batched_flush()
+      ! the previous irrep's dpsi: written now unless no later step reads it (sth_batched_flush_end)
+      IF (pending .AND. flush_needed()) CALL sth_batched_flush()
+      pending = .FALSE.
       have_state = .FALSE.
       ! per-q state (k, k+q data, vkb, h_diag, psi(r)) is kept across the irreps of one q
       IF (.NOT. sth_engine_qready() .OR. ANY(xq /= st_xq) .OR. nksq /= st_nksq) THEN
@@ -147,6 +149,25 @@ CONTAINS
     eng_last = .TRUE.
 #endif
   END SUBROUTINE sth_batched_kernel
+  !
+  !--------------------------------------------------------------------------------------------
+  LOGICAL FUNCTION flush_needed()
+    !--------------------------------------------------------------------------------------------
+    !! Does any later step read this irrep's dpsi from iudwf? Yes for q = Gamma (ef_shift_wfc_new),
+    !! for buffers on files (no reduce_io: restart), and when drhodv does not take the engine path
+    !! (RTSC_TAIL=0). Otherwise drhodv reads the engine's device dpsi (sth_batched_becs) and nothing
+    !! else reads iudwf; drhodv still flushes first if it falls back to the vanilla path.
+    USE control_lr,       ONLY : lgamma, reduce_io
+    USE sth_tail,         ONLY : sth_tail_on
+    flush_needed = lgamma .OR. .NOT. reduce_io .OR. .NOT. sth_tail_on()
+  END FUNCTION flush_needed
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_flush_end()
+    !--------------------------------------------------------------------------------------------
+    !! end of dfpt_kernel: write the engine's dpsi to iudwf if a later step reads it there
+    IF (pending .AND. flush_needed()) CALL sth_batched_flush()
+  END SUBROUTINE sth_batched_flush_end
   !
   !--------------------------------------------------------------------------------------------
   SUBROUTINE sth_batched_flush()

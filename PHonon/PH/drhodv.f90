@@ -58,7 +58,7 @@ subroutine drhodv (nu_i0, nper, drhos)
   USE control_ph,       ONLY : lmultipole
   USE control_lr,       ONLY : lgamma
   USE sth_tail,         ONLY : sth_tail_on
-  USE sth_batched,      ONLY : sth_batched_becs
+  USE sth_batched,      ONLY : sth_batched_becs, sth_batched_flush
 
   implicit none
 
@@ -120,6 +120,8 @@ subroutine drhodv (nu_i0, nper, drhos)
      CALL sth_batched_becs(nper, becq_all, alpq_all, use_eng)
      IF (.NOT. use_eng) DEALLOCATE (becq_all, alpq_all)
   ENDIF
+  ! the vanilla path reads dpsi from iudwf: write the engine's dpsi there first if still pending
+  IF (.NOT. use_eng) CALL sth_batched_flush()
   !$acc data copyin(xk, dpsi) create(aux( 1:npwx*npol , 1:nbnd)) 
   do ik = 1, nksq
      ikk = ikks(ik)

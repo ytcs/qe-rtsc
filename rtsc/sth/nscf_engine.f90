@@ -399,6 +399,11 @@ CONTAINS
     COMPLEX(dp), PARAMETER :: ONE = (1.0_dp, 0.0_dp), ZERO = (0.0_dp, 0.0_dp)
     !
     CALL SYSTEM_CLOCK(c0, cr)
+    ! clear a pending (non-sticky) CUDA error left by earlier code (as sth_engine_setup does), so that
+    ! kerr reports only this module's launches; it is printed, not hidden
+    istat = cudaGetLastError()
+    IF (istat /= cudaSuccess) WRITE(*, '(A,A)') 'nscf_engine: cleared a pending CUDA error from earlier code: ', &
+         TRIM(cudaGetErrorString(istat))
     nscf_eng_t_eig = 0
     nhpsi_tot = 0
     snv = INT(npwx, 8) * nvx
