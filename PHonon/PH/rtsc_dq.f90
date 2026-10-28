@@ -156,7 +156,7 @@ CONTAINS
     DO ipert = 1, npe
       dfpt_data%dvscfp(:, :, ipert) = dv_all(:, :, imode0 + ipert)
     ENDDO
-    CALL psymdvscf(dfpt_data%dvscfp, dfftp)
+    IF (.NOT. env_is('RTSC_DQ_NOSYM', '1')) CALL psymdvscf(dfpt_data%dvscfp, dfftp)   ! NOSYM: diagnostic
     CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     !
     ! RTSC_DQ_NITER passes (default 1): pass 1 solves from dpsi = 0 (engine: cold start; vanilla loop:
