@@ -67,6 +67,9 @@
                                s_bztoibz, spin_fac
   USE global_setups,    ONLY : use_wannier_setup, lsda_setup
   USE wannier2bloch,    ONLY : rtsc_ephwan2blochp_batch
+#if defined(__CUDA)
+  USE epw_gpu_fine,     ONLY : ef_free
+#endif
   USE wannier2bloch,    ONLY : dmewan2bloch, hamwan2bloch, dynwan2bloch,           &
                                ephwan2blochp, ephwan2bloch, vmewan2bloch,          &
                                dynifc2blochf, vmewan2blochp, rrwan2bloch,          &
@@ -1731,6 +1734,14 @@
         ENDDO  ! end loop over q points
       ENDDO  ! cycle loop QDPT
     ENDDO  ! loop over QDPT mesh
+#if defined(__CUDA)
+    ! rtsc: release the fused path's device and host caches before the solver
+    IF (ALLOCATED(rtsc_cufgc)) THEN
+      CALL ef_free()
+      DEALLOCATE(rtsc_ekc, rtsc_cufkc, rtsc_egc, rtsc_cufgc, rtsc_kwof, rtsc_goff, rtsc_gcnt)
+      IF (ALLOCATED(rtsc_g2)) DEALLOCATE(rtsc_g2)
+    ENDIF
+#endif
     !---------------------------------------------------------------------------------!
     !
     IF (plrn) CALL plrn_collect_image()
