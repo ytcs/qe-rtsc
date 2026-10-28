@@ -23,6 +23,10 @@ MODULE epw_gpu_eliash
   INTEGER, DEVICE, ALLOCATABLE :: d_ixkqf(:), d_ixqfs(:), d_nqfs(:)
   REAL(dp), DEVICE, ALLOCATABLE :: d_wsi(:), d_dwsi(:), d_adp(:), d_part(:)
   INTEGER, DEVICE, ALLOCATABLE :: d_wsn(:)
+  ! F(m, nu, q) = wf / (wf^2 + omega_m^2) (0 for wf <= eps_acoustic), per temperature
+  REAL(dp), DEVICE, ALLOCATABLE :: d_ftab(:)
+  REAL(dp) :: ftab_pit = -1.0_dp
+  INTEGER :: ftab_n2 = -1
   INTEGER(8) :: sz_static = -1
   INTEGER :: nsplit = 1
   !
@@ -44,8 +48,117 @@ CONTAINS
     !! Drop the device copies of the temperature-independent arrays.
     IF (ALLOCATED(d_g2)) DEALLOCATE(d_g2, d_wf, d_ekfs, d_w0g, d_wqf, d_ixkqf, d_ixqfs, d_nqfs)
     IF (ALLOCATED(d_wsi)) DEALLOCATE(d_wsi, d_dwsi, d_wsn, d_adp, d_part)
+    IF (ALLOCATED(d_ftab)) DEALLOCATE(d_ftab)
+    ftab_pit = -1.0_dp; ftab_n2 = -1
     sz_static = -1
   END SUBROUTINE ege_reset
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_ftab(n2, nm, nqtot, wf, eps_ac, pit, ftab)
+    !! ftab(m, nu, q) = wf(nu,q) / (wf^2 + omega_m^2), omega_m = 2 (m-1) pi T (lambdar_aniso_ver1)
+    INTEGER, VALUE :: n2, nm, nqtot
+    REAL(dp), VALUE :: eps_ac, pit
+    REAL(dp), DEVICE :: wf(nm, nqtot), ftab(n2, nm, nqtot)
+    INTEGER :: m, nu, iq
+    REAL(dp) :: w, om
+    m = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    nu = blockIdx%y
+    iq = blockIdx%z
+    IF (m > n2) RETURN
+    w = wf(nu, iq)
+    om = DBLE(2 * (m - 1)) * pit
+    IF (w > eps_ac) THEN
+      ftab(m, nu, iq) = w / (w * w + om * om)
+    ELSE
+      ftab(m, nu, iq) = 0.0_dp
+    ENDIF
+  END SUBROUTINE k_ftab
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_fsr4(nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk, &
+                                       g2, ftab, ixkqf, ixqfs, nqfs, ekfs, w0g, wqf, &
+                                       wsi, dwsi, adp, part, ef0, fsthick, dosef, inv_dos, mucs)
+    !! Uniform positive Matsubara grid (wsn(iw) = iw - 1): lambda(|n-n'|) = l(|iw-iwp|+1),
+    !! lambda(n+n'+1) = l(iw+iwp). Each thread owns 4 consecutive iw and keeps sliding register
+    !! windows over both kernel rows, so each iwp step costs 2 shared loads (plus 3 broadcasts)
+    !! for 4 outputs. The kernel row is sum_nu g2 * ftab: no divisions per pair.
+    INTEGER, VALUE :: nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk
+    REAL(dp), VALUE :: ef0, fsthick, dosef, inv_dos, mucs
+    REAL(dp), DEVICE :: g2(nkl, mq, nb, nb, nm), ftab(n2, nm, *), ekfs(nb, *), w0g(nb, *), wqf(*)
+    INTEGER, DEVICE :: ixkqf(nkl, *), ixqfs(nkl, *), nqfs(*)
+    REAL(dp), DEVICE :: wsi(nsiw), dwsi(nsiw), adp(nsiw, nb, *), part(nsiw, 3, nb, nkl, *)
+    REAL(dp), SHARED :: sh(*)
+    INTEGER :: ikl, ik, ibnd, ic, iq, iq0, iq1, iq2, kq, jbnd, m, nu, iwp, tid, nthr, i0, j
+    REAL(dp) :: weight, lam, d, e, km, w1, w2, w3, gv
+    REAL(dp) :: m0, m1, m2, m3, p0, p1, p2, p3
+    REAL(dp) :: an0, an1, an2, an3, az0, az1, az2, az3, ad0, ad1, ad2, ad3
+    !
+    ikl = blockIdx%x
+    ibnd = blockIdx%y
+    ic = blockIdx%z
+    ik = kl0 - 1 + ikl
+    tid = threadIdx%x
+    nthr = blockDim%x
+    i0 = 4 * (tid - 1) + 1
+    an0 = 0.0_dp; an1 = 0.0_dp; an2 = 0.0_dp; an3 = 0.0_dp
+    az0 = 0.0_dp; az1 = 0.0_dp; az2 = 0.0_dp; az3 = 0.0_dp
+    ad0 = 0.0_dp; ad1 = 0.0_dp; ad2 = 0.0_dp; ad3 = 0.0_dp
+    IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+      iq1 = (ic - 1) * nchunk + 1
+      iq2 = MIN(nqfs(ik), ic * nchunk)
+      DO iq = iq1, iq2
+        iq0 = ixqfs(ikl, iq)
+        kq = ixkqf(ikl, iq0)
+        DO jbnd = 1, nb
+          IF (ABS(ekfs(jbnd, kq) - ef0) < fsthick) THEN
+            weight = wqf(iq) * w0g(jbnd, kq) * inv_dos
+            CALL syncthreads()
+            DO m = tid, n2, nthr
+              lam = 0.0_dp
+              DO nu = 1, nm
+                lam = lam + g2(ikl, iq, ibnd, jbnd, nu) * ftab(m, nu, iq0)
+              ENDDO
+              sh(m) = 2.0_dp * lam * dosef
+            ENDDO
+            DO m = tid, nsiw, nthr
+              d = adp(m, jbnd, kq)
+              e = weight * dwsi(m) / SQRT(wsi(m) * wsi(m) + d * d)
+              sh(n2p + m) = weight * dwsi(m)
+              sh(n2p + nsiw + m) = e * wsi(m)
+              sh(n2p + 2 * nsiw + m) = e * d
+            ENDDO
+            CALL syncthreads()
+            IF (i0 <= nsiw) THEN
+              m0 = sh(i0);     m1 = sh(i0 + 1); m2 = sh(i0 + 2); m3 = sh(i0 + 3)
+              p0 = sh(i0 + 1); p1 = sh(i0 + 2); p2 = sh(i0 + 3); p3 = sh(i0 + 4)
+              DO iwp = 1, nsiw
+                w1 = sh(n2p + iwp); w2 = sh(n2p + nsiw + iwp); w3 = sh(n2p + 2 * nsiw + iwp)
+                km = m0 - p0; an0 = an0 + w1 * km; az0 = az0 + w2 * km; ad0 = ad0 + w3 * (m0 + p0 - mucs)
+                km = m1 - p1; an1 = an1 + w1 * km; az1 = az1 + w2 * km; ad1 = ad1 + w3 * (m1 + p1 - mucs)
+                km = m2 - p2; an2 = an2 + w1 * km; az2 = az2 + w2 * km; ad2 = ad2 + w3 * (m2 + p2 - mucs)
+                km = m3 - p3; an3 = an3 + w1 * km; az3 = az3 + w2 * km; ad3 = ad3 + w3 * (m3 + p3 - mucs)
+                m3 = m2; m2 = m1; m1 = m0; m0 = sh(ABS(i0 - iwp - 1) + 1)
+                p0 = p1; p1 = p2; p2 = p3; p3 = sh(i0 + iwp + 4)
+              ENDDO
+            ENDIF
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDIF
+    IF (i0 <= nsiw) THEN
+      part(i0, 1, ibnd, ikl, ic) = an0; part(i0, 2, ibnd, ikl, ic) = az0; part(i0, 3, ibnd, ikl, ic) = ad0
+    ENDIF
+    IF (i0 + 1 <= nsiw) THEN
+      part(i0 + 1, 1, ibnd, ikl, ic) = an1; part(i0 + 1, 2, ibnd, ikl, ic) = az1
+      part(i0 + 1, 3, ibnd, ikl, ic) = ad1
+    ENDIF
+    IF (i0 + 2 <= nsiw) THEN
+      part(i0 + 2, 1, ibnd, ikl, ic) = an2; part(i0 + 2, 2, ibnd, ikl, ic) = az2
+      part(i0 + 2, 3, ibnd, ikl, ic) = ad2
+    ENDIF
+    IF (i0 + 3 <= nsiw) THEN
+      part(i0 + 3, 1, ibnd, ikl, ic) = an3; part(i0 + 3, 2, ibnd, ikl, ic) = az3
+      part(i0 + 3, 3, ibnd, ikl, ic) = ad3
+    ENDIF
+  END SUBROUTINE k_fsr4
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_fsr(nkl, kl0, nb, mq, nm, nsiw, n2, nchunk, &
                                       g2, wf, ixkqf, ixqfs, nqfs, ekfs, w0g, wqf, &
@@ -133,8 +246,9 @@ CONTAINS
     REAL(dp), INTENT(IN) :: ef0, fsthick, eps_ac, dosef, pit, inv_dos, mucs
     !
     INTEGER(8) :: sz
-    INTEGER :: istat, nthr, nchunk, ic, ib, ik, iw, maxq
+    INTEGER :: istat, nthr, nchunk, ic, ib, ik, iw, maxq, n2p
     INTEGER :: shbytes
+    LOGICAL :: uniform
     REAL(dp), ALLOCATABLE :: part(:, :, :, :, :)
     TYPE(dim3) :: grd, blk
     !
@@ -160,15 +274,41 @@ CONTAINS
              d_part(nsiw * 3 * nb * nkl * nsplit))
     d_wsi = wsi; d_dwsi = dwsi; d_wsn = wsn; d_adp = adp
     !
-    nthr = MIN(1024, 32 * ((nsiw + 31) / 32))
-    shbytes = 8 * (n2 + 3 * nsiw)
-    blk = dim3(nthr, 1, 1)
-    grd = dim3(nkl, nb, nsplit)
     istat = cudaGetLastError()   ! clear an error left pending by earlier (non-rtsc) code
-    CALL k_fsr<<<grd, blk, shbytes>>>(nkl, kl0, nb, mq, nm, nsiw, n2, nchunk, &
-         d_g2, d_wf, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, d_wqf, d_wsi, d_wsn, d_dwsi, d_adp, &
-         d_part, ef0, fsthick, eps_ac, dosef, pit, inv_dos, mucs)
-    istat = cudaGetLastError(); CALL chk(istat, 'k_fsr launch')
+    uniform = .TRUE.
+    DO iw = 1, nsiw
+      IF (wsn(iw) /= iw - 1) uniform = .FALSE.
+    ENDDO
+    uniform = uniform .AND. (n2 == 2 * nsiw)
+    IF (uniform) THEN
+      ! kernel factor table for this temperature
+      IF (pit /= ftab_pit .OR. n2 /= ftab_n2) THEN
+        IF (ALLOCATED(d_ftab)) DEALLOCATE(d_ftab)
+        ALLOCATE(d_ftab(INT(n2, 8) * nm * nqtot))
+        CALL k_ftab<<<dim3((n2 + 127) / 128, nm, nqtot), dim3(128, 1, 1)>>>(n2, nm, nqtot, d_wf, &
+             eps_ac, pit, d_ftab)
+        istat = cudaGetLastError(); CALL chk(istat, 'k_ftab launch')
+        ftab_pit = pit; ftab_n2 = n2
+      ENDIF
+      n2p = n2 + 8   ! padding: the register windows prefetch up to 4 entries past n2
+      nthr = MIN(1024, 32 * (((nsiw + 3) / 4 + 31) / 32))
+      shbytes = 8 * (n2p + 3 * nsiw)
+      blk = dim3(nthr, 1, 1)
+      grd = dim3(nkl, nb, nsplit)
+      CALL k_fsr4<<<grd, blk, shbytes>>>(nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk, &
+           d_g2, d_ftab, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, d_wqf, d_wsi, d_dwsi, d_adp, &
+           d_part, ef0, fsthick, dosef, inv_dos, mucs)
+      istat = cudaGetLastError(); CALL chk(istat, 'k_fsr4 launch')
+    ELSE
+      nthr = MIN(1024, 32 * ((nsiw + 31) / 32))
+      shbytes = 8 * (n2 + 3 * nsiw)
+      blk = dim3(nthr, 1, 1)
+      grd = dim3(nkl, nb, nsplit)
+      CALL k_fsr<<<grd, blk, shbytes>>>(nkl, kl0, nb, mq, nm, nsiw, n2, nchunk, &
+           d_g2, d_wf, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, d_wqf, d_wsi, d_wsn, d_dwsi, d_adp, &
+           d_part, ef0, fsthick, eps_ac, dosef, pit, inv_dos, mucs)
+      istat = cudaGetLastError(); CALL chk(istat, 'k_fsr launch')
+    ENDIF
     ALLOCATE(part(nsiw, 3, nb, nkl, nsplit))
     istat = cudaDeviceSynchronize(); CALL chk(istat, 'k_fsr')
     istat = cudaMemcpy(part, d_part, nsiw * 3 * nb * nkl * nsplit); CALL chk(istat, 'D2H part')
