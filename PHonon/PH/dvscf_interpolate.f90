@@ -414,7 +414,7 @@ MODULE dvscf_interpolate
     USE io_global,   ONLY : ionode, stdout
     USE scatter_mod, ONLY : scatter_grid
     USE fft_base,    ONLY : dfftp
-    USE cell_base,   ONLY : at, bg
+    USE cell_base,   ONLY : at
     USE modes,       ONLY : nmodes
     USE noncollin_module, ONLY : nspin_mag
     USE control_ph,  ONLY : current_iq, start_q, last_q
@@ -429,9 +429,7 @@ MODULE dvscf_interpolate
     !! Output. Interpolated dvscf
     !
     INTEGER :: imode, jmode, ir, irlocal, is
-    REAL(DP) :: xq_cry(3), arg, xq_use(3)
-    CHARACTER(LEN=16) :: envs
-    INTEGER :: ios
+    REAL(DP) :: xq_cry(3), arg
     COMPLEX(DP) :: phase
     COMPLEX(DP), ALLOCATABLE :: aux(:)
     !! (dfftp%nnr) temporary variable for multiplying exp(-iqr)
@@ -521,24 +519,15 @@ MODULE dvscf_interpolate
     !
     CALL start_clock('dvscf_iqr')
     !
-    ! rtsc (RTSC_DQ=1): undo dvscf_q2r's exp(iqr) and centre shift with the q representative that
-    ! dvscf_q2r used (crystal coordinates in [0,1)), then convert to the periodic part of ph.x's xq
-    ! (exp(-iGr), G = xq - xq_use). With xq itself, the exp(-iqr) of a q that differs from dvscf_q2r's
-    ! by G wraps the FFT-box edge before the centre shift, and the round trip is not exact (B2 L/X).
-    xq_use = xq
-    CALL get_environment_variable('RTSC_DQ', envs, STATUS=ios)
-    IF (ios == 0 .AND. TRIM(envs) == '1') THEN
-      xq_use = xq_cry - FLOOR(xq_cry + 1.d-8)
-      CALL cryst_to_cart(1, xq_use, bg, +1)
-    ENDIF
     ALLOCATE(aux(dfftp%nnr))
     aux = (1.d0, 0.d0)
-    CALL multiply_iqr(dfftp, -xq_use, aux)
+    CALL multiply_iqr(dfftp, -xq, aux)
     DO imode = 1, nmodes
       DO is = 1, nspin_mag
         dvscf_cart(:, is, imode) = dvscf_cart(:, is, imode) * aux(:)
       ENDDO
     ENDDO
+    DEALLOCATE(aux)
     !
     CALL stop_clock('dvscf_iqr')
     !
@@ -549,17 +538,7 @@ MODULE dvscf_interpolate
     ! Only the part interpolated from w_pot should be shifted. The center of
     ! dvscf_long_range and dvsc_bare is already at tau.
     !
-    CALL dvscf_shift_center(dvscf_cart, xq_use, shift_half, +1)
-    IF (ANY(ABS(xq - xq_use) > 1.d-8)) THEN
-      aux = (1.d0, 0.d0)
-      CALL multiply_iqr(dfftp, -(xq - xq_use), aux)
-      DO imode = 1, nmodes
-        DO is = 1, nspin_mag
-          dvscf_cart(:, is, imode) = dvscf_cart(:, is, imode) * aux(:)
-        ENDDO
-      ENDDO
-    ENDIF
-    DEALLOCATE(aux)
+    CALL dvscf_shift_center(dvscf_cart, xq, shift_half, +1)
     !
     !--------------------------------------------------------------------------
     ! For IR active materials with nonzero Born effective charge, add the
