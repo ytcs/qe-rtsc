@@ -145,7 +145,7 @@ def epw(s, g):
   laniso = .true.
   limag = .true.
   lpade = .true.
-  conv_thr_iaxis = 1.0d-4
+  conv_thr_iaxis = 1.0d-6
   wscut = {s.get('wscut', 1.0)}
   temps = {g["temps"][0]} {g["temps"][1]}
   nstemp = {g["nstemp"]}
