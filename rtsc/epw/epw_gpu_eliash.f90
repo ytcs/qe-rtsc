@@ -25,6 +25,8 @@ MODULE epw_gpu_eliash
   INTEGER, DEVICE, ALLOCATABLE :: d_wsn(:)
   ! F(m, nu, q) = wf / (wf^2 + omega_m^2) (0 for wf <= eps_acoustic), per temperature
   REAL(dp), DEVICE, ALLOCATABLE :: d_ftab(:)
+  ! per iteration: ez = dw * wp / sqrt(wp^2 + D^2), ed = dw * D / sqrt(wp^2 + D^2)
+  REAL(dp), DEVICE, ALLOCATABLE :: d_ez(:), d_ed(:)
   REAL(dp) :: ftab_pit = -1.0_dp
   INTEGER :: ftab_n2 = -1
   INTEGER(8) :: sz_static = -1
@@ -49,6 +51,7 @@ CONTAINS
     IF (ALLOCATED(d_g2)) DEALLOCATE(d_g2, d_wf, d_ekfs, d_w0g, d_wqf, d_ixkqf, d_ixqfs, d_nqfs)
     IF (ALLOCATED(d_wsi)) DEALLOCATE(d_wsi, d_dwsi, d_wsn, d_adp, d_part)
     IF (ALLOCATED(d_ftab)) DEALLOCATE(d_ftab)
+    IF (ALLOCATED(d_ez)) DEALLOCATE(d_ez, d_ed)
     ftab_pit = -1.0_dp; ftab_n2 = -1
     sz_static = -1
   END SUBROUTINE ege_reset
@@ -72,6 +75,125 @@ CONTAINS
       ftab(m, nu, iq) = 0.0_dp
     ENDIF
   END SUBROUTINE k_ftab
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_etab(nsiw, ntot, wsi, dwsi, adp, ez, ed)
+    INTEGER, VALUE :: nsiw, ntot
+    REAL(dp), DEVICE :: wsi(nsiw), dwsi(nsiw), adp(nsiw, *), ez(nsiw, *), ed(nsiw, *)
+    INTEGER :: iw, j
+    REAL(dp) :: d, r
+    iw = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    j = blockIdx%y
+    IF (iw > nsiw .OR. j > ntot) RETURN
+    d = adp(iw, j)
+    r = dwsi(iw) / SQRT(wsi(iw) * wsi(iw) + d * d)
+    ez(iw, j) = r * wsi(iw)
+    ed(iw, j) = r * d
+  END SUBROUTINE k_etab
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_fsr5(nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk, ntile, &
+                                       g2, ftab, ixkqf, ixqfs, nqfs, ekfs, w0g, wqf, &
+                                       dwsi, ez, ed, part, ef0, fsthick, dosef, inv_dos, mucs)
+    !! As k_fsr4 (uniform grid, 4 consecutive iw per lane, sliding register windows), but a
+    !! block is 4 warps working on different q of the same (k, n, 128-wide iw tile): each warp
+    !! builds its own kernel row (warp sync only), the 1/sqrt(wp^2+D^2) factors come from the
+    !! per-iteration tables ez/ed, and the pair weight multiplies the iwp sum once. The four
+    !! warps' partial sums are added in fixed order at the end.
+    INTEGER, VALUE :: nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk, ntile
+    REAL(dp), VALUE :: ef0, fsthick, dosef, inv_dos, mucs
+    REAL(dp), DEVICE :: g2(nkl, mq, nb, nb, nm), ftab(n2, nm, *), ekfs(nb, *), w0g(nb, *), wqf(*)
+    INTEGER, DEVICE :: ixkqf(nkl, *), ixqfs(nkl, *), nqfs(*)
+    REAL(dp), DEVICE :: dwsi(nsiw), ez(nsiw, nb, *), ed(nsiw, nb, *), part(nsiw, 3, nb, nkl, *)
+    REAL(dp), SHARED :: sh(*)
+    INTEGER :: ikl, ik, ibnd, ic, it, iq, iq0, iq1, iq2, kq, jbnd, m, nu, iwp, lane, w, i0, ko, ro
+    REAL(dp) :: weight, lam, km, w1, w2, w3
+    REAL(dp) :: m0, m1, m2, m3, p0, p1, p2, p3
+    REAL(dp) :: sn0, sn1, sn2, sn3, sz0, sz1, sz2, sz3, sd0, sd1, sd2, sd3
+    REAL(dp) :: an0, an1, an2, an3, az0, az1, az2, az3, ad0, ad1, ad2, ad3
+    !
+    ikl = blockIdx%x
+    it = (blockIdx%y - 1) / nb
+    ibnd = MOD(blockIdx%y - 1, nb) + 1
+    ic = blockIdx%z
+    ik = kl0 - 1 + ikl
+    lane = MOD(threadIdx%x - 1, 32)
+    w = (threadIdx%x - 1) / 32
+    i0 = 128 * it + 4 * lane + 1
+    ko = w * n2p              ! this warp's kernel row: sh(ko+1 : ko+n2p)
+    an0 = 0.0_dp; an1 = 0.0_dp; an2 = 0.0_dp; an3 = 0.0_dp
+    az0 = 0.0_dp; az1 = 0.0_dp; az2 = 0.0_dp; az3 = 0.0_dp
+    ad0 = 0.0_dp; ad1 = 0.0_dp; ad2 = 0.0_dp; ad3 = 0.0_dp
+    IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+      iq1 = (ic - 1) * nchunk + 1
+      iq2 = MIN(nqfs(ik), ic * nchunk)
+      DO iq = iq1 + w, iq2, 4
+        iq0 = ixqfs(ikl, iq)
+        kq = ixkqf(ikl, iq0)
+        DO jbnd = 1, nb
+          IF (ABS(ekfs(jbnd, kq) - ef0) < fsthick) THEN
+            weight = wqf(iq) * w0g(jbnd, kq) * inv_dos
+            CALL syncwarp(-1)
+            DO m = lane + 1, n2, 32
+              lam = 0.0_dp
+              DO nu = 1, nm
+                lam = lam + g2(ikl, iq, ibnd, jbnd, nu) * ftab(m, nu, iq0)
+              ENDDO
+              sh(ko + m) = 2.0_dp * lam * dosef
+            ENDDO
+            CALL syncwarp(-1)
+            IF (i0 <= nsiw) THEN
+              sn0 = 0.0_dp; sn1 = 0.0_dp; sn2 = 0.0_dp; sn3 = 0.0_dp
+              sz0 = 0.0_dp; sz1 = 0.0_dp; sz2 = 0.0_dp; sz3 = 0.0_dp
+              sd0 = 0.0_dp; sd1 = 0.0_dp; sd2 = 0.0_dp; sd3 = 0.0_dp
+              m0 = sh(ko + i0);     m1 = sh(ko + i0 + 1); m2 = sh(ko + i0 + 2); m3 = sh(ko + i0 + 3)
+              p0 = sh(ko + i0 + 1); p1 = sh(ko + i0 + 2); p2 = sh(ko + i0 + 3); p3 = sh(ko + i0 + 4)
+              DO iwp = 1, nsiw
+                w1 = dwsi(iwp); w2 = ez(iwp, jbnd, kq); w3 = ed(iwp, jbnd, kq)
+                km = m0 - p0; sn0 = sn0 + w1 * km; sz0 = sz0 + w2 * km; sd0 = sd0 + w3 * (m0 + p0 - mucs)
+                km = m1 - p1; sn1 = sn1 + w1 * km; sz1 = sz1 + w2 * km; sd1 = sd1 + w3 * (m1 + p1 - mucs)
+                km = m2 - p2; sn2 = sn2 + w1 * km; sz2 = sz2 + w2 * km; sd2 = sd2 + w3 * (m2 + p2 - mucs)
+                km = m3 - p3; sn3 = sn3 + w1 * km; sz3 = sz3 + w2 * km; sd3 = sd3 + w3 * (m3 + p3 - mucs)
+                m3 = m2; m2 = m1; m1 = m0; m0 = sh(ko + ABS(i0 - iwp - 1) + 1)
+                p0 = p1; p1 = p2; p2 = p3; p3 = sh(ko + i0 + iwp + 4)
+              ENDDO
+              an0 = an0 + weight * sn0; an1 = an1 + weight * sn1; an2 = an2 + weight * sn2; an3 = an3 + weight * sn3
+              az0 = az0 + weight * sz0; az1 = az1 + weight * sz1; az2 = az2 + weight * sz2; az3 = az3 + weight * sz3
+              ad0 = ad0 + weight * sd0; ad1 = ad1 + weight * sd1; ad2 = ad2 + weight * sd2; ad3 = ad3 + weight * sd3
+            ENDIF
+          ENDIF
+        ENDDO
+      ENDDO
+    ENDIF
+    ! reduce the 4 warps in fixed order: sh(ro + 12*(t-1) + v), t = thread, v = value
+    CALL syncthreads()
+    ro = 4 * n2p + 12 * (threadIdx%x - 1)
+    sh(ro + 1) = an0; sh(ro + 2) = an1; sh(ro + 3) = an2; sh(ro + 4) = an3
+    sh(ro + 5) = az0; sh(ro + 6) = az1; sh(ro + 7) = az2; sh(ro + 8) = az3
+    sh(ro + 9) = ad0; sh(ro + 10) = ad1; sh(ro + 11) = ad2; sh(ro + 12) = ad3
+    CALL syncthreads()
+    IF (w == 0) THEN
+      DO m = 2, 4
+        ro = 4 * n2p + 12 * ((m - 1) * 32 + lane)
+        an0 = an0 + sh(ro + 1); an1 = an1 + sh(ro + 2); an2 = an2 + sh(ro + 3); an3 = an3 + sh(ro + 4)
+        az0 = az0 + sh(ro + 5); az1 = az1 + sh(ro + 6); az2 = az2 + sh(ro + 7); az3 = az3 + sh(ro + 8)
+        ad0 = ad0 + sh(ro + 9); ad1 = ad1 + sh(ro + 10); ad2 = ad2 + sh(ro + 11); ad3 = ad3 + sh(ro + 12)
+      ENDDO
+      IF (i0 <= nsiw) THEN
+        part(i0, 1, ibnd, ikl, ic) = an0; part(i0, 2, ibnd, ikl, ic) = az0; part(i0, 3, ibnd, ikl, ic) = ad0
+      ENDIF
+      IF (i0 + 1 <= nsiw) THEN
+        part(i0 + 1, 1, ibnd, ikl, ic) = an1; part(i0 + 1, 2, ibnd, ikl, ic) = az1
+        part(i0 + 1, 3, ibnd, ikl, ic) = ad1
+      ENDIF
+      IF (i0 + 2 <= nsiw) THEN
+        part(i0 + 2, 1, ibnd, ikl, ic) = an2; part(i0 + 2, 2, ibnd, ikl, ic) = az2
+        part(i0 + 2, 3, ibnd, ikl, ic) = ad2
+      ENDIF
+      IF (i0 + 3 <= nsiw) THEN
+        part(i0 + 3, 1, ibnd, ikl, ic) = an3; part(i0 + 3, 2, ibnd, ikl, ic) = az3
+        part(i0 + 3, 3, ibnd, ikl, ic) = ad3
+      ENDIF
+    ENDIF
+  END SUBROUTINE k_fsr5
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_fsr4(nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk, &
                                        g2, ftab, ixkqf, ixqfs, nqfs, ekfs, w0g, wqf, &
@@ -246,7 +368,7 @@ CONTAINS
     REAL(dp), INTENT(IN) :: ef0, fsthick, eps_ac, dosef, pit, inv_dos, mucs
     !
     INTEGER(8) :: sz
-    INTEGER :: istat, nthr, nchunk, ic, ib, ik, iw, maxq, n2p
+    INTEGER :: istat, nthr, nchunk, ic, ib, ik, iw, maxq, n2p, ntile
     INTEGER :: shbytes
     LOGICAL :: uniform
     CHARACTER(LEN = 16) :: envval
@@ -294,14 +416,31 @@ CONTAINS
         ftab_pit = pit; ftab_n2 = n2
       ENDIF
       n2p = n2 + 8   ! padding: the register windows prefetch up to 4 entries past n2
-      nthr = MIN(1024, 32 * (((nsiw + 3) / 4 + 31) / 32))
-      shbytes = 8 * (n2p + 3 * nsiw)
-      blk = dim3(nthr, 1, 1)
-      grd = dim3(nkl, nb, nsplit)
-      CALL k_fsr4<<<grd, blk, shbytes>>>(nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk, &
-           d_g2, d_ftab, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, d_wqf, d_wsi, d_dwsi, d_adp, &
-           d_part, ef0, fsthick, dosef, inv_dos, mucs)
-      istat = cudaGetLastError(); CALL chk(istat, 'k_fsr4 launch')
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_K5', envval)
+      IF (nsiw <= 512 .AND. TRIM(envval) /= '0') THEN
+        IF (ALLOCATED(d_ez)) THEN
+          IF (SIZE(d_ez) /= nsiw * nb * nkfs) DEALLOCATE(d_ez, d_ed)
+        ENDIF
+        IF (.NOT. ALLOCATED(d_ez)) ALLOCATE(d_ez(nsiw * nb * nkfs), d_ed(nsiw * nb * nkfs))
+        CALL k_etab<<<dim3((nsiw + 127) / 128, nb * nkfs, 1), dim3(128, 1, 1)>>>(nsiw, nb * nkfs, &
+             d_wsi, d_dwsi, d_adp, d_ez, d_ed)
+        istat = cudaGetLastError(); CALL chk(istat, 'k_etab launch')
+        ntile = (nsiw + 127) / 128
+        shbytes = 8 * (4 * n2p + 12 * 128)
+        CALL k_fsr5<<<dim3(nkl, nb * ntile, nsplit), dim3(128, 1, 1), shbytes>>>(nkl, kl0, nb, mq, &
+             nm, nsiw, n2, n2p, nchunk, ntile, d_g2, d_ftab, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, &
+             d_wqf, d_dwsi, d_ez, d_ed, d_part, ef0, fsthick, dosef, inv_dos, mucs)
+        istat = cudaGetLastError(); CALL chk(istat, 'k_fsr5 launch')
+      ELSE
+        nthr = MIN(1024, 32 * (((nsiw + 3) / 4 + 31) / 32))
+        shbytes = 8 * (n2p + 3 * nsiw)
+        blk = dim3(nthr, 1, 1)
+        grd = dim3(nkl, nb, nsplit)
+        CALL k_fsr4<<<grd, blk, shbytes>>>(nkl, kl0, nb, mq, nm, nsiw, n2, n2p, nchunk, &
+             d_g2, d_ftab, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, d_wqf, d_wsi, d_dwsi, d_adp, &
+             d_part, ef0, fsthick, dosef, inv_dos, mucs)
+        istat = cudaGetLastError(); CALL chk(istat, 'k_fsr4 launch')
+      ENDIF
     ELSE
       nthr = MIN(1024, 32 * ((nsiw + 31) / 32))
       shbytes = 8 * (n2 + 3 * nsiw)
