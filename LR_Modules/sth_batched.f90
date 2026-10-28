@@ -3,7 +3,7 @@
 ! groups/compute/STH-ENGINE.md). sternheimer_kernel dispatches here when RTSC_STH=1 and the
 ! case is supported; otherwise (or if the engine declines) the vanilla k x pert loop runs.
 !
-! Supported: norm-conserving, collinear, nspin_mag = 1, no DFT+U, no time reversal, q /= 0,
+! Supported: norm-conserving, collinear, nspin_mag = 1, no DFT+U, no time reversal, any q,
 ! lgauss smearing (no tetrahedra, no twochem), no meta-GGA / EXX / real_space / scissor /
 ! lelfield, serial FFT within the pool (nproc_bgrp = 1, no task groups), one band group.
 ! Any number of pools: each pool rank runs its own engine on its own k-points.
@@ -91,7 +91,10 @@ CONTAINS
     IF (.NOT. sth_env_flag('RTSC_STH')) RETURN
     ! supported case (STH-ENGINE.md, v1)
     IF (time_reversed .OR. okvan .OR. noncolin .OR. lsda .OR. nspin_mag /= 1 .OR. npol /= 1) RETURN
-    IF (lda_plus_u .OR. lgamma .OR. gamma_only .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
+    ! q = Gamma (lgamma, evq => evc): k+q = k, so the engine gets the same psi twice; the Fermi
+    ! shift of metals (ef_shift_new on drho, ef_shift_wfc_new on iudwf after the flush) acts
+    ! outside this kernel, unchanged
+    IF (lda_plus_u .OR. gamma_only .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
     IF (xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space .OR. scissor .OR. lelfield) RETURN
     IF (nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups) RETURN
     IF (dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x) RETURN
@@ -227,7 +230,7 @@ CONTAINS
     USE scf,              ONLY : vrs
     USE buffers,          ONLY : get_buffer
     USE units_lr,         ONLY : iuwfc, lrwfc, lrdwf, iudwf
-    USE control_lr,       ONLY : nbnd_occ, alpha_pv
+    USE control_lr,       ONLY : nbnd_occ, alpha_pv, lgamma
     USE qpoint,           ONLY : nksq, ikks, ikqs
     USE eqv,              ONLY : dpsi, dvpsi, evq
     USE sth_engine,       ONLY : sth_engine_init, sth_engine_set_global, sth_engine_set_k, &
@@ -274,7 +277,7 @@ CONTAINS
       idxk(1:npw) = dffts%nl(igk_k(1:npw, ikk))
       idxkq(1:npwq) = dffts%nl(igk_k(1:npwq, ikq))
       CALL get_buffer(evc, lrwfc, iuwfc, ikk)
-      CALL get_buffer(evq, lrwfc, iuwfc, ikq)
+      IF (.NOT. lgamma) CALL get_buffer(evq, lrwfc, iuwfc, ikq)   ! lgamma: evq => evc, ikq = ikk
       CALL init_us_2(npwq, igk_k(1, ikq), xk(1, ikq), vkb, .true.)
       !$acc update host(vkb)
       CALL g2_kin(ikq)
@@ -320,7 +323,11 @@ CONTAINS
       ENDDO
     ENDDO
     DEALLOCATE(idxk, idxkq, wwg, wg1)
-    !$acc update device(evc, evq)
+    IF (lgamma) THEN
+      !$acc update device(evc)
+    ELSE
+      !$acc update device(evc, evq)
+    ENDIF
     CALL sth_engine_setup(ierr)
     CALL stop_clock('sth_init')
   END SUBROUTINE sth_batched_init
