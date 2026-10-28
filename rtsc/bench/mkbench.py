@@ -40,14 +40,17 @@ SYSTEMS = {
                    ("H", 0.258656, 0, 0), ("H", -0.258656, 0, 0), ("H", 0, 0.258656, 0),
                    ("H", 0, -0.258656, 0), ("H", 0, 0, 0.258656), ("H", 0, 0, -0.258656)],
         ecutwfc=80, degauss=0.02, nbnd=40,
-        # Bands 1-12: Mg 2s2p + Ir 5s5p semicore. Bands 13-21: H-s bonding + Ir t2g (filled);
-        # 22-23: Ir-eg*/H-s antibonding, crossing E_F (10.95 eV). Band 24 starts at E_F+1.17 eV,
-        # so the frozen window stops at E_F+1.1 eV. H phonons reach ~250 meV: wscut 2 eV.
-        wannier=dict(nbndsub=11, dis_froz_max=12.05, exclude="1-12", proj=["Ir:d", "H:s"]),
+        # Bands 1-12: Mg 2s2p + Ir 5s5p semicore. 43 valence e (SG15), so band 22 is half filled:
+        # it runs from a non-degenerate s-like state at Gamma (12.99 eV) down through E_F (10.83 eV,
+        # nscf) to 9.9 eV at X. Ir-d/H-s bases (11-13 WF) cannot follow that character change and
+        # leave 0.1-0.55 eV interpolation errors at E_F. Adding Mg s+p fixes it (wancheck/, 8^3 k):
+        # 20 WF, frozen window to 14.5 eV gives max 21 meV within 0.5 eV of E_F, spreads <= 3.7 A^2.
+        wannier=dict(nbndsub=20, dis_froz_max=14.5, exclude="1-12",
+                     proj=["Ir:s", "Ir:d", "H:s", "Mg:s", "Mg:p"], wdata=["dis_num_iter = 2000"]),
         wscut=2.0,
         grids=dict(
-            frozen=dict(kscf=12, kq=4, kf=32, qf=16, temps=(10, 25), nstemp=4),
-            smoke=dict(kscf=6, kq=2, kf=8, qf=4, temps=(10, 20), nstemp=2),
+            frozen=dict(kscf=12, kq=4, kw=8, kf=32, qf=16, temps=(10, 25), nstemp=4),
+            smoke=dict(kscf=6, kq=2, kw=4, kf=8, qf=4, temps=(10, 20), nstemp=2),
         ),
     ),
 }
@@ -117,7 +120,8 @@ def epw(s, g):
     w = s["wannier"]
     masses = "".join(f"  amass({i+1}) = {m}\n" for i, (_, m, _) in enumerate(s["species"]))
     proj = "".join(f"  proj({i+1}) = '{p}'\n" for i, p in enumerate(w["proj"]))
-    n, kf, qf = g["kq"], g["kf"], g["qf"]
+    proj += "".join(f"  wdata({i+1}) = '{x}'\n" for i, x in enumerate(w.get("wdata", [])))
+    n, nk, kf, qf = g["kq"], g.get("kw", g["kq"]), g["kf"], g["qf"]
     return f"""&inputepw
   prefix = '{s["prefix"]}'
 {masses}  outdir = './'
@@ -148,7 +152,7 @@ def epw(s, g):
   nsiter = 500
   muc = 0.16
   dvscf_dir = './save'
-  nk1 = {n}, nk2 = {n}, nk3 = {n}
+  nk1 = {nk}, nk2 = {nk}, nk3 = {nk}
   nq1 = {n}, nq2 = {n}, nq3 = {n}
   mp_mesh_k = .true.
   nkf1 = {kf}, nkf2 = {kf}, nkf3 = {kf}
@@ -165,7 +169,7 @@ def main(sysid, variant):
     k = g["kscf"]
     (out / "scf.in").write_text(pw(s, "scf", f"K_POINTS automatic\n{k} {k} {k} 0 0 0\n"))
     (out / "ph.in").write_text(ph(s, g))
-    (out / "nscf.in").write_text(pw(s, "nscf", kfull(g["kq"]), f"\n    nbnd = {s['nbnd']}"))
+    (out / "nscf.in").write_text(pw(s, "nscf", kfull(g.get("kw", g["kq"])), f"\n    nbnd = {s['nbnd']}"))
     (out / "epw.in").write_text(epw(s, g))
     print(f"wrote {out}")
 
