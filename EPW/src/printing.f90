@@ -1842,6 +1842,8 @@
     CALL print_clock('epq_cfac')
     CALL print_clock('epq_rrf')
     CALL print_clock('epq_kloop')
+    CALL print_clock('rtsc_fsetup')
+    CALL print_clock('rtsc_fbatch')
     CALL print_clock('write_dos')
     CALL print_clock('write_phdos')
     !

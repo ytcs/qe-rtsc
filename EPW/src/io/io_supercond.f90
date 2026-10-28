@@ -2239,7 +2239,7 @@
     !-----------------------------------------------------------------------
     !
     !-----------------------------------------------------------------------
-    SUBROUTINE write_ephmat(iqq, iq, lrepmatw2_restart, first_cycle)
+    SUBROUTINE write_ephmat(iqq, iq, lrepmatw2_restart, first_cycle, g2pre)
     !-----------------------------------------------------------------------
     !!
     !!  This routine writes the elph matrix elements in a format required
@@ -2287,6 +2287,9 @@
     INTEGER, INTENT(inout) :: lrepmatw2_restart(npool)
     !! Current position inside the file during writing
     LOGICAL, INTENT(in) :: first_cycle
+    REAL(KIND = DP), INTENT(in), OPTIONAL :: g2pre(:)
+    !! rtsc: this q's g^2 list in the order of the loop below, computed on the GPU
+    !! (epw_gpu_fine); when present the loop is skipped
     !! Check wheter this is the first cycle after a restart.
     !
     ! Local variables
@@ -2463,6 +2466,10 @@
     IF (iqq == 1) WRITE(iufileph) my_pool_id + 1, fermicount
     !
     xq(:) = xqf(:, iq)
+    IF (PRESENT(g2pre)) THEN
+      ind(my_pool_id + 1) = SIZE(g2pre)
+      GOTO 100
+    ENDIF
     !
     ! nkf - nr of k-points in the pool (fine mesh)
     ! for mp_mesh_k = true nkf is nr of irreducible k-points in the pool
@@ -2583,6 +2590,7 @@
       !
     ENDDO ! ik's
     !
+100 CONTINUE
     lrepmatw2_merge = lrepmatw2_merge + ind(my_pool_id + 1)
     !
     ! Save to file restart information in formatted way for possible restart
@@ -2598,7 +2606,11 @@
     IF (ind(my_pool_id + 1) > 0) THEN
       !WRITE(*, *) my_pool_id + 1, ind(my_pool_id + 1), lrepmatw2_merge
       ! rtsc: one WRITE for the whole q (stream access: same bytes as one WRITE per element)
-      WRITE(iufileph) tmp_g2(1:ind(my_pool_id + 1))
+      IF (PRESENT(g2pre)) THEN
+        WRITE(iufileph) g2pre(1:ind(my_pool_id + 1))
+      ELSE
+        WRITE(iufileph) tmp_g2(1:ind(my_pool_id + 1))
+      ENDIF
       !
       IF (rtsc_sync) FLUSH(iufileph)
       !
