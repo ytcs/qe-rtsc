@@ -67,6 +67,10 @@ set(sources
     src/dvqhub.f90
     src/onemkl_wrappers.f90
     )
+if(QE_ENABLE_CUDA)
+    # rtsc: GPU kernels for EPW (CUDA Fortran, cuFFT, cuBLAS)
+    list(PREPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/epw/epw_gpu_coarse.f90)
+endif()
 qe_enable_cuda_fortran("${sources}")
 
 qe_add_library(qe_epw ${sources})
@@ -88,6 +92,9 @@ target_link_libraries(
 
 if(QE_ENABLE_ONEAPI)
     target_link_libraries(qe_epw PRIVATE MKL::sycl)
+endif()
+if(QE_ENABLE_CUDA)
+    target_link_libraries(qe_epw PRIVATE CUDA::cufft CUDA::cublas)
 endif()
 
 ###########################################################
