@@ -46,29 +46,50 @@ def main(store, out_subset, out_refs):
     print(f"eligible {len(ok)}; subset {len(subset)}; {n}")
     Path(out_subset).write_text(json.dumps(subset))
 
+    ehull_j = {}
     systems = set()
     for v in subset.values():
         els = sorted({sp["element"] for site in v["structure"]["sites"] for sp in site["species"]})
         for r in range(1, len(els) + 1):
             systems.update(tuple(c) for c in itertools.combinations(els, r))
     d3 = data("dft_3d", store_dir=store)
-    best = {}
+    # dft_3d's own 'ehull' field is unusable (e.g. TiN 2.04, Nb3Sn 4.18 eV/atom), so the hull is rebuilt
+    # here from formation_energy_peratom (OptB88vdW) per chemical system.
+    from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
+    pool = {}
     for e in d3:
         try:
-            comp = Composition(e["formula"]) if e.get("formula") else None
+            comp = Composition(e["formula"])
+            ef = float(e["formation_energy_peratom"])
         except Exception:
             continue
-        if comp is None:
-            continue
         key = tuple(sorted(x.symbol for x in comp.elements))
-        if key not in systems:
-            continue
-        eh = e.get("ehull")
-        if not isinstance(eh, (int, float)):
-            continue
-        rf = comp.reduced_formula
-        if rf not in best or eh < best[rf][0]:
-            best[rf] = (eh, e)
+        if key in systems:
+            pool.setdefault(key, []).append((e, comp, ef))
+    best = {}
+    for top in {tuple(sorted({sp["element"] for site in v["structure"]["sites"] for sp in site["species"]}))
+                for v in subset.values()}:
+        ents = []
+        for r in range(1, len(top) + 1):
+            for sy in itertools.combinations(top, r):
+                for e, comp, ef in pool.get(sy, []):
+                    ents.append(PDEntry(comp, ef * comp.num_atoms, name=e["jid"]))
+        for el in top:
+            ents.append(PDEntry(Composition(el), 0.0, name=f"el-{el}"))
+        pd = PhaseDiagram(ents)
+        for en in ents:
+            if en.name.startswith("el-"):
+                continue
+            eh = pd.get_e_above_hull(en)
+            rf = en.composition.reduced_formula
+            if rf not in best or eh < best[rf][0]:
+                best[rf] = (eh, en.name)
+            ehull_j[en.name] = eh
+    jid2e = {e["jid"]: e for e in d3}
+    best = {rf: (eh, jid2e[j]) for rf, (eh, j) in best.items()}
+    for k in subset:
+        subset[k]["ehull_jarvis_recomputed"] = ehull_j.get(k)
+    Path(out_subset).write_text(json.dumps(subset))
     refs = {}
     for rf, (eh, e) in best.items():
         s = to_pmg(e["atoms"])
