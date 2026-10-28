@@ -2,9 +2,8 @@
 # DeviceXlib
 ###########################################################
 if(QE_DEVICEXLIB_INTERNAL)
-    message(STATUS "Installing DeviceXlib via submodule")
-
-    qe_git_submodule_update(external/devxlib)
+    # rtsc: devxlib is vendored at a6b89ef (gitlab.com is unreachable from our build pods).
+    message(STATUS "Installing DeviceXlib from vendored source")
 
     set(src_devxlib
         devxlib/src/deviceXlib_mod.f90
