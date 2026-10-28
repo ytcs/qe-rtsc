@@ -3,7 +3,7 @@
 !
 ! RTSC_DQ=1, RTSC_DQ_WPOT=<dir>: at every q /= Gamma, solve_linter calls dq_solve_irrep instead of the
 ! self-consistent dfpt_kernel. The induced potential dV_in of the irrep is Fourier-interpolated
-! (dvscf_r2q, from the w_pot that dvscf_q2r.x wrote for a coarser q-grid), symmetrized (psymdvscf),
+! (dvscf_r2q, from the w_pot that dvscf_q2r.x wrote for a coarser q-grid), its G-sphere part symmetrized,
 ! and one non-self-consistent Sternheimer solve gives dpsi and dn_out (on the batched engine with
 ! RTSC_STH=1: one engine call per irrep, CG from dpsi = 0, no mixing). Then:
 !  - dvscf written for EPW: dV_in (the interpolated, symmetrized potential);
@@ -156,7 +156,7 @@ CONTAINS
     DO ipert = 1, npe
       dfpt_data%dvscfp(:, :, ipert) = dv_all(:, :, imode0 + ipert)
     ENDDO
-    IF (.NOT. env_is('RTSC_DQ_NOSYM', '1')) CALL psymdvscf(dfpt_data%dvscfp, dfftp)   ! NOSYM: diagnostic
+    IF (.NOT. env_is('RTSC_DQ_NOSYM', '1')) CALL psym_sphere(dfpt_data%dvscfp, npe)   ! NOSYM: diagnostic
     CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     !
     ! RTSC_DQ_NITER passes (default 1): pass 1 solves from dpsi = 0 (engine: cold start; vanilla loop:
@@ -249,6 +249,38 @@ CONTAINS
     DEALLOCATE(vin, vout, vmix)
     CALL stop_clock('dq_irrep')
   END SUBROUTINE dq_solve_irrep
+  !
+  !------------------------------------------------------------------------------------------------
+  SUBROUTINE psym_sphere(v, npe)
+    !------------------------------------------------------------------------------------------------
+    !! psymdvscf on the G-sphere part of v only. psymdvscf multiplies by exp(i G r) for the
+    !! operations with S q = q + G (G /= 0, e.g. at K); on the FFT grid that wraps components near the
+    !! box edge, so it is a projector only for functions inside the sphere (as dn is). dV_ind has
+    !! components outside it (xc in real space; B1 K point: psymdvscf moved the exact dV_ind by
+    !! 1-10 %). The outside part is kept as interpolated.
+    USE fft_base,         ONLY : dfftp
+    USE fft_interfaces,   ONLY : fwfft, invfft
+    USE gvect,            ONLY : ngm
+    USE noncollin_module, ONLY : nspin_mag
+    INTEGER, INTENT(IN) :: npe
+    COMPLEX(DP), INTENT(INOUT) :: v(dfftp%nnr, nspin_mag, npe)
+    COMPLEX(DP), ALLOCATABLE :: a(:,:,:), aux(:)
+    INTEGER :: ip, is
+    ALLOCATE(a(dfftp%nnr, nspin_mag, npe), aux(dfftp%nnr))
+    DO ip = 1, npe
+      DO is = 1, nspin_mag
+        aux = v(:, is, ip)
+        CALL fwfft('Rho', aux, dfftp)
+        a(:, is, ip) = (0.d0, 0.d0)
+        a(dfftp%nl(1:ngm), is, ip) = aux(dfftp%nl(1:ngm))
+        CALL invfft('Rho', a(:, is, ip), dfftp)
+      ENDDO
+    ENDDO
+    v = v - a                  ! outside the sphere
+    CALL psymdvscf(a, dfftp)   ! inside: symmetrize
+    v = v + a
+    DEALLOCATE(a, aux)
+  END SUBROUTINE psym_sphere
   !
   !------------------------------------------------------------------------------------------------
   SUBROUTINE symtest(v, what)
