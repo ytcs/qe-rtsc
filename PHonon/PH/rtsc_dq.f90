@@ -15,6 +15,7 @@
 !  - printed per irrep: |dV_out - dV_in| / |dV_in| (the interpolation-quality meter) and max |C|.
 ! Gamma runs the normal SCF (metals need the Fermi shift there; Gamma is on every subgrid).
 ! RTSC_DQ_THRESH: Sternheimer threshold of the pass (default 1e-8 = 0.1 sqrt(tr2_ph = 1e-14)).
+! RTSC_DQ_NITER=N (default 1): N passes, Broyden-mixed as dfpt_kernel, the last one as above.
 !
 MODULE rtsc_dq
   USE kinds, ONLY : DP
@@ -119,7 +120,7 @@ CONTAINS
     USE units_lr,          ONLY : iudwf, lrdwf
     USE eqv,               ONLY : dpsi
     USE qpoint,            ONLY : nksq, xq
-    USE control_lr,        ONLY : convt, lnoloc
+    USE control_lr,        ONLY : convt, lnoloc, alpha_mix, nmix_ph, tr2_ph, flmixdpot
     USE dv_of_drho_lr,     ONLY : dv_of_drho
     USE apply_dpot_mod,    ONLY : apply_dpot_allocate, apply_dpot_deallocate
     USE dfpt_type,         ONLY : dfpt_data_type, dfpt_dvscfp_to_dvscfs
@@ -130,11 +131,12 @@ CONTAINS
     REAL(DP), INTENT(OUT) :: dr2
     TYPE(dfpt_data_type), INTENT(INOUT) :: dfpt_data
     !
-    COMPLEX(DP), ALLOCATABLE :: vin(:,:,:), vout(:,:,:)
-    REAL(DP) :: thresh, averlt, nin, nres, rel, cmax
+    COMPLEX(DP), ALLOCATABLE :: vin(:,:,:), vout(:,:,:), vmix(:,:,:)
+    REAL(DP) :: thresh, averlt, nin, nres, dr2m
+    LOGICAL :: conv
     REAL(DP), EXTERNAL :: get_clock
     LOGICAL :: all_conv
-    INTEGER :: ipert, jpert, ik, ios
+    INTEGER :: ipert, jpert, ik, ios, it, nit
     CHARACTER(LEN=32) :: s
     !
     IF (okvan .OR. okpaw .OR. noncolin .OR. lsda .OR. nspin_mag /= 1 .OR. lda_plus_u .OR. twochem .OR. lnoloc) &
@@ -147,21 +149,21 @@ CONTAINS
     IF (ios == 0 .AND. LEN_TRIM(s) > 0) READ(s, *) thresh
     !
     ! dV_in: the irrep's slice of the interpolated potential, projected on the irrep (psymdvscf)
-    ALLOCATE(vin(dfftp%nnr, nspin_mag, npe), vout(dfftp%nnr, nspin_mag, npe))
+    ALLOCATE(vin(dfftp%nnr, nspin_mag, npe), vout(dfftp%nnr, nspin_mag, npe), vmix(dfftp%nnr, nspin_mag, npe))
     DO ipert = 1, npe
       dfpt_data%dvscfp(:, :, ipert) = dv_all(:, :, imode0 + ipert)
     ENDDO
     CALL psymdvscf(dfpt_data%dvscfp, dfftp)
-    vin = dfpt_data%dvscfp
     CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     !
-    ! one Sternheimer solve, dpsi from 0 (engine: cold start; vanilla loop: zero iudwf records)
+    ! RTSC_DQ_NITER passes (default 1): pass 1 solves from dpsi = 0 (engine: cold start; vanilla loop:
+    ! zero iudwf records), later passes warm-start from the previous dpsi after a Broyden step
+    ! (mix_potential, as dfpt_kernel). The last pass gives dpsi, dn_out, the correction and the dvscf.
+    nit = 1
+    CALL get_environment_variable('RTSC_DQ_NITER', s, STATUS=ios)
+    IF (ios == 0 .AND. LEN_TRIM(s) > 0) READ(s, *) nit
     CALL apply_dpot_allocate()
-    dfpt_data%drhos = (0.d0, 0.d0)
-    dfpt_data%dbecsum = (0.d0, 0.d0)
-    IF (sth_env_flag('RTSC_STH')) THEN
-      CALL sth_batched_cold(.TRUE.)
-    ELSE
+    IF (.NOT. sth_env_flag('RTSC_STH')) THEN
       dpsi = (0.d0, 0.d0)
       DO ipert = 1, npe
         DO ik = 1, nksq
@@ -169,60 +171,75 @@ CONTAINS
         ENDDO
       ENDDO
     ENDIF
-    CALL sternheimer_kernel(.FALSE., .FALSE., npe, lrbar, iubar, thresh, dfpt_data%dvscfs, all_conv, &
-                            averlt, dfpt_data%drhos, dfpt_data%dbecsum)
-    CALL sth_batched_cold(.FALSE.)
-    CALL sternheimer_postprocess(1, dfpt_data)
-    CALL psymdvscf(dfpt_data%drhos, dffts)
-    CALL psymdvscf(dfpt_data%drhop, dfftp)
-    !
-    ! dV_out = Hxc response to dn_out
-    DO ipert = 1, npe
-      vout(:, :, ipert) = dfpt_data%drhop(:, :, ipert)
-      IF (ALLOCATED(dfpt_data%drhoc)) THEN
-        CALL dv_of_drho(vout(:, :, ipert), drhoc = dfpt_data%drhoc(:, ipert))
-      ELSE
-        CALL dv_of_drho(vout(:, :, ipert))
-      ENDIF
+    DO it = 1, nit
+      vin = dfpt_data%dvscfp
+      dfpt_data%drhos = (0.d0, 0.d0)
+      dfpt_data%dbecsum = (0.d0, 0.d0)
+      IF (it == 1 .AND. sth_env_flag('RTSC_STH')) CALL sth_batched_cold(.TRUE.)
+      CALL sternheimer_kernel(.FALSE., .FALSE., npe, lrbar, iubar, thresh, dfpt_data%dvscfs, all_conv, &
+                              averlt, dfpt_data%drhos, dfpt_data%dbecsum)
+      CALL sth_batched_cold(.FALSE.)
+      CALL sternheimer_postprocess(1, dfpt_data)
+      CALL psymdvscf(dfpt_data%drhos, dffts)
+      CALL psymdvscf(dfpt_data%drhop, dfftp)
+      !
+      ! dV_out = Hxc response to dn_out
+      DO ipert = 1, npe
+        vout(:, :, ipert) = dfpt_data%drhop(:, :, ipert)
+        IF (ALLOCATED(dfpt_data%drhoc)) THEN
+          CALL dv_of_drho(vout(:, :, ipert), drhoc = dfpt_data%drhoc(:, ipert))
+        ELSE
+          CALL dv_of_drho(vout(:, :, ipert))
+        ENDIF
+      ENDDO
+      !
+      ! residual meter (per mode) and dr2 as mix_potential + dfpt_kernel print it
+      dr2 = 0.d0
+      DO jpert = 1, npe
+        nin = REAL(DOT_PRODUCT(vin(:, 1, jpert), vin(:, 1, jpert)), DP)
+        nres = REAL(DOT_PRODUCT(vin(:, 1, jpert) - vout(:, 1, jpert), vin(:, 1, jpert) - vout(:, 1, jpert)), DP)
+        CALL mp_sum(nin, intra_bgrp_comm)
+        CALL mp_sum(nres, intra_bgrp_comm)
+        dr2 = dr2 + nres
+        WRITE(stdout, '(5x,"rtsc dq: pass ",I0," mode ",I4,"  |dV_out - dV_in| / |dV_in| = ",ES10.3)') &
+             it, imode0 + jpert, SQRT(nres / MAX(nin, 1.d-300))
+      ENDDO
+      dr2 = dr2 / (2.d0 * dfftp%nr1 * dfftp%nr2 * dfftp%nr3 * npe)**2 / npe
+      WRITE(stdout, '(/,5x," iter # ",i3," total cpu time :",f8.1," secs   av.it.: ",f5.1)') it, &
+           get_clock('PHONON'), averlt
+      WRITE(stdout, '(5x," thresh=",es10.3," rtsc dq pass |ddv_scf|^2 = ",es10.3)') thresh, dr2
+      IF (.NOT. all_conv) WRITE(stdout, '(5x,"rtsc dq: Sternheimer not converged at all k")')
+      IF (it == nit) EXIT
+      vmix = vout
+      CALL mix_potential(2 * dfftp%nnr * nspin_mag * npe, vmix, dfpt_data%dvscfp, alpha_mix(it), dr2m, &
+                         npe * tr2_ph, it, nmix_ph, flmixdpot, conv)
+      CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     ENDDO
     !
-    ! residual meter and the stationary correction C(i,j) = - int conj(dn_out_i) (dV_in_j - dV_out_j)
+    ! stationary correction C(i,j) = - int conj(dn_out_i) (dV_in_j - dV_out_j), last pass
     IF (ALLOCATED(corr)) DEALLOCATE(corr)
     ALLOCATE(corr(npe, npe))
-    dr2 = 0.d0
     DO jpert = 1, npe
-      nin = REAL(DOT_PRODUCT(vin(:, 1, jpert), vin(:, 1, jpert)), DP)
-      nres = REAL(DOT_PRODUCT(vin(:, 1, jpert) - vout(:, 1, jpert), vin(:, 1, jpert) - vout(:, 1, jpert)), DP)
-      CALL mp_sum(nin, intra_bgrp_comm)
-      CALL mp_sum(nres, intra_bgrp_comm)
-      rel = SQRT(nres / MAX(nin, 1.d-300))
-      dr2 = dr2 + nres
-      WRITE(stdout, '(5x,"rtsc dq: mode ",I4,"  |dV_out - dV_in| / |dV_in| = ",ES10.3)') imode0 + jpert, rel
       DO ipert = 1, npe
         corr(ipert, jpert) = - DOT_PRODUCT(dfpt_data%drhop(:, 1, ipert), vin(:, 1, jpert) - vout(:, 1, jpert)) &
                              * omega / REAL(dfftp%nr1 * dfftp%nr2 * dfftp%nr3, DP)
       ENDDO
     ENDDO
     CALL mp_sum(corr, intra_bgrp_comm)
-    ! as mix_potential + dfpt_kernel print it: (|res| / ndim)^2 / npert, ndim = 2 nnr npert
-    dr2 = dr2 / (2.d0 * dfftp%nr1 * dfftp%nr2 * dfftp%nr3 * npe)**2 / npe
     IF (env_is('RTSC_DQ_VAR', '0')) corr = (0.d0, 0.d0)
     corr_i0 = imode0
     corr_npe = npe
-    cmax = MAXVAL(ABS(corr))
-    WRITE(stdout, '(/,5x," iter #   1 total cpu time :",f8.1," secs   av.it.: ",f5.1)') get_clock('PHONON'), averlt
-    WRITE(stdout, '(5x," thresh=",es10.3," one-shot (rtsc dq) |ddv_scf|^2 = ",es10.3,"  max|C| = ",es10.3)') &
-         thresh, dr2, cmax
-    IF (.NOT. all_conv) WRITE(stdout, '(5x,"rtsc dq: Sternheimer not converged at all k")')
+    WRITE(stdout, '(5x,"rtsc dq: ",I0," pass(es), max|C| = ",es10.3)') nit, MAXVAL(ABS(corr))
     !
-    ! dvscf of this irrep (written by solve_linter for EPW, and used nowhere else): dV_in
+    ! dvscf of this irrep (written by solve_linter for EPW, and used nowhere else): the dV_in of
+    ! the last pass
     dfpt_data%dvscfp = vin
     CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     convt = .TRUE.
     !
     CALL sth_batched_flush_end()
     CALL apply_dpot_deallocate()
-    DEALLOCATE(vin, vout)
+    DEALLOCATE(vin, vout, vmix)
     CALL stop_clock('dq_irrep')
   END SUBROUTINE dq_solve_irrep
   !
