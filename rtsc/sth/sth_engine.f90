@@ -67,6 +67,8 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_debug_slot = 0      ! >0: print the CG history of this slot
   INTEGER, PUBLIC, SAVE :: sth_opvar = 0           ! testing: 1 = (g2 - e) x + Vx (same operator, other rounding)
   INTEGER, PUBLIC, SAVE :: sth_rb = 128            ! threads per column reduction (power of 2, <= 256)
+  LOGICAL, PUBLIC, SAVE :: sth_cold_start = .FALSE. ! dV_ind given (not first_iter) but CG starts from dpsi = 0
+                                                    ! (one-shot pass from an interpolated dvscf, PH/rtsc_dq.f90)
   !
   LOGICAL, SAVE :: ready = .FALSE., staged = .FALSE., qready = .FALSE.
   INTEGER, SAVE :: nksq, npwx, nbnd, nkb, npert, nslot, nproj, nsl, ngrp, nnr, nvalid, nbox
@@ -1181,7 +1183,7 @@ CONTAINS
     ENDIF
     !
     ! CG (cgsolve_all), all columns at once
-    IF (first_iter) CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
+    IF (first_iter .OR. sth_cold_start) CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
     d_conv = 0
     d_cnt = 0
     d_kter = 0.0_dp

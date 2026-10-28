@@ -25,7 +25,7 @@ MODULE sth_batched
   IMPLICIT NONE
   PRIVATE
   PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs, sth_batched_flush_end, &
-            sth_batched_end_q, sth_strict_check
+            sth_batched_end_q, sth_strict_check, sth_batched_cold
   !
   LOGICAL, SAVE :: have_state = .FALSE.
   LOGICAL, SAVE :: pending = .FALSE.        ! engine dpsi not yet written to iudwf
@@ -33,6 +33,7 @@ MODULE sth_batched
   INTEGER, SAVE :: st_npert = -1, st_iudvpsi = -1, st_nksq = -1
   COMPLEX(DP), SAVE :: st_key = (0.d0, 0.d0)
   REAL(DP), SAVE :: st_xq(3) = 1.d10        ! q of the per-q engine state
+  LOGICAL, SAVE :: cold = .FALSE.           ! not first_iter, but dpsi starts from 0 (sth_batched_cold)
   !
 CONTAINS
   !
@@ -157,6 +158,21 @@ CONTAINS
     eng_last = .TRUE.
 #endif
   END SUBROUTINE sth_batched_kernel
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_cold(flag)
+    !--------------------------------------------------------------------------------------------
+    !! flag = .TRUE.: the following calls get dV_ind (first_iter = .FALSE.) but solve from dpsi = 0
+    !! instead of the iudwf warm start (one-shot pass from an interpolated dvscf, PH/rtsc_dq.f90)
+#if defined(__CUDA)
+    USE sth_engine,       ONLY : sth_cold_start
+#endif
+    LOGICAL, INTENT(IN) :: flag
+    cold = flag
+#if defined(__CUDA)
+    sth_cold_start = flag
+#endif
+  END SUBROUTINE sth_batched_cold
   !
   !--------------------------------------------------------------------------------------------
   SUBROUTINE sth_strict_check(what, done)
@@ -319,7 +335,7 @@ CONTAINS
           ENDIF
         ENDIF
         CALL sth_engine_set_dvbare(ik, ipert, dvpsi)
-        IF (.NOT. first_iter) THEN
+        IF (.NOT. (first_iter .OR. cold)) THEN
           CALL get_buffer(dpsi, lrdwf, iudwf, nrec)
           CALL sth_engine_set_dpsi(ik, ipert, dpsi)
         ENDIF
@@ -430,7 +446,7 @@ CONTAINS
           ENDIF
         ENDIF
         CALL sth_engine_set_dvbare(ik, ipert, dvpsi)
-        IF (.NOT. first_iter) THEN
+        IF (.NOT. (first_iter .OR. cold)) THEN
           ! restart in the middle of an irrep: warm start from iudwf, as vanilla
           CALL get_buffer(dpsi, lrdwf, iudwf, nrec)
           CALL sth_engine_set_dpsi(ik, ipert, dpsi)

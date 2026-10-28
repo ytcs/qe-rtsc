@@ -72,6 +72,7 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   USE dfpt_kernels,         ONLY : dfpt_kernel
   USE phus,                 ONLY : becsumort
   USE recover_mod,          ONLY : write_rec
+  USE rtsc_dq,              ONLY : dq_active, dq_solve_irrep, dq_add_dyn
   !
   IMPLICIT NONE
   !
@@ -253,8 +254,13 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   !
   !    Solve DFPT fixed-point equation
   !
-  CALL dfpt_kernel('PHONON', npe, iter0, lrbar, iubar, dr2, dfpt_data, irr, imode0, &
-                   write_rec_callback = write_rec, stop_callback = stop_smoothly_ph)
+  ! rtsc: RTSC_DQ=1 and q /= Gamma: one non-self-consistent pass from the interpolated dvscf
+  IF (dq_active()) THEN
+     CALL dq_solve_irrep(npe, imode0, lrbar, iubar, dr2, dfpt_data)
+  ELSE
+     CALL dfpt_kernel('PHONON', npe, iter0, lrbar, iubar, dr2, dfpt_data, irr, imode0, &
+                      write_rec_callback = write_rec, stop_callback = stop_smoothly_ph)
+  ENDIF
   !
 155 CONTINUE
   !
@@ -268,6 +274,8 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
      IF (lmultipole) CALL write_epsilon(npe, dfpt_data%drhop)
      !
      CALL drhodvus (irr, imode0, dfpt_data%dvscfp, npe)
+     ! rtsc: stationary correction of the one-shot pass (after drhodvus, which resets dyn_rec)
+     IF (dq_active()) CALL dq_add_dyn(imode0, npe)
      IF (nlcc_any) CALL dynmat_nlcc (imode0, dfpt_data%drhop, npe)
      !
      ! Write charge density to file

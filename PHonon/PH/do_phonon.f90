@@ -49,6 +49,7 @@ SUBROUTINE do_phonon(auxdyn)
   USE control_flags,  ONLY : use_gpu
   USE environment,   ONLY : print_cuda_info
   USE sth_batched,   ONLY : sth_batched_end_q
+  USE rtsc_dq,       ONLY : dq_end_q
   
   IMPLICIT NONE
   !
@@ -171,6 +172,7 @@ SUBROUTINE do_phonon(auxdyn)
      ! rtsc (RTSC_STH=1): release the engine's per-q state and the runtime-cached device blocks;
      ! one line with this q's device-memory high-water
      CALL sth_batched_end_q(iq)
+     CALL dq_end_q()
      !
   END DO
 
