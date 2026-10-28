@@ -215,6 +215,9 @@ CONTAINS
            get_clock('PHONON'), averlt
       WRITE(stdout, '(5x," thresh=",es10.3," rtsc dq pass |ddv_scf|^2 = ",es10.3)') thresh, dr2
       IF (.NOT. all_conv) WRITE(stdout, '(5x,"rtsc dq: Sternheimer not converged at all k")')
+      IF (env_is('RTSC_DQ_SYMTEST', '1')) CALL symtest(vout, 'psym(dV_out) vs dV_out')
+      IF (env_is('RTSC_DQ_SYMTEST', '1')) CALL symtest(vin, 'psym(dV_in) vs dV_in')
+      IF (env_is('RTSC_DQ_SYMTEST', '1')) CALL symtest(dfpt_data%drhop, 'psym(dn_out) vs dn_out')
       IF (it == nit) EXIT
       vmix = vout
       CALL mix_potential(2 * dfftp%nnr * nspin_mag * npe, vmix, dfpt_data%dvscfp, alpha_mix(it), dr2m, &
@@ -246,6 +249,27 @@ CONTAINS
     DEALLOCATE(vin, vout, vmix)
     CALL stop_clock('dq_irrep')
   END SUBROUTINE dq_solve_irrep
+  !
+  !------------------------------------------------------------------------------------------------
+  SUBROUTINE symtest(v, what)
+    !! diagnostic (RTSC_DQ_SYMTEST=1): how much psymdvscf changes v, per perturbation
+    USE io_global,        ONLY : stdout
+    USE fft_base,         ONLY : dfftp
+    USE noncollin_module, ONLY : nspin_mag
+    USE lr_symm_base,     ONLY : lr_npert
+    COMPLEX(DP), INTENT(IN) :: v(dfftp%nnr, nspin_mag, lr_npert)
+    CHARACTER(LEN=*), INTENT(IN) :: what
+    COMPLEX(DP), ALLOCATABLE :: w(:,:,:)
+    INTEGER :: ip
+    ALLOCATE(w(dfftp%nnr, nspin_mag, lr_npert))
+    w = v
+    CALL psymdvscf(w, dfftp)
+    DO ip = 1, lr_npert
+      WRITE(stdout, '(5x,"rtsc dq symtest: ",a," pert ",I0,": ",ES10.3)') what, ip, &
+           SQRT(SUM(ABS(w(:, 1, ip) - v(:, 1, ip))**2) / SUM(ABS(v(:, 1, ip))**2))
+    ENDDO
+    DEALLOCATE(w)
+  END SUBROUTINE symtest
   !
   !------------------------------------------------------------------------------------------------
   SUBROUTINE dq_finish_dyn()
