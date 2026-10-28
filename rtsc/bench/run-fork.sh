@@ -17,8 +17,10 @@ prefix=$(grep -oP "prefix\s*=\s*'\K[^']+" scf.in)
 stage() { local name=$1; shift; local t0=$(date +%s.%N); "$@"; local t1=$(date +%s.%N)
           awk -v n="$name" -v a="$t0" -v b="$t1" 'BEGIN{printf "%s\t%.2f\n", n, b-a}' | tee -a timings.tsv; }
 T0=$(date +%s.%N)
-stage scf  env OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 -x RTSC_STH -x RTSC_STRICT -x OMP_NUM_THREADS "$BIN"/pw.x -in scf.in > scf.out
-stage ph   env OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 -x RTSC_STH -x RTSC_STRICT -x OMP_NUM_THREADS "$BIN"/ph.x -in ph.in > ph.out
+# every RTSC_* switch of the caller (e.g. RTSC_STH_MP=1, mixed-precision engine) reaches pw.x / ph.x
+XR=$(env | grep -o '^RTSC_[A-Z0-9_]*' | sed 's/^/-x /' | tr '\n' ' ')
+stage scf  env OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 $XR -x OMP_NUM_THREADS "$BIN"/pw.x -in scf.in > scf.out
+stage ph   env OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 $XR -x OMP_NUM_THREADS "$BIN"/ph.x -in ph.in > ph.out
 stage collect bash -c "
   mkdir -p save; nq=\$(sed -n 2p $prefix.dyn0 | awk '{print \$1}')
   for i in \$(seq 1 \$nq); do
