@@ -719,6 +719,8 @@
     USE wannier2bloch, ONLY : dynwan2bloch, dynifc2blochf
     !
     IMPLICIT NONE
+    INTEGER :: rtsc_i1, rtsc_i2
+    !! rtsc: frequency-bin window of one Gaussian
     !
     INTEGER, INTENT(in) :: nrr_q
     !! number of WS points
@@ -819,7 +821,11 @@
         DO iq = 1, nqtotf
           DO imode = 1, nmodes
             IF (wf(imode, iq) > eps_acoustic) THEN
-              DO iwph = 1, nqstep
+              ! rtsc: only the bins with |ww - wf| / sigma <= sqrt(200) + 1 bin; beyond, w0gauss
+              ! is the clipped exp(-200) ~ 1e-87, below the resolution of any bin with weight
+              rtsc_i1 = MAX(1, FLOOR((wf(imode, iq) - 14.2d0 * sigma) / dw) - 1)
+              rtsc_i2 = MIN(nqstep, CEILING((wf(imode, iq) + 14.2d0 * sigma) / dw) + 1)
+              DO iwph = rtsc_i1, rtsc_i2
                 weightq  = w0gauss((ww(iwph) - wf(imode, iq)) / sigma, 0) / sigma
                 phdos(iwph, ismear) = phdos(iwph, ismear) + wqf(iq) * weightq
                 IF (ismear == 1) &
