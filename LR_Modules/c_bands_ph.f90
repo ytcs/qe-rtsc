@@ -36,6 +36,7 @@ SUBROUTINE c_bands_nscf_ph( )
   USE noncollin_module,     ONLY : noncolin, npol, domag
   USE io_files,             ONLY : tmp_dir, prefix
   USE uspp_init,            ONLY : init_us_2
+  USE sth_nscf_start,       ONLY : nscf_start_prepare, nscf_start_get, nscf_start_free
   !
   IMPLICIT NONE
   !
@@ -74,6 +75,9 @@ SUBROUTINE c_bands_nscf_ph( )
   ! ... For each k point (except those already calculated if restarting)
   ! ... diagonalizes the hamiltonian
   !
+  ! rtsc: rotated scf wavefunctions as Davidson starting vectors (RTSC_NSCF_ROT=1)
+  CALL nscf_start_prepare()
+  !
   k_loop: DO ik = ik_+1, nks
      !
      ! ... Set k-point, spin, kinetic energy, needed by Hpsi
@@ -105,6 +109,10 @@ SUBROUTINE c_bands_nscf_ph( )
      IF ( TRIM(starting_wfc) == 'file' ) THEN
         !
         CALL get_buffer ( evc, nwordwfc, iunwfc, ik )
+        !$acc update device(evc)
+        !
+     ELSE IF ( nscf_start_get( ik, evc ) ) THEN
+        !
         !$acc update device(evc)
         !
      ELSE
@@ -161,6 +169,7 @@ SUBROUTINE c_bands_nscf_ph( )
      !
   END DO k_loop
   !
+  CALL nscf_start_free()
   CALL mp_sum( avg_iter, inter_pool_comm )
   avg_iter = avg_iter / nkstot
   !

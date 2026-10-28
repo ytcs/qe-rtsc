@@ -74,9 +74,16 @@ set(sources
     ccg_psi.f90
     ccgsolve_all.f90
     ch_psi_all_complex.f90
+    sth_dump.f90
+    sth_batched.f90
+    sth_nscf_start.f90
     response_kernels.f90
     efermi_shift.f90
     dfpt_kernels.f90)
+if(QE_ENABLE_CUDA)
+    # rtsc: batched Sternheimer engine (CUDA Fortran, cuFFT, cuBLAS); used by sth_batched.f90
+    list(PREPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/sth_engine.f90)
+endif()
 qe_enable_cuda_fortran("${sources}")
 qe_add_library(qe_lr_modules ${sources})
 target_link_libraries(qe_lr_modules
@@ -94,6 +101,10 @@ target_link_libraries(qe_lr_modules
 if(QE_ENABLE_CUDA)
     target_link_libraries(qe_modules
         PRIVATE
+            CUDA::cublas)
+    target_link_libraries(qe_lr_modules
+        PRIVATE
+            CUDA::cufft
             CUDA::cublas)
 endif()
 

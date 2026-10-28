@@ -84,6 +84,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !
    USE kinds,                ONLY : DP
    USE mp_pools,             ONLY : inter_pool_comm
+   USE sth_batched,          ONLY : sth_batched_flush
    USE mp_bands,             ONLY : intra_bgrp_comm
    USE mp,                   ONLY : mp_sum
    USE fft_base,             ONLY : dfftp, dffts
@@ -481,6 +482,9 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       IF (convt) EXIT
       !
    ENDDO ! iteration
+   !
+   ! rtsc: write the batched engine's dpsi to iudwf (no-op unless the engine ran this irrep)
+   CALL sth_batched_flush()
    !
    ! Update the responses with the Fermi energy shift
    !

@@ -1,0 +1,329 @@
+!
+! rtsc: QE-side adapter of the batched Sternheimer engine (rtsc/sth/sth_engine.f90,
+! groups/compute/STH-ENGINE.md). sternheimer_kernel dispatches here when RTSC_STH=1 and the
+! case is supported; otherwise (or if the engine declines) the vanilla k x pert loop runs.
+!
+! Supported: norm-conserving, collinear, nspin_mag = 1, no DFT+U, no time reversal, q /= 0,
+! lgauss smearing (no tetrahedra, no twochem), no meta-GGA / EXX / real_space / scissor /
+! lelfield, serial FFT within the pool (nproc_bgrp = 1, no task groups), one band group.
+! Any number of pools: each pool rank runs its own engine on its own k-points.
+!
+! At the first call of an irrep (first_iter, or no engine state for this irrep) the adapter
+! gathers QE state for all k (buffers, FFT maps, vkb and g2kin at k+q, vrs, deeq, et, wk, the
+! orthogonalize weights) into the engine. Each call then runs the engine and writes every dpsi
+! back to iudwf, which drhodv, the restart files and the next irrep's consumers read.
+!
+! RTSC_STH_TIME=1 prints the wall time of every call (engine and vanilla paths).
+!
+MODULE sth_batched
+  USE kinds, ONLY : DP
+  IMPLICIT NONE
+  PRIVATE
+  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush
+  !
+  LOGICAL, SAVE :: have_state = .FALSE.
+  LOGICAL, SAVE :: pending = .FALSE.        ! engine dpsi not yet written to iudwf
+  INTEGER, SAVE :: st_npert = -1, st_iudvpsi = -1, st_nksq = -1
+  COMPLEX(DP), SAVE :: st_key = (0.d0, 0.d0)
+  REAL(DP), SAVE :: st_xq(3) = 1.d10        ! q of the per-q engine state
+  !
+CONTAINS
+  !
+  LOGICAL FUNCTION sth_env_flag(name)
+    CHARACTER(LEN=*), INTENT(IN) :: name
+    CHARACTER(LEN=16) :: s
+    INTEGER :: ios
+    sth_env_flag = .FALSE.
+    CALL get_environment_variable(name, s, STATUS=ios)
+    IF (ios == 0) sth_env_flag = (TRIM(s) == '1')
+  END FUNCTION sth_env_flag
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi, thresh, &
+                                dvscfins, all_conv, avg_iter, drhoout, done)
+    !--------------------------------------------------------------------------------------------
+    !! One sternheimer_kernel call on the batched engine. done = .FALSE. on return means the case
+    !! is not supported (or the engine declined) and the caller must run the vanilla loop.
+    USE io_global,        ONLY : stdout
+    USE mp,               ONLY : mp_sum
+    USE mp_pools,         ONLY : inter_pool_comm
+    USE mp_bands,         ONLY : nproc_bgrp, nbgrp
+    USE fft_base,         ONLY : dffts
+    USE buffers,          ONLY : get_buffer, save_buffer
+    USE klist,            ONLY : lgauss, ltetra
+    USE noncollin_module, ONLY : noncolin, npol, nspin_mag
+    USE lsda_mod,         ONLY : lsda
+    USE uspp,             ONLY : okvan
+    USE ldaU,             ONLY : lda_plus_u
+    USE control_lr,       ONLY : lgamma
+    USE control_flags,    ONLY : gamma_only, scissor
+    USE realus,           ONLY : real_space
+    USE bp,               ONLY : lelfield
+    USE xc_lib,           ONLY : exx_is_active, xclib_dft_is
+    USE two_chem,         ONLY : twochem
+    USE units_lr,         ONLY : lrdwf, iudwf
+    USE qpoint,           ONLY : nksq
+    USE wvfct,            ONLY : nbnd, npwx
+    USE eqv,              ONLY : dpsi, dvpsi
+#if defined(__CUDA)
+    USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready
+    USE qpoint,           ONLY : xq
+#endif
+    !
+    LOGICAL, INTENT(IN) :: first_iter, time_reversed
+    INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
+    REAL(DP), INTENT(IN) :: thresh
+    COMPLEX(DP), INTENT(IN) :: dvscfins(dffts%nnr, nspin_mag, npert)
+    LOGICAL, INTENT(OUT) :: all_conv
+    REAL(DP), INTENT(OUT) :: avg_iter
+    COMPLEX(DP), INTENT(INOUT) :: drhoout(dffts%nnr, nspin_mag, npert)
+    LOGICAL, INTENT(OUT) :: done
+    !
+#if defined(__CUDA)
+    INTEGER :: tot_num_iter, tot_cg_calls, nfail, ik, ipert, nrec, ierr
+    COMPLEX(DP) :: key
+    COMPLEX(DP), ALLOCATABLE :: dv(:,:), dr(:,:)
+    LOGICAL :: reinit
+#endif
+    !
+    done = .FALSE.
+#if defined(__CUDA)
+    IF (.NOT. sth_env_flag('RTSC_STH')) RETURN
+    ! supported case (STH-ENGINE.md, v1)
+    IF (time_reversed .OR. okvan .OR. noncolin .OR. lsda .OR. nspin_mag /= 1 .OR. npol /= 1) RETURN
+    IF (lda_plus_u .OR. lgamma .OR. gamma_only .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
+    IF (xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space .OR. scissor .OR. lelfield) RETURN
+    IF (nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups) RETURN
+    IF (dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x) RETURN
+    IF (nksq < 1 .OR. npert > 6) RETURN
+    !
+    ! engine state belongs to this irrep? (re-initialised at every first iteration; otherwise the
+    ! dV_bare psi of (k=1, pert=1) identifies the irrep, e.g. after a restart)
+    CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, 1)
+    key = SUM(dvpsi(:, 1)) + (0.d0, 1.d0) * SUM(ABS(dvpsi(:, 1)))
+    reinit = first_iter .OR. .NOT. have_state .OR. .NOT. sth_engine_ready() .OR. npert /= st_npert &
+             .OR. iudvpsi /= st_iudvpsi .OR. nksq /= st_nksq .OR. key /= st_key
+    IF (reinit) THEN
+      CALL sth_batched_flush()
+      have_state = .FALSE.
+      ! per-q state (k, k+q data, vkb, h_diag, psi(r)) is kept across the irreps of one q
+      IF (.NOT. sth_engine_qready() .OR. ANY(xq /= st_xq) .OR. nksq /= st_nksq) THEN
+        CALL sth_batched_init(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+        st_xq = xq
+      ELSE
+        CALL sth_batched_irrep(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+      ENDIF
+      IF (ierr /= 0) THEN
+        WRITE(stdout, '(5x,"rtsc sth: engine declined (code ",I0,"), vanilla path")') ierr
+        RETURN
+      ENDIF
+      have_state = .TRUE.
+      st_npert = npert; st_iudvpsi = iudvpsi; st_nksq = nksq; st_key = key
+    ENDIF
+    !
+    ALLOCATE(dv(dffts%nnr, npert), dr(dffts%nnr, npert))
+    dv(:, :) = dvscfins(:, 1, :)
+    dr(:, :) = drhoout(:, 1, :)
+    CALL sth_engine_solve(first_iter, thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
+    drhoout(:, 1, :) = dr(:, :)
+    DEALLOCATE(dv, dr)
+    !
+    ! dpsi goes back to iudwf once per irrep (sth_batched_flush, end of dfpt_kernel) or before the
+    ! engine state is replaced; nothing reads iudwf between the calls of one irrep on this path
+    pending = .TRUE.
+    !
+    all_conv = (nfail == 0)
+    IF (.NOT. all_conv) WRITE(stdout, '(5x,"rtsc sth: ",I0," (k,pert) solves not converged, thresh ",ES10.3)') &
+         nfail, thresh
+    CALL mp_sum(tot_num_iter, inter_pool_comm)
+    CALL mp_sum(tot_cg_calls, inter_pool_comm)
+    avg_iter = REAL(tot_num_iter, DP) / REAL(tot_cg_calls, DP)
+    done = .TRUE.
+#endif
+  END SUBROUTINE sth_batched_kernel
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_flush()
+    !--------------------------------------------------------------------------------------------
+    !! write the engine's dpsi of the current irrep to iudwf (drhodv, restart, vanilla warm start)
+    USE buffers,          ONLY : save_buffer
+    USE units_lr,         ONLY : lrdwf, iudwf
+    USE eqv,              ONLY : dpsi
+#if defined(__CUDA)
+    USE sth_engine,       ONLY : sth_engine_get_dpsi
+#endif
+    INTEGER :: ik, ipert, nrec
+    IF (.NOT. pending) RETURN
+#if defined(__CUDA)
+    CALL start_clock('sth_flush')
+    DO ik = 1, st_nksq
+      DO ipert = 1, st_npert
+        nrec = (ipert - 1) * st_nksq + ik
+        CALL sth_engine_get_dpsi(ik, ipert, dpsi)
+        CALL save_buffer(dpsi, lrdwf, iudwf, nrec)
+      ENDDO
+    ENDDO
+    CALL stop_clock('sth_flush')
+#endif
+    pending = .FALSE.
+  END SUBROUTINE sth_batched_flush
+  !
+#if defined(__CUDA)
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_irrep(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+    !--------------------------------------------------------------------------------------------
+    !! new irrep on the per-q engine state: only dV_bare psi (and a warm start) change
+    USE klist,            ONLY : ngk
+    USE wvfct,            ONLY : npwx
+    USE buffers,          ONLY : get_buffer
+    USE units_lr,         ONLY : lrdwf, iudwf
+    USE control_lr,       ONLY : nbnd_occ
+    USE qpoint,           ONLY : nksq, ikks, ikqs
+    USE eqv,              ONLY : dpsi, dvpsi
+    USE sth_engine,       ONLY : sth_engine_irrep, sth_engine_set_dvbare, sth_engine_set_dpsi, &
+                                 sth_engine_irrep_commit
+    LOGICAL, INTENT(IN) :: first_iter
+    INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
+    INTEGER, INTENT(OUT) :: ierr
+    INTEGER :: ik, ipert, nrec, npwq, nock
+    CALL start_clock('sth_irrep')
+    CALL sth_engine_irrep(npert, ierr)
+    IF (ierr /= 0) RETURN
+    DO ik = 1, nksq
+      npwq = ngk(ikqs(ik)); nock = nbnd_occ(ikks(ik))
+      DO ipert = 1, npert
+        nrec = (ipert - 1) * nksq + ik
+        CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
+        IF (npwq < npwx) THEN
+          IF (ANY(dvpsi(npwq + 1:npwx, 1:nock) /= (0.d0, 0.d0))) THEN
+            ierr = 10
+            RETURN
+          ENDIF
+        ENDIF
+        CALL sth_engine_set_dvbare(ik, ipert, dvpsi)
+        IF (.NOT. first_iter) THEN
+          CALL get_buffer(dpsi, lrdwf, iudwf, nrec)
+          CALL sth_engine_set_dpsi(ik, ipert, dpsi)
+        ENDIF
+      ENDDO
+    ENDDO
+    CALL sth_engine_irrep_commit(ierr)
+    CALL stop_clock('sth_irrep')
+  END SUBROUTINE sth_batched_irrep
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_init(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+    !--------------------------------------------------------------------------------------------
+    USE fft_base,         ONLY : dffts
+    USE ions_base,        ONLY : nat, ityp
+    USE klist,            ONLY : xk, wk, ngk, igk_k, degauss, ngauss
+    USE ener,             ONLY : ef
+    USE cell_base,        ONLY : omega
+    USE wvfct,            ONLY : nbnd, npwx, et, g2kin
+    USE wavefunctions,    ONLY : evc
+    USE uspp,             ONLY : vkb, nkb, deeq, ofsbeta
+    USE uspp_param,       ONLY : nh
+    USE uspp_init,        ONLY : init_us_2
+    USE scf,              ONLY : vrs
+    USE buffers,          ONLY : get_buffer
+    USE units_lr,         ONLY : iuwfc, lrwfc, lrdwf, iudwf
+    USE control_lr,       ONLY : nbnd_occ, alpha_pv
+    USE qpoint,           ONLY : nksq, ikks, ikqs
+    USE eqv,              ONLY : dpsi, dvpsi, evq
+    USE sth_engine,       ONLY : sth_engine_init, sth_engine_set_global, sth_engine_set_k, &
+                                 sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup
+    !
+    LOGICAL, INTENT(IN) :: first_iter
+    INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
+    INTEGER, INTENT(OUT) :: ierr
+    !
+    INTEGER :: ik, ikk, ikq, npw, npwq, nock, nockq, ipert, nrec, na, ih, jh, ibnd, jbnd, nslot
+    INTEGER, ALLOCATABLE :: idxk(:), idxkq(:)
+    REAL(DP), ALLOCATABLE :: wwg(:,:), wg1(:)
+    COMPLEX(DP), ALLOCATABLE :: dmat(:,:)
+    REAL(DP) :: w0g, wgp, deltae, theta
+    REAL(DP), EXTERNAL :: wgauss, w0gauss
+    !
+    CALL start_clock('sth_init')
+    nslot = 0
+    DO ik = 1, nksq
+      nslot = MAX(nslot, nbnd_occ(ikks(ik)))
+    ENDDO
+    CALL sth_engine_init(nksq, npwx, nbnd, nkb, npert, nslot, dffts%nr1, dffts%nr2, dffts%nr3, &
+                         dffts%nr1x, dffts%nr2x, dffts%nr3x, dffts%nnr, alpha_pv, omega, ierr)
+    IF (ierr /= 0) RETURN
+    !
+    ! dense nkb x nkb D (block-diagonal per atom), as add_vuspsi applies deeq
+    ALLOCATE(dmat(nkb, nkb))
+    dmat = (0.d0, 0.d0)
+    DO na = 1, nat
+      DO ih = 1, nh(ityp(na))
+        DO jh = 1, nh(ityp(na))
+          dmat(ofsbeta(na) + ih, ofsbeta(na) + jh) = CMPLX(deeq(ih, jh, na, 1), 0.d0, KIND=DP)
+        ENDDO
+      ENDDO
+    ENDDO
+    CALL sth_engine_set_global(vrs(:, 1), dmat)
+    DEALLOCATE(dmat)
+    !
+    ALLOCATE(idxk(npwx), idxkq(npwx), wwg(nbnd, nbnd), wg1(nbnd))
+    DO ik = 1, nksq
+      ikk = ikks(ik); ikq = ikqs(ik)
+      npw = ngk(ikk); npwq = ngk(ikq)
+      nock = nbnd_occ(ikk); nockq = nbnd_occ(ikq)
+      idxk(1:npw) = dffts%nl(igk_k(1:npw, ikk))
+      idxkq(1:npwq) = dffts%nl(igk_k(1:npwq, ikq))
+      CALL get_buffer(evc, lrwfc, iuwfc, ikk)
+      CALL get_buffer(evq, lrwfc, iuwfc, ikq)
+      CALL init_us_2(npwq, igk_k(1, ikq), xk(1, ikq), vkb, .true.)
+      !$acc update host(vkb)
+      CALL g2_kin(ikq)
+      !
+      ! orthogonalize.f90, lgauss branch (twochem excluded)
+      DO ibnd = 1, nock
+        wg1(ibnd) = wgauss((ef - et(ibnd, ikk)) / degauss, ngauss)
+        w0g = w0gauss((ef - et(ibnd, ikk)) / degauss, ngauss) / degauss
+        DO jbnd = 1, nbnd
+          wgp = wgauss((ef - et(jbnd, ikq)) / degauss, ngauss)
+          deltae = et(jbnd, ikq) - et(ibnd, ikk)
+          theta = wgauss(deltae / degauss, 0)
+          wwg(jbnd, ibnd) = wg1(ibnd) * (1.d0 - theta) + wgp * theta
+          IF (jbnd <= nockq) THEN
+            IF (ABS(deltae) > 1.0d-5) THEN
+              wwg(jbnd, ibnd) = wwg(jbnd, ibnd) + alpha_pv * theta * (wgp - wg1(ibnd)) / deltae
+            ELSE
+              wwg(jbnd, ibnd) = wwg(jbnd, ibnd) - alpha_pv * theta * w0g
+            ENDIF
+          ENDIF
+        ENDDO
+      ENDDO
+      !
+      CALL sth_engine_set_k(ik, npw, npwq, nock, nockq, wk(ikk), idxk(1:npw), idxkq(1:npwq), evc, evq, &
+                            et(:, ikk), g2kin, vkb, wwg(:, 1:nock), wg1(1:nock))
+      DO ipert = 1, npert
+        nrec = (ipert - 1) * nksq + ik
+        CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
+        ! the engine keeps rows > npwq at zero; vanilla carries dvbare's padding through cgsolve_all
+        ! (h = g on those rows), so the two agree only when that padding is zero
+        IF (npwq < npwx) THEN
+          IF (ANY(dvpsi(npwq + 1:npwx, 1:nock) /= (0.d0, 0.d0))) THEN
+            ierr = 10
+            RETURN
+          ENDIF
+        ENDIF
+        CALL sth_engine_set_dvbare(ik, ipert, dvpsi)
+        IF (.NOT. first_iter) THEN
+          ! restart in the middle of an irrep: warm start from iudwf, as vanilla
+          CALL get_buffer(dpsi, lrdwf, iudwf, nrec)
+          CALL sth_engine_set_dpsi(ik, ipert, dpsi)
+        ENDIF
+      ENDDO
+    ENDDO
+    DEALLOCATE(idxk, idxkq, wwg, wg1)
+    !$acc update device(evc, evq)
+    CALL sth_engine_setup(ierr)
+    CALL stop_clock('sth_init')
+  END SUBROUTINE sth_batched_init
+#endif
+  !
+END MODULE sth_batched
