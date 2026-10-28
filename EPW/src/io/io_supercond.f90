@@ -2273,6 +2273,13 @@
     !
     IMPLICIT NONE
     !
+    LOGICAL, SAVE :: rtsc_dosef_done = .FALSE.
+    !! rtsc: dosef already computed (it does not depend on q)
+    REAL(KIND = DP), SAVE :: rtsc_dosef
+    !! rtsc: cached dosef
+    LOGICAL :: rtsc_sync
+    !! rtsc: flush the ephmat file and write restart.fmt at this q
+    !
     INTEGER, INTENT(in) :: iqq
     !! Q-point index from selecq.fmt window
     INTEGER, INTENT(in) :: iq
@@ -2366,9 +2373,20 @@
       ! in ephwann_shuffle
     ENDIF
     !
-    dosef = dos_ef(ngaussw, degaussw, ef0, etf, wkf, nkqf, nbndsub)
-    ! N(Ef) in the equation for lambda is the DOS per spin
-    dosef = dosef / two
+    ! rtsc: dos_ef sums wkf * w0gauss over the k points only (wkf(k+q) = 0), so it does not
+    ! depend on q; vanilla recomputed it, with an inter-pool mp_sum, for every q
+    IF (.NOT. rtsc_dosef_done) THEN
+      dosef = dos_ef(ngaussw, degaussw, ef0, etf, wkf, nkqf, nbndsub)
+      ! N(Ef) in the equation for lambda is the DOS per spin
+      dosef = dosef / two
+      rtsc_dosef = dosef
+      rtsc_dosef_done = .TRUE.
+    ELSE
+      dosef = rtsc_dosef
+    ENDIF
+    ! rtsc: flush the ephmat file and write restart.fmt every 64 q and at the last q
+    ! (vanilla: every q)
+    rtsc_sync = (MOD(iqq, 64) == 0) .OR. (iqq == totq)
     !
     ! find the bounds of k-dependent arrays in the parallel case
     nkftot = nktotf
@@ -2570,11 +2588,11 @@
         WRITE(iufileph) tmp_g2(ifil)
       ENDDO
       !
-      FLUSH(iufileph)
+      IF (rtsc_sync) FLUSH(iufileph)
       !
     ENDIF
     !
-    IF (my_pool_id == 0) THEN
+    IF (my_pool_id == 0 .AND. rtsc_sync) THEN
       dummy = 0
       ! format is compatible with IBTE
       OPEN(UNIT = iunrestart, FILE = 'restart.fmt')
