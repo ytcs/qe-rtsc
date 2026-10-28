@@ -1127,6 +1127,7 @@
           ! dynamical matrix : Wannier -> Bloch
           ! ------------------------------------------------------
           !
+          CALL start_clock('epq_pre')
           IF (.NOT. lifc) THEN
             CALL dynwan2bloch(nmodes, nrr_q, irvec_q, ndegen_q, xxq_r, uf, w2, mirror_q)
           ELSE
@@ -1182,6 +1183,8 @@
           ! Fourier factors for batched Wannier -> Bloch
           ! -------------------------------------------------------------
           !
+          CALL stop_clock('epq_pre')
+          CALL start_clock('epq_cfac')
           ! This is a loop over k blocks in the pool (size of the local k-set)
           DO ik = 1, nkf
             !
@@ -1244,6 +1247,7 @@
           ! electron Hamiltonian: Wannier -> Bloch
           ! -------------------------------------------------------------
           !
+          CALL stop_clock('epq_cfac')
           CALL hamwan2bloch_batch(nbndsub, nrr_k, cuf_batch, etf, chw, cfac_batch, &
             nkf, iq, chf_batch, wb_batch)
           !
@@ -1278,7 +1282,10 @@
           ! electron Berry connection: Wannier -> Bloch
           ! -------------------------------------------------------------
           !
+          CALL start_clock('epq_rrf')
           CALL rrwan2bloch_batch(nbndsub, nrr_k, nkf, cfac_batch, rrf_batch)
+          CALL stop_clock('epq_rrf')
+          CALL start_clock('epq_kloop')
           !
           ! This is a loop over k blocks in the pool (size of the local k-set)
           !$omp parallel private(ikk,ikq,xxq_tmp,cfac,cfacq,cufkk,cufkq,rrf,epmatf,eimpmatf,tmp)
@@ -1414,6 +1421,7 @@
           ENDDO  ! end loop over k points
           !$omp end do
           !$omp end parallel
+          CALL stop_clock('epq_kloop')
           !
           IF (MOD(iqq, restart_step) == 0 .AND. adapt_smearing) THEN
             ! Min non-zero value

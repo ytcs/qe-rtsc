@@ -1834,6 +1834,10 @@
     CALL print_clock('el_aniso')
     CALL print_clock('qwindow')
     CALL print_clock('write_ephmat')
+    CALL print_clock('epq_pre')
+    CALL print_clock('epq_cfac')
+    CALL print_clock('epq_rrf')
+    CALL print_clock('epq_kloop')
     CALL print_clock('write_dos')
     CALL print_clock('write_phdos')
     !
