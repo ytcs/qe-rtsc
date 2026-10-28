@@ -142,5 +142,32 @@ def cmd_hull(allj, ms, mace, out):
     print("T1a pass by label (n, pass):", lab)
 
 
+def cmd_t2db(hull, t1b, t2, out):
+    """T2 on database entries: metal (N(E_F) >= 0.05 /eV/atom), non-magnetic (|M| <= 0.1 muB/cell), DFT
+    decomposition energy vs the MatterSim-hull neighbours <= 0.10 eV/atom."""
+    h = json.loads(Path(hull).read_text())
+    b = load(t1b, key="pass_T1b")
+    d = {k: r for (k, x), r in load(t2, by=("id", "xc")).items() if x == "pbe"}
+    res = {}
+    for k, v in h.items():
+        if k not in d:
+            continue
+        r = d[k]
+        neigh = v["mattersim"]["neighbours"]
+        ed = None
+        if all(n in d for n in neigh) and neigh:
+            ed = r["e_atom"] - sum(a * d[n]["e_atom"] for n, a in neigh.items())
+        metal = r.get("N_EF", 0) >= 0.05
+        nonmag = abs(r.get("mag", 0.0)) <= 0.1
+        res[k] = dict(label=v["label"], Tc=v["Tc"], N_EF=r.get("N_EF"), mag=r.get("mag"), dft_decomp=ed,
+                      metal=metal, nonmag=nonmag, pass_T1b=b.get(k, {}).get("pass_T1b"),
+                      pass_T2=bool(metal and nonmag and ed is not None and ed <= 0.10), wall_s=r["wall_s"])
+    Path(out).write_text(json.dumps(res, indent=1))
+    for lab in ("pos", "neg", "mid"):
+        rs = [x for x in res.values() if x["label"] == lab]
+        print(lab, len(rs), "pass", sum(x["pass_T2"] for x in rs), "metal", sum(x["metal"] for x in rs),
+              "hull<=0.1", sum(1 for x in rs if x["dft_decomp"] is not None and x["dft_decomp"] <= 0.10))
+
+
 if __name__ == "__main__":
-    {"access": cmd_access, "hull": cmd_hull}[sys.argv[1]](*sys.argv[2:])
+    {"access": cmd_access, "hull": cmd_hull, "t2db": cmd_t2db}[sys.argv[1]](*sys.argv[2:])
