@@ -249,6 +249,7 @@ CONTAINS
     INTEGER :: istat, nthr, nchunk, ic, ib, ik, iw, maxq, n2p
     INTEGER :: shbytes
     LOGICAL :: uniform
+    CHARACTER(LEN = 16) :: envval
     REAL(dp), ALLOCATABLE :: part(:, :, :, :, :)
     TYPE(dim3) :: grd, blk
     !
@@ -280,6 +281,8 @@ CONTAINS
       IF (wsn(iw) /= iw - 1) uniform = .FALSE.
     ENDDO
     uniform = uniform .AND. (n2 == 2 * nsiw)
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_K4', envval)
+    IF (TRIM(envval) == '0') uniform = .FALSE.   ! force the reference kernel k_fsr
     IF (uniform) THEN
       ! kernel factor table for this temperature
       IF (pit /= ftab_pit .OR. n2 /= ftab_n2) THEN
