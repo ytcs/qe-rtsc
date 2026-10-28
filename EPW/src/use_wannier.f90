@@ -168,6 +168,10 @@
   CHARACTER(LEN = 256) :: fnm
   !! Buffer file name
   LOGICAL :: already_skipped
+  LOGICAL :: rtsc_need_vme
+  !! rtsc: .FALSE. when no consumer of the electron velocities vmef is active
+  CHARACTER(LEN = 16) :: rtsc_env
+  !! rtsc: environment switch
   !! Skipping band during the Wannierization
   LOGICAL :: exst
   !! If the file exist
@@ -1062,6 +1066,14 @@
           ! Do not enter if no quasidegenerate state
         ENDIF
         !------------------------------------------------------------------------------!
+        ! rtsc: vmef (Wannier velocities) is read only by transport, self-energy, spectral,
+        ! absorption, polaron, nesting, adaptive-smearing and printing code; an Eliashberg /
+        ! ephwrite run never reads it, so skip vmewan2bloch_batch then. RTSC_EPW_VME=1 forces it.
+        CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_VME', rtsc_env)
+        rtsc_need_vme = (TRIM(rtsc_env) == '1') .OR. (.NOT. ephwrite) .OR. elecselfen .OR. phonselfen &
+          .OR. plselfen .OR. specfun_el .OR. specfun_ph .OR. specfun_pl .OR. scattering &
+          .OR. iterative_bte .OR. lindabs .OR. loptabs .OR. adapt_smearing .OR. prtvkk .OR. nest_fn &
+          .OR. lwfpt .OR. plrn .OR. explrn .OR. ii_g .OR. lscreen .OR. scatread .OR. int_mob .OR. carrier
         DO iqq = iq_restart, totq
           CALL start_clock ('ep-interp')
           !
@@ -1255,7 +1267,7 @@
           ! electron velocity: Wannier -> Bloch
           ! -------------------------------------------------------------
           !
-          IF (vme == 'wannier') THEN
+          IF (vme == 'wannier' .AND. rtsc_need_vme) THEN
             IF (.NOT. eig_read) THEN
               CALL vmewan2bloch_batch(nbndsub, nrr_k, irvec_k, nkf, &
                 cuf_batch, vmef, etf, etf_ks, chw, cfac_batch, vmef_tmp, chf_a)
