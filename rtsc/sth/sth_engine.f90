@@ -592,6 +592,7 @@ CONTAINS
   SUBROUTINE zero_c(a, n)
     COMPLEX(dp), DEVICE :: a(*)
     INTEGER(8), INTENT(IN) :: n
+    IF (n <= 0) RETURN
     CALL k_zero<<<MIN(INT((n + TPB - 1) / TPB), 4096), TPB, 0, strm>>>(a, n)
     CALL kerr('zero')
   END SUBROUTINE zero_c
@@ -850,6 +851,11 @@ CONTAINS
     REAL(dp) :: t0
     t0 = wtime()
     ierr = 0
+    ! clear a pending (non-sticky) error left by other code, so that kerr reports only the
+    ! engine's own launches; it is printed, not hidden
+    istat = cudaGetLastError()
+    IF (istat /= cudaSuccess) WRITE(*, '(A,A)') 'sth_engine: cleared a pending CUDA error from earlier code: ', &
+         TRIM(cudaGetErrorString(istat))
     IF (.NOT. staged) THEN
       ierr = 1
       RETURN
@@ -972,6 +978,7 @@ CONTAINS
     INTEGER, ALLOCATABLE :: conv(:)
     !
     t0 = wtime()
+    istat = cudaGetLastError()   ! see sth_engine_setup
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     h_dpsi_valid = .FALSE.
     d_drho = drho
