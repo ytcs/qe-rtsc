@@ -14,7 +14,7 @@
     occupations = 'smearing'
     smearing = 'mp'
     degauss = 0.02
-    nbnd = 8
+    nbnd = 16
     nosym = .true.
 /
 &electrons

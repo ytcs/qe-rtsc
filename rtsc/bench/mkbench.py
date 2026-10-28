@@ -18,8 +18,10 @@ SYSTEMS = {
         nat=3, ntyp=2,
         species=[("Mg", 24.305, "Mg_ONCV_PBE-1.2.upf"), ("B", 10.811, "B_ONCV_PBE-1.2.upf")],
         positions=[("Mg", 0, 0, 0), ("B", 1/3, 2/3, 0.5), ("B", 2/3, 1/3, 0.5)],
-        ecutwfc=60, degauss=0.02, nbnd=8,
-        wannier=dict(nbndsub=5, dis_froz_max=8.8,
+        ecutwfc=60, degauss=0.02, nbnd=16,
+        # SG15 Mg carries 2s2p semicore (bands 1-4, at -65/-32 eV): keep them out of
+        # the Wannier subspace. Frozen window top = E_F(scf, 9.56 eV) + 1.4 eV.
+        wannier=dict(nbndsub=5, dis_froz_max=11.0, exclude="1-4",
                      proj=["B:pz", "f=0.5,1.0,0.5:s", "f=0.0,0.5,0.5:s", "f=0.5,0.5,0.5:s"]),
         grids=dict(
             frozen=dict(kscf=18, kq=6, kf=48, qf=24, temps=(10, 55), nstemp=10),
@@ -96,6 +98,7 @@ def epw(s, g):
   epwwrite = .true.
   etf_mem = 1
   nbndsub = {w["nbndsub"]}
+  bands_skipped = 'exclude_bands = {w["exclude"]}'
   wannierize = .true.
   num_iter = 500
   dis_froz_max = {w["dis_froz_max"]}
