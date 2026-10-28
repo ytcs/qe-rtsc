@@ -30,7 +30,7 @@
   laniso = .true.
   limag = .true.
   lpade = .true.
-  conv_thr_iaxis = 1.0d-4
+  conv_thr_iaxis = 1.0d-6
   wscut = 2.0
   temps = 10 25
   nstemp = 4
