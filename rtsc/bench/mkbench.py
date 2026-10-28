@@ -108,6 +108,7 @@ def ph(s, g):
   fildvscf = 'dvscf'
   nq1 = {g["kq"]}, nq2 = {g["kq"]}, nq3 = {g["kq"]}
   tr2_ph = 1.0d-14
+  reduce_io = .true.
 /
 """
 
