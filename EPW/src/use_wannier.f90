@@ -66,6 +66,7 @@
                                pir_all, gammai_all, fermi_energies_t, wkf_irr,     &
                                s_bztoibz, spin_fac
   USE global_setups,    ONLY : use_wannier_setup, lsda_setup
+  USE wannier2bloch,    ONLY : rtsc_ephwan2blochp_batch
   USE wannier2bloch,    ONLY : dmewan2bloch, hamwan2bloch, dynwan2bloch,           &
                                ephwan2blochp, ephwan2bloch, vmewan2bloch,          &
                                dynifc2blochf, vmewan2blochp, rrwan2bloch,          &
@@ -173,6 +174,13 @@
   LOGICAL :: rtsc_need_vme
   !! rtsc: .FALSE. when no consumer of the electron velocities vmef is active
   INTEGER :: rtsc_ir
+  !! rtsc: counter for the host-side Fourier factors
+  LOGICAL :: rtsc_batchp
+  !! rtsc: ephwan2blochp batched over q (GPU build, etf_mem = 0)
+  INTEGER :: rtsc_qb, rtsc_nqb, rtsc_q0, rtsc_j, rtsc_iq
+  !! rtsc: batch size, current batch length, first iqq of the batch, counters
+  REAL(KIND = DP), ALLOCATABLE :: rtsc_xxqb(:, :)
+  COMPLEX(KIND = DP), ALLOCATABLE :: rtsc_epmatfb(:, :)
   !! rtsc: counter for the host-side Fourier factors
   !! rtsc: .FALSE. when no consumer of the electron velocities vmef is active
   CHARACTER(LEN = 16) :: rtsc_env
@@ -1079,6 +1087,24 @@
           .OR. plselfen .OR. specfun_el .OR. specfun_ph .OR. specfun_pl .OR. scattering &
           .OR. iterative_bte .OR. lindabs .OR. loptabs .OR. adapt_smearing .OR. prtvkk .OR. nest_fn &
           .OR. lwfpt .OR. plrn .OR. explrn .OR. ii_g .OR. lscreen .OR. scatread .OR. int_mob .OR. carrier
+        ! rtsc: ephwan2blochp for a batch of q at once (one ZGEMM + one mp_sum per batch);
+        ! RTSC_EPW_QBATCH=0 restores the per-q call
+        rtsc_batchp = .FALSE.
+#if defined(__CUDA)
+        CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_QBATCH', rtsc_env)
+        rtsc_batchp = (TRIM(rtsc_env) /= '0') .AND. (etf_mem == 0) .AND. (.NOT. lfast_kmesh) &
+                      .AND. (.NOT. lopt_w2b) .AND. (.NOT. longrange_only)
+#endif
+        IF (rtsc_batchp) THEN
+          ! at most 64 q and at most ~256 MB per batch
+          rtsc_qb = MAX(1, MIN(64, INT(268435456_8 / (16_8 * nbndsub * nbndsub * nrr_k * nmodes))))
+          IF (ALLOCATED(rtsc_xxqb)) DEALLOCATE(rtsc_xxqb, rtsc_epmatfb)
+          ALLOCATE(rtsc_xxqb(3, rtsc_qb), rtsc_epmatfb(nbndsub * nbndsub * nrr_k * nmodes, rtsc_qb), &
+                   STAT = ierr)
+          IF (ierr /= 0) CALL errore('use_wannier', 'Error allocating rtsc q batch', 1)
+          rtsc_q0 = iq_restart
+          rtsc_nqb = 0
+        ENDIF
         DO iqq = iq_restart, totq
           CALL start_clock ('ep-interp')
           !
@@ -1164,7 +1190,26 @@
           ! --------------------------------------------------------------
           !
           IF (.NOT. longrange_only) THEN
-            CALL ephwan2blochp(nmodes, xxq, irvec_g, ndegen_g, nrr_g, epmatwef, nbndsub, nrr_k, dims, dims2)
+            IF (rtsc_batchp) THEN
+              IF (iqq > rtsc_q0 + rtsc_nqb - 1) THEN
+                ! refill: q-points iqq .. iqq + nqb - 1 (all pools reach this at the same iqq)
+                rtsc_q0 = iqq
+                rtsc_nqb = MIN(rtsc_qb, totq - iqq + 1)
+                DO rtsc_j = 1, rtsc_nqb
+                  rtsc_iq = image_array(iqq + rtsc_j - 1)
+                  IF (rtsc_iq > 0) THEN
+                    rtsc_xxqb(:, rtsc_j) = xqf(:, rtsc_iq)
+                  ELSE
+                    rtsc_xxqb(:, rtsc_j) = 0.d0
+                  ENDIF
+                ENDDO
+                CALL rtsc_ephwan2blochp_batch(nmodes, rtsc_nqb, rtsc_xxqb, irvec_g, nrr_g, &
+                                              rtsc_epmatfb, nbndsub, nrr_k)
+              ENDIF
+              epmatwef = RESHAPE(rtsc_epmatfb(:, iqq - rtsc_q0 + 1), SHAPE(epmatwef))
+            ELSE
+              CALL ephwan2blochp(nmodes, xxq, irvec_g, ndegen_g, nrr_g, epmatwef, nbndsub, nrr_k, dims, dims2)
+            ENDIF
           ENDIF
           CALL wigner_divide_ndegen(epmatwef, 1, nbndsub, nrr_k, nmodes, ndegen_k, dims)
           !
