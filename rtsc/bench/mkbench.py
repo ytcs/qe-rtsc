@@ -24,7 +24,7 @@ SYSTEMS = {
         wannier=dict(nbndsub=5, dis_froz_max=11.0, exclude="1-4",
                      proj=["B:pz", "f=0.5,1.0,0.5:s", "f=0.0,0.5,0.5:s", "f=0.5,0.5,0.5:s"]),
         grids=dict(
-            frozen=dict(kscf=18, kq=6, kf=48, qf=24, temps=(10, 30), nstemp=5),
+            frozen=dict(kscf=18, kq=6, kf=48, qf=24, temps=(10, 20), nstemp=3),
             smoke=dict(kscf=12, kq=3, kf=12, qf=6, temps=(20, 50), nstemp=2),
         ),
     ),
