@@ -29,8 +29,8 @@
   lpade = .true.
   conv_thr_iaxis = 1.0d-4
   wscut = 1.0
-  temps = 10 55
-  nstemp = 10
+  temps = 10 30
+  nstemp = 5
   nsiter = 500
   muc = 0.16
   dvscf_dir = './save'

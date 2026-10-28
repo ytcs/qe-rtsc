@@ -28,7 +28,7 @@
   lpade = .true.
   conv_thr_iaxis = 1.0d-4
   wscut = 2.0
-  temps = 80 160
+  temps = 10 20
   nstemp = 2
   nsiter = 500
   muc = 0.16

@@ -24,7 +24,7 @@ SYSTEMS = {
         wannier=dict(nbndsub=5, dis_froz_max=11.0, exclude="1-4",
                      proj=["B:pz", "f=0.5,1.0,0.5:s", "f=0.0,0.5,0.5:s", "f=0.5,0.5,0.5:s"]),
         grids=dict(
-            frozen=dict(kscf=18, kq=6, kf=48, qf=24, temps=(10, 55), nstemp=10),
+            frozen=dict(kscf=18, kq=6, kf=48, qf=24, temps=(10, 30), nstemp=5),
             smoke=dict(kscf=12, kq=3, kf=12, qf=6, temps=(20, 50), nstemp=2),
         ),
     ),
@@ -46,11 +46,17 @@ SYSTEMS = {
         wannier=dict(nbndsub=11, dis_froz_max=12.05, exclude="1-12", proj=["Ir:d", "H:s"]),
         wscut=2.0,
         grids=dict(
-            frozen=dict(kscf=12, kq=4, kf=32, qf=16, temps=(60, 200), nstemp=8),
-            smoke=dict(kscf=6, kq=2, kf=8, qf=4, temps=(80, 160), nstemp=2),
+            frozen=dict(kscf=12, kq=4, kf=32, qf=16, temps=(10, 25), nstemp=4),
+            smoke=dict(kscf=6, kq=2, kf=8, qf=4, temps=(10, 20), nstemp=2),
         ),
     ),
 }
+
+
+# Every temperature must sit below the T_c that the given grid produces: above T_c the
+# anisotropic solver's Broyden update goes singular and EPW stops (B2 smoke at 80 K with
+# McMillan T_c 28 K). The frozen sets therefore stay at 10-30 K and the accuracy gate
+# compares gaps there (MILESTONE-1.md, 2026-10-27 amendment).
 
 
 def species_block(s):
