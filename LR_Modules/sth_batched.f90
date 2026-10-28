@@ -24,6 +24,7 @@ MODULE sth_batched
   LOGICAL, SAVE :: have_state = .FALSE.
   INTEGER, SAVE :: st_npert = -1, st_iudvpsi = -1, st_nksq = -1
   COMPLEX(DP), SAVE :: st_key = (0.d0, 0.d0)
+  REAL(DP), SAVE :: st_xq(3) = 1.d10        ! q of the per-q engine state
   !
 CONTAINS
   !
@@ -64,7 +65,8 @@ CONTAINS
     USE wvfct,            ONLY : nbnd, npwx
     USE eqv,              ONLY : dpsi, dvpsi
 #if defined(__CUDA)
-    USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready
+    USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready
+    USE qpoint,           ONLY : xq
 #endif
     !
     LOGICAL, INTENT(IN) :: first_iter, time_reversed
@@ -102,7 +104,13 @@ CONTAINS
              .OR. iudvpsi /= st_iudvpsi .OR. nksq /= st_nksq .OR. key /= st_key
     IF (reinit) THEN
       have_state = .FALSE.
-      CALL sth_batched_init(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+      ! per-q state (k, k+q data, vkb, h_diag, psi(r)) is kept across the irreps of one q
+      IF (.NOT. sth_engine_qready() .OR. ANY(xq /= st_xq) .OR. nksq /= st_nksq) THEN
+        CALL sth_batched_init(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+        st_xq = xq
+      ELSE
+        CALL sth_batched_irrep(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+      ENDIF
       IF (ierr /= 0) THEN
         WRITE(stdout, '(5x,"rtsc sth: engine declined (code ",I0,"), vanilla path")') ierr
         RETURN
@@ -138,6 +146,48 @@ CONTAINS
   END SUBROUTINE sth_batched_kernel
   !
 #if defined(__CUDA)
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_irrep(first_iter, npert, lrdvpsi, iudvpsi, ierr)
+    !--------------------------------------------------------------------------------------------
+    !! new irrep on the per-q engine state: only dV_bare psi (and a warm start) change
+    USE klist,            ONLY : ngk
+    USE wvfct,            ONLY : npwx
+    USE buffers,          ONLY : get_buffer
+    USE units_lr,         ONLY : lrdwf, iudwf
+    USE control_lr,       ONLY : nbnd_occ
+    USE qpoint,           ONLY : nksq, ikks, ikqs
+    USE eqv,              ONLY : dpsi, dvpsi
+    USE sth_engine,       ONLY : sth_engine_irrep, sth_engine_set_dvbare, sth_engine_set_dpsi, &
+                                 sth_engine_irrep_commit
+    LOGICAL, INTENT(IN) :: first_iter
+    INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
+    INTEGER, INTENT(OUT) :: ierr
+    INTEGER :: ik, ipert, nrec, npwq, nock
+    CALL start_clock('sth_irrep')
+    CALL sth_engine_irrep(npert, ierr)
+    IF (ierr /= 0) RETURN
+    DO ik = 1, nksq
+      npwq = ngk(ikqs(ik)); nock = nbnd_occ(ikks(ik))
+      DO ipert = 1, npert
+        nrec = (ipert - 1) * nksq + ik
+        CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
+        IF (npwq < npwx) THEN
+          IF (ANY(dvpsi(npwq + 1:npwx, 1:nock) /= (0.d0, 0.d0))) THEN
+            ierr = 10
+            RETURN
+          ENDIF
+        ENDIF
+        CALL sth_engine_set_dvbare(ik, ipert, dvpsi)
+        IF (.NOT. first_iter) THEN
+          CALL get_buffer(dpsi, lrdwf, iudwf, nrec)
+          CALL sth_engine_set_dpsi(ik, ipert, dpsi)
+        ENDIF
+      ENDDO
+    ENDDO
+    CALL sth_engine_irrep_commit(ierr)
+    CALL stop_clock('sth_irrep')
+  END SUBROUTINE sth_batched_irrep
+  !
   !--------------------------------------------------------------------------------------------
   SUBROUTINE sth_batched_init(first_iter, npert, lrdvpsi, iudvpsi, ierr)
     !--------------------------------------------------------------------------------------------

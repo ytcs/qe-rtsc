@@ -40,7 +40,7 @@ MODULE sth_engine
   PUBLIC :: sth_engine_init, sth_engine_set_global, sth_engine_set_k, sth_engine_set_dvbare, &
             sth_engine_set_dpsi, sth_engine_setup, sth_engine_solve, sth_engine_get_dpsi, &
             sth_engine_get_hdiag, sth_engine_set_hdiag, sth_engine_reset_dpsi, sth_engine_free, sth_engine_shutdown, &
-            sth_weights, sth_engine_ready
+            sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready
   !
   ! run statistics of the last solve (seconds; timers need sth_timing = .true.)
   LOGICAL, PUBLIC, SAVE :: sth_timing = .FALSE.
@@ -53,7 +53,7 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_opvar = 0           ! testing: 1 = (g2 - e) x + Vx (same operator, other rounding)
   INTEGER, PUBLIC, SAVE :: sth_rb = 128            ! threads per column reduction (power of 2, <= 256)
   !
-  LOGICAL, SAVE :: ready = .FALSE., staged = .FALSE.
+  LOGICAL, SAVE :: ready = .FALSE., staged = .FALSE., qready = .FALSE.
   INTEGER, SAVE :: nksq, npwx, nbnd, nkb, npert, nslot, nproj, nsl, ngrp, nnr, nvalid, nbox
   INTEGER, SAVE :: nr(3), nrx(3)
   REAL(dp), SAVE :: alpha_pv, omega
@@ -741,13 +741,17 @@ CONTAINS
   ! public API
   !=================================================================================================
   !
+  LOGICAL FUNCTION sth_engine_qready()
+    sth_engine_qready = qready
+  END FUNCTION sth_engine_qready
+  !
   LOGICAL FUNCTION sth_engine_ready()
     sth_engine_ready = ready
   END FUNCTION sth_engine_ready
   !
   SUBROUTINE sth_engine_init(nksq_, npwx_, nbnd_, nkb_, npert_, nslot_, nr1, nr2, nr3, nr1x, nr2x, &
                              nr3x, nnr_, alpha_pv_, omega_, ierr)
-    !! Allocate host staging for one irrep. nslot_ = max over k of nocc_k.
+    !! Allocate host staging for one q (and its first irrep, npert_). nslot_ = max over k of nocc_k.
     INTEGER, INTENT(IN) :: nksq_, npwx_, nbnd_, nkb_, npert_, nslot_, nr1, nr2, nr3, nr1x, nr2x, nr3x, nnr_
     REAL(dp), INTENT(IN) :: alpha_pv_, omega_
     INTEGER, INTENT(OUT) :: ierr
@@ -765,18 +769,15 @@ CONTAINS
     nr = (/ nr1, nr2, nr3 /); nrx = (/ nr1x, nr2x, nr3x /); nnr = nnr_
     alpha_pv = alpha_pv_; omega = omega_
     nproj = nkb + nbnd
-    nsl = nslot * npert * nksq
-    ngrp = npert * nksq
     nbox = nslot * nksq
     ALLOCATE(h_npw(nksq), h_npwq(nksq), h_nock(nksq), h_nockq(nksq), h_wk(nksq))
     ALLOCATE(h_idxk(npwx, nksq), h_idxkq(npwx, nksq), h_g2(npwx, nksq), h_etk(nbnd, nksq))
     ALLOCATE(h_wwg(nbnd, nslot, nksq), h_wg1(nslot, nksq))
-    ALLOCATE(h_W(npwx, nproj, nksq), h_evc(npwx, nbox), h_dvb(npwx, nsl), h_dpsi0(npwx, nsl))
+    ALLOCATE(h_W(npwx, nproj, nksq), h_evc(npwx, nbox))
     h_npw = 0; h_npwq = 0; h_nock = 0; h_nockq = 0; h_wk = 0
     h_idxk = 1; h_idxkq = 1; h_g2 = 0; h_etk = 0; h_wwg = 0; h_wg1 = 0
-    h_W = (0.0_dp, 0.0_dp); h_evc = (0.0_dp, 0.0_dp); h_dvb = (0.0_dp, 0.0_dp)
-    h_dpsi0 = (0.0_dp, 0.0_dp)
-    have_dpsi0 = .FALSE.
+    h_W = (0.0_dp, 0.0_dp); h_evc = (0.0_dp, 0.0_dp)
+    CALL irrep_stage(npert_)
     staged = .TRUE.
   END SUBROUTINE sth_engine_init
   !
@@ -888,43 +889,12 @@ CONTAINS
     d_wgt = 2.0_dp * h_wk / omega
     d_W = h_W
     !
-    ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
-    ALLOCATE(d_t(npwx, nsl), d_cf(nproj, nsl), d_cf2(nproj, nsl), d_ps(nbnd, nsl))
-    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl))
-    d_dvb = h_dvb
-    d_dpsi = h_dpsi0
-    ALLOCATE(d_box(nnr, sth_bmax), d_dv(nnr, npert), d_drho(nnr, npert))
+    ALLOCATE(d_box(nnr, sth_bmax))
     ALLOCATE(d_psir(nnr, nbox))
-    ALLOCATE(h_dpsi(npwx, nsl))
-    h_dpsi_valid = .FALSE.
-    !
-    ! valid slot list (k-major, then pert, then band)
-    nvalid = 0
-    DO ik = 1, nksq
-      nvalid = nvalid + npert * h_nock(ik)
-    ENDDO
-    ALLOCATE(h_valid(nvalid), d_valid(nvalid), d_act(nsl), d_act2(nsl))
-    nvalid = 0
-    DO ik = 1, nksq
-      DO ip = 1, npert
-        DO n = 1, h_nock(ik)
-          nvalid = nvalid + 1
-          h_valid(nvalid) = slot(n, ip, ik)
-        ENDDO
-      ENDDO
-    ENDDO
-    d_valid = h_valid
     istat = cudaDeviceSynchronize()
     !
     CALL make_plans()
     !
-    ! zero the work arrays (invalid slots must stay zero; stale values must be finite)
-    CALL zero_c(d_d0, INT(npwx, 8) * nsl)
-    CALL zero_c(d_g, INT(npwx, 8) * nsl)
-    CALL zero_c(d_h, INT(npwx, 8) * nsl)
-    CALL zero_c(d_t, INT(npwx, 8) * nsl)
-    CALL zero_c(d_cf, INT(nproj, 8) * nsl)
-    CALL zero_c(d_cf2, INT(nproj, 8) * nsl)
     CALL zero_c(d_box, INT(nnr, 8) * sth_bmax)
     !
     ! h_diag
@@ -951,11 +921,107 @@ CONTAINS
       ENDDO
       CALL tsync()
       DEALLOCATE(d_evc)
+    DEALLOCATE(h_evc, h_W)
     istat = cudaDeviceSynchronize()
     CALL chk(istat, 'setup')
-    ready = .TRUE.
+    qready = .TRUE.
+    CALL sth_engine_irrep_commit(ierr)
     sth_t_setup = wtime() - t0
   END SUBROUTINE sth_engine_setup
+  !
+  SUBROUTINE irrep_free()
+    IF (ALLOCATED(h_dvb)) DEALLOCATE(h_dvb, h_dpsi0)
+    IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
+    IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
+    IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho)
+    IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
+  END SUBROUTINE irrep_free
+  !
+  SUBROUTINE irrep_stage(npert_)
+    INTEGER, INTENT(IN) :: npert_
+    npert = npert_
+    nsl = nslot * npert * nksq
+    ngrp = npert * nksq
+    ALLOCATE(h_dvb(npwx, nsl), h_dpsi0(npwx, nsl))
+    h_dvb = (0.0_dp, 0.0_dp)
+    h_dpsi0 = (0.0_dp, 0.0_dp)
+    have_dpsi0 = .FALSE.
+  END SUBROUTINE irrep_stage
+  !
+  SUBROUTINE sth_engine_irrep(npert_, ierr)
+    !! Start a new irrep on the per-q state already set up: keeps k/k+q data, W, h_diag, psi(r) and
+    !! the plans; then set_dvbare (and set_dpsi for a warm start) and sth_engine_irrep_commit.
+    INTEGER, INTENT(IN) :: npert_
+    INTEGER, INTENT(OUT) :: ierr
+    ierr = 0
+    ready = .FALSE.
+    IF (.NOT. qready) THEN
+      ierr = 1
+      RETURN
+    ENDIF
+    IF (npert_ > MAXPERT .OR. npert_ < 1) THEN
+      ierr = 3
+      RETURN
+    ENDIF
+    CALL irrep_free()
+    CALL irrep_stage(npert_)
+  END SUBROUTINE sth_engine_irrep
+  !
+  SUBROUTINE sth_engine_irrep_commit(ierr)
+    !! upload the staged dV_bare psi (and warm start) of the current irrep; allocate its work arrays
+    INTEGER, INTENT(OUT) :: ierr
+    INTEGER :: istat, ik, n, ip
+    INTEGER(8) :: need, freeb, totb
+    ierr = 0
+    IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho)
+    IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
+    IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
+    IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
+    need = 16_8 * npwx * nsl * 7
+    istat = cudaMemGetInfo(freeb, totb)
+    IF (need > freeb - 512_8 * 1024**2) THEN
+      WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: irrep needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
+           REAL(freeb) / 1024.0**3, ' GiB'
+      ierr = 2
+      RETURN
+    ENDIF
+    ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
+    ALLOCATE(d_t(npwx, nsl), d_cf(nproj, nsl), d_cf2(nproj, nsl), d_ps(nbnd, nsl))
+    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl))
+    ALLOCATE(d_dv(nnr, npert), d_drho(nnr, npert))
+    ALLOCATE(h_dpsi(npwx, nsl))
+    h_dpsi_valid = .FALSE.
+    d_dvb = h_dvb
+    d_dpsi = h_dpsi0
+    ! valid slot list (k-major, then pert, then band)
+    nvalid = 0
+    DO ik = 1, nksq
+      nvalid = nvalid + npert * h_nock(ik)
+    ENDDO
+    ALLOCATE(h_valid(nvalid), d_valid(nvalid), d_act(nsl), d_act2(nsl))
+    nvalid = 0
+    DO ik = 1, nksq
+      DO ip = 1, npert
+        DO n = 1, h_nock(ik)
+          nvalid = nvalid + 1
+          h_valid(nvalid) = slot(n, ip, ik)
+        ENDDO
+      ENDDO
+    ENDDO
+    d_valid = h_valid
+    istat = cudaDeviceSynchronize()
+    ! zero the work arrays (invalid slots must stay zero; stale values must be finite)
+    CALL zero_c(d_d0, INT(npwx, 8) * nsl)
+    CALL zero_c(d_g, INT(npwx, 8) * nsl)
+    CALL zero_c(d_h, INT(npwx, 8) * nsl)
+    CALL zero_c(d_t, INT(npwx, 8) * nsl)
+    CALL zero_c(d_cf, INT(nproj, 8) * nsl)
+    CALL zero_c(d_cf2, INT(nproj, 8) * nsl)
+    CALL tsync()
+    ready = .TRUE.
+  END SUBROUTINE sth_engine_irrep_commit
   !
   SUBROUTINE sth_engine_reset_dpsi()
     !! restore the staged warm start (for repeated timing runs of the same call)
@@ -1131,19 +1197,18 @@ CONTAINS
   END SUBROUTINE sth_engine_set_hdiag
   !
   SUBROUTINE sth_engine_free()
-    !! release per-irrep state (keeps the stream, cuBLAS handle and FFT plans)
+    !! release the per-q state (keeps the stream, cuBLAS handle and FFT plans)
     ready = .FALSE.
     staged = .FALSE.
+    qready = .FALSE.
+    CALL irrep_free()
     IF (ALLOCATED(h_npw)) DEALLOCATE(h_npw, h_npwq, h_nock, h_nockq, h_wk, h_idxk, h_idxkq, h_g2, &
-                                     h_etk, h_wwg, h_wg1, h_W, h_evc, h_dvb, h_dpsi0)
-    IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
-    IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
+                                     h_etk, h_wwg, h_wg1)
+    IF (ALLOCATED(h_W)) DEALLOCATE(h_W)
+    IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
     IF (ALLOCATED(d_npw)) DEALLOCATE(d_npw, d_npwq, d_nock, d_nockq, d_idxk, d_idxkq, d_g2, d_etk, &
                                      d_hd, d_wwg, d_wg1, d_wgt, d_W)
-    IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
-                                     d_cnt, d_kter, d_nact, d_av, d_cv)
-    IF (ALLOCATED(d_box)) DEALLOCATE(d_box, d_dv, d_drho, d_psir)
-    IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
+    IF (ALLOCATED(d_box)) DEALLOCATE(d_box, d_psir)
   END SUBROUTINE sth_engine_free
   !
   SUBROUTINE sth_engine_shutdown()
