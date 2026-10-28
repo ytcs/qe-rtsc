@@ -21,6 +21,7 @@ MODULE nscf_engine
   USE cudafor
   USE cufft
   USE cublas_v2
+  USE sth_engine, ONLY : sth_mem_trim, sth_mem_sample
   IMPLICIT NONE
   PRIVATE
   INTEGER, PARAMETER :: dp = SELECTED_REAL_KIND(14, 200)
@@ -255,6 +256,7 @@ CONTAINS
     INTEGER :: istat, nv
     nv = david * nbnd_
     per = 16_8 * npwx_ * (2 * nv + 4 * nbnd_ + nkb_) + 16_8 * nv * (2 * nv + 2 * nbnd_) + 4_8 * nnr_ + 32_8 * npwx_
+    CALL sth_mem_trim()   ! blocks freed earlier but kept by the NVHPC runtime (see sth_engine)
     istat = cudaMemGetInfo(freeb, totb)
     nscf_eng_kmax = INT(MAX(1_8, (freeb - 16_8 * nnr_ * 256 - 2_8 * 1024**3) / per))
   END FUNCTION nscf_eng_kmax
@@ -415,6 +417,7 @@ CONTAINS
     ALLOCATE(d_hc(nvx, nvx, nk), d_sc(nvx, nvx, nk), d_A(nvx, nbnd, nk), d_B(nvx, nbnd, nk))
     ALLOCATE(d_cf(nkb, nbnd, nk), d_cf2(nkb, nbnd, nk), d_t1(npwx, nbnd, nk), d_t2(npwx, nbnd, nk))
     ALLOCATE(d_ewc(nbnd, nk), d_nrm(nbnd, nk), d_box(nnr, bmax))
+    CALL sth_mem_sample()
     d_npw = h_npw; d_idx = h_idx; d_g2 = h_g2; d_vkb = h_vkb
     ALLOCATE(inv(nnr, nk))
     inv = 0
@@ -635,6 +638,7 @@ CONTAINS
     DEALLOCATE(hc, sc, vc, A, B, ew, e, ewc, nbase, notcnv, list, off, ncol, flag, active, conv, info, bconv)
     DEALLOCATE(d_npw, d_idx, d_g2, d_vkb, d_hd, d_inv, d_list, d_off, d_ncol, d_flag, d_psi, d_hpsi, d_new, &
                d_hnew, d_hc, d_sc, d_A, d_B, d_cf, d_cf2, d_t1, d_t2, d_ewc, d_nrm, d_box)
+    CALL sth_mem_trim()
   END SUBROUTINE nscf_eng_solve
   !
   SUBROUTINE nscf_eng_free()

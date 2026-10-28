@@ -14,12 +14,18 @@
 ! back to iudwf, which drhodv, the restart files and the next irrep's consumers read.
 !
 ! RTSC_STH_TIME=1 prints the wall time of every call (engine and vanilla paths).
+! RTSC_STRICT=1 (scored runs, rtsc/bench/run-fork.sh): with RTSC_STH=1, a call that does not run on
+! the engine (unsupported case or engine declined) stops ph.x instead of taking the vanilla loop.
+!
+! sth_batched_end_q (do_phonon, after each q) releases the per-q engine state and the device blocks
+! the NVHPC runtime keeps after DEALLOCATE, and prints one line with the q's device-memory high-water.
 !
 MODULE sth_batched
   USE kinds, ONLY : DP
   IMPLICIT NONE
   PRIVATE
-  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs, sth_batched_flush_end
+  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs, sth_batched_flush_end, &
+            sth_batched_end_q, sth_strict_check
   !
   LOGICAL, SAVE :: have_state = .FALSE.
   LOGICAL, SAVE :: pending = .FALSE.        ! engine dpsi not yet written to iudwf
@@ -122,6 +128,8 @@ CONTAINS
       ENDIF
       IF (ierr /= 0) THEN
         WRITE(stdout, '(5x,"rtsc sth: engine declined (code ",I0,"), vanilla path")') ierr
+        IF (sth_env_flag('RTSC_STRICT')) CALL errore('sth_batched_kernel', &
+             'engine declined (see the sth_engine line above) and RTSC_STRICT=1', ABS(ierr))
         RETURN
       ENDIF
       have_state = .TRUE.
@@ -149,6 +157,47 @@ CONTAINS
     eng_last = .TRUE.
 #endif
   END SUBROUTINE sth_batched_kernel
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_strict_check(what, done)
+    !--------------------------------------------------------------------------------------------
+    !! RTSC_STRICT=1 with RTSC_STH=1: a step that did not run on the engine is an error
+    CHARACTER(LEN=*), INTENT(IN) :: what
+    LOGICAL, INTENT(IN) :: done
+    IF (done) RETURN
+    IF (.NOT. (sth_env_flag('RTSC_STH') .AND. sth_env_flag('RTSC_STRICT'))) RETURN
+    CALL errore(what, 'RTSC_STH=1 but this call is not supported by the engine and RTSC_STRICT=1', 1)
+  END SUBROUTINE sth_strict_check
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_end_q(iq)
+    !--------------------------------------------------------------------------------------------
+    !! end of q-point iq (do_phonon): free the per-q engine state (it was kept until the next q's
+    !! first call, i.e. through that q's nscf), return the runtime-cached device blocks to the driver,
+    !! and print the device-memory high-water of this q (nscf, engine, GPU tail)
+    USE io_global,        ONLY : stdout
+    USE qpoint,           ONLY : nksq
+#if defined(__CUDA)
+    USE sth_engine,       ONLY : sth_engine_free, sth_mem_take_hw, sth_mem_sample
+#endif
+    INTEGER, INTENT(IN) :: iq
+#if defined(__CUDA)
+    INTEGER(8) :: hw, tot, after
+    REAL(DP), PARAMETER :: gib = 1024.d0**3
+    IF (.NOT. sth_env_flag('RTSC_STH')) RETURN
+    IF (pending .AND. flush_needed()) CALL sth_batched_flush()
+    pending = .FALSE.
+    have_state = .FALSE.
+    eng_last = .FALSE.
+    st_xq = 1.d10
+    st_nksq = -1
+    CALL sth_mem_take_hw(hw, tot)
+    CALL sth_engine_free()            ! also returns the runtime-cached blocks (sth_mem_trim)
+    CALL sth_mem_sample(after)        ! the next q's high-water starts from this baseline
+    WRITE(stdout, '(5x,"rtsc mem: q ",I0,", nksq ",I0,": device high-water ",F6.2," GiB, after release ", &
+         &F6.2," GiB (of ",F6.2,")")') iq, nksq, REAL(hw, DP) / gib, REAL(after, DP) / gib, REAL(tot, DP) / gib
+#endif
+  END SUBROUTINE sth_batched_end_q
   !
   !--------------------------------------------------------------------------------------------
   LOGICAL FUNCTION flush_needed()

@@ -79,7 +79,7 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    USE lr_nc_mag,             ONLY : lr_apply_time_reversal
    USE incdrhoscf_mod,        ONLY : incdrhoscf, incdrhoscf_nc
    USE sth_dump,              ONLY : sth_dump_begin, sth_dump_end
-   USE sth_batched,           ONLY : sth_batched_kernel, sth_env_flag
+   USE sth_batched,           ONLY : sth_batched_kernel, sth_env_flag, sth_strict_check
    !
    IMPLICIT NONE
    !
@@ -152,6 +152,7 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
          CALL stop_clock("sth_kernel")
          RETURN
       ENDIF
+      CALL sth_strict_check('sternheimer_kernel', sth_done)   ! RTSC_STRICT=1: no silent vanilla path
    ENDIF
    !
    exclude_hubbard_ = .FALSE.

@@ -41,7 +41,21 @@ MODULE sth_engine
             sth_engine_set_dpsi, sth_engine_setup, sth_engine_solve, sth_engine_get_dpsi, &
             sth_engine_get_hdiag, sth_engine_set_hdiag, sth_engine_reset_dpsi, sth_engine_free, sth_engine_shutdown, &
             sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
-            sth_engine_becs
+            sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw
+  !
+  ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
+  ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
+  ! reuses it only for a later allocation of the same size. The engine and the nscf engine allocate
+  ! sizes that change with every q (nksq) and irrep (npert), so the free lists grew q after q until
+  ! cudaMemGetInfo saw almost nothing free (B1 frozen, q7: 8.75 of 79 GiB free, engine declined).
+  ! sth_mem_trim returns the free lists to the driver (acc_clear_freelists, an NVHPC extension); it
+  ! runs before every memory check and at every q-point boundary. sth_mem_sample records the
+  ! high-water mark of device memory in use (driver view, total - free).
+  INTERFACE
+    SUBROUTINE acc_clear_freelists() BIND(C, name='acc_clear_freelists')
+    END SUBROUTINE acc_clear_freelists
+  END INTERFACE
+  INTEGER(8), SAVE :: mem_hw = 0
   !
   ! run statistics of the last solve (seconds; timers need sth_timing = .true.)
   LOGICAL, PUBLIC, SAVE :: sth_timing = .FALSE.
@@ -612,6 +626,33 @@ CONTAINS
     ENDIF
   END SUBROUTINE kerr
   !
+  SUBROUTINE sth_mem_trim()
+    !! return the device blocks freed so far (kept by the NVHPC runtime) to the driver
+    INTEGER :: istat
+    istat = cudaDeviceSynchronize()
+    CALL acc_clear_freelists()
+  END SUBROUTINE sth_mem_trim
+  !
+  SUBROUTINE sth_mem_sample(used)
+    !! update the high-water mark of device memory in use; optionally return the current use (bytes)
+    INTEGER(8), INTENT(OUT), OPTIONAL :: used
+    INTEGER(8) :: freeb, totb
+    INTEGER :: istat
+    istat = cudaMemGetInfo(freeb, totb)
+    mem_hw = MAX(mem_hw, totb - freeb)
+    IF (PRESENT(used)) used = totb - freeb
+  END SUBROUTINE sth_mem_sample
+  !
+  SUBROUTINE sth_mem_take_hw(hw, total)
+    !! high-water mark since the last call (bytes), then reset it; total device memory (bytes)
+    INTEGER(8), INTENT(OUT) :: hw, total
+    INTEGER(8) :: freeb
+    INTEGER :: istat
+    istat = cudaMemGetInfo(freeb, total)
+    hw = MAX(mem_hw, total - freeb)
+    mem_hw = 0
+  END SUBROUTINE sth_mem_take_hw
+  !
   REAL(dp) FUNCTION wtime()
     INTEGER(8) :: c, r
     CALL SYSTEM_CLOCK(c, r)
@@ -910,6 +951,7 @@ CONTAINS
     ENDIF
     ! memory check (bytes): column arrays, psi(r) cache, FFT box, W
     need = 16_8 * npwx * nsl * 7 + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
+    CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
     IF (need > freeb - 1024_8**3) THEN
       WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
@@ -944,6 +986,7 @@ CONTAINS
     ALLOCATE(d_box(nnr, sth_bmax))
     ALLOCATE(d_psir(nnr, nbox))
     istat = cudaDeviceSynchronize()
+    CALL sth_mem_sample()
     !
     CALL make_plans()
     !
@@ -1032,6 +1075,7 @@ CONTAINS
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
     need = 16_8 * npwx * nsl * 7
+    CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
     IF (need > freeb - 512_8 * 1024**2) THEN
       WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: irrep needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
@@ -1072,6 +1116,7 @@ CONTAINS
     CALL zero_c(d_cf, INT(nproj, 8) * nsl)
     CALL zero_c(d_cf2, INT(nproj, 8) * nsl)
     CALL tsync()
+    CALL sth_mem_sample()
     ready = .TRUE.
   END SUBROUTINE sth_engine_irrep_commit
   !
@@ -1226,6 +1271,7 @@ CONTAINS
     COMPLEX(dp), ALLOCATABLE :: hb(:,:,:)
     INTEGER :: istat, ipol, ik, ip, n, s
     ALLOCATE(d_kqg(npwx, 3, nksq), d_b(nkb, nsl, 4), hb(nkb, nsl, 4))
+    CALL sth_mem_sample()
     d_kqg = kqg
     istat = cudaDeviceSynchronize()
     DO ipol = 0, 3
@@ -1309,6 +1355,7 @@ CONTAINS
                                      d_hd, d_wwg, d_wg1, d_wgt, d_W)
     IF (ALLOCATED(d_box)) DEALLOCATE(d_box, d_psir)
     IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+    CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
   !
   SUBROUTINE sth_engine_shutdown()

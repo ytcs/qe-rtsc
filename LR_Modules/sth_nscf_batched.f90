@@ -53,7 +53,7 @@ CONTAINS
     INTEGER(8) :: nhpsi
     INTEGER, ALLOCATABLE :: idx(:)
     COMPLEX(DP), ALLOCATABLE :: dmat(:,:)
-    LOGICAL :: ok
+    LOGICAL :: ok, strict, unsup
     INTEGER(8) :: c0, c1, cr
     REAL(DP) :: tset, tsol, teig
     INTEGER :: nit
@@ -65,11 +65,18 @@ CONTAINS
     IF (.NOT. (ios == 0 .AND. TRIM(s) == '1')) RETURN
     CALL get_environment_variable('RTSC_NSCF_BATCH', s, STATUS=ios)
     IF (ios == 0 .AND. TRIM(s) == '0') RETURN
-    IF (ik_ /= 0 .OR. isolve /= 0 .OR. david < 2) RETURN
-    IF (okvan .OR. noncolin .OR. npol /= 1 .OR. lsda .OR. lda_plus_u .OR. gamma_only) RETURN
-    IF (xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space) RETURN
-    IF (nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups) RETURN
-    IF (dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x) RETURN
+    CALL get_environment_variable('RTSC_STRICT', s, STATUS=ios)
+    strict = (ios == 0 .AND. TRIM(s) == '1')
+    unsup = ik_ /= 0 .OR. isolve /= 0 .OR. david < 2
+    unsup = unsup .OR. okvan .OR. noncolin .OR. npol /= 1 .OR. lsda .OR. lda_plus_u .OR. gamma_only
+    unsup = unsup .OR. xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space
+    unsup = unsup .OR. nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups
+    unsup = unsup .OR. dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x
+    IF (unsup) THEN
+      ! RTSC_STRICT=1 (scored runs): no silent fallback to the per-k Davidson
+      IF (strict) CALL errore('nscf_batched_run', 'case not supported by the batched nscf and RTSC_STRICT=1', 1)
+      RETURN
+    ENDIF
     !
     CALL start_clock('nscf_batch')
     maxit = 100
