@@ -79,6 +79,7 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    USE lr_nc_mag,             ONLY : lr_apply_time_reversal
    USE incdrhoscf_mod,        ONLY : incdrhoscf, incdrhoscf_nc
    USE sth_dump,              ONLY : sth_dump_begin, sth_dump_end
+   USE sth_batched,           ONLY : sth_batched_kernel, sth_env_flag
    !
    IMPLICIT NONE
    !
@@ -130,10 +131,28 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    !
    EXTERNAL ch_psi_all, cg_psi
    !! functions passed to cgsolve_all
+   LOGICAL :: sth_done
+   !! rtsc: true if the batched engine handled this call
+   INTEGER(8) :: sth_c0, sth_c1, sth_cr
    !
    ! Initialization
    !
    CALL start_clock("sth_kernel")
+   CALL SYSTEM_CLOCK(sth_c0, sth_cr)
+   !
+   ! rtsc: batched Sternheimer engine (RTSC_STH=1, supported cases only; see LR_Modules/sth_batched.f90)
+   !
+   IF (.NOT. PRESENT(exclude_hubbard)) THEN
+      CALL sth_batched_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi, thresh, &
+                              dvscfins, all_conv, avg_iter, drhoout, sth_done)
+      IF (sth_done) THEN
+         CALL SYSTEM_CLOCK(sth_c1)
+         IF (sth_env_flag('RTSC_STH_TIME')) WRITE(stdout, '(5x,"rtsc sth_kernel call: engine ",F10.3," s")') &
+            REAL(sth_c1 - sth_c0, DP) / REAL(sth_cr, DP)
+         CALL stop_clock("sth_kernel")
+         RETURN
+      ENDIF
+   ENDIF
    !
    exclude_hubbard_ = .FALSE.
    IF (PRESENT(exclude_hubbard)) exclude_hubbard_ = exclude_hubbard
@@ -304,6 +323,9 @@ SUBROUTINE sternheimer_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi
    DEALLOCATE(aux2)
    DEALLOCATE(h_diag)
    !
+   CALL SYSTEM_CLOCK(sth_c1)
+   IF (sth_env_flag('RTSC_STH_TIME')) WRITE(stdout, '(5x,"rtsc sth_kernel call: vanilla ",F10.3," s")') &
+      REAL(sth_c1 - sth_c0, DP) / REAL(sth_cr, DP)
    CALL stop_clock("sth_kernel")
    !
 !----------------------------------------------------------------------------
