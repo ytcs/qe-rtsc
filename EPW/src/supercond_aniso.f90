@@ -315,6 +315,7 @@
             CALL mp_barrier(inter_pool_comm)
             !
           ELSE ! not fbw
+            CALL start_clock('eliash_mix')
             DO ik = lower_bnd, upper_bnd
               DO ibnd = 1, nbndfs
                 IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
@@ -327,10 +328,13 @@
             ! Make everything 0 except the range of k-points we are working on
             adeltaip(:, :, 1:lower_bnd - 1) = zero
             adeltaip(:, :, lower_bnd + nks:nkfs) = zero
+            CALL stop_clock('eliash_mix')
             !
             ! collect contributions from all pools
+            CALL start_clock('eliash_comm')
             CALL mp_sum(adeltaip, inter_pool_comm)
             CALL mp_barrier(inter_pool_comm)
+            CALL stop_clock('eliash_comm')
           ENDIF ! fbw
           iter = iter + 1
         ENDDO ! iter
@@ -808,6 +812,9 @@
     !! free energy difference between supercond and normal states
     REAL(KIND = DP), EXTERNAL :: wgauss
     !! Compute the approximate theta function. Used to calculate nel
+    REAL(KIND = DP), EXTERNAL :: get_clock
+    REAL(KIND = DP) :: tgmax, tgmin
+    !! rtsc: per-pool GPU-sum time spread
     REAL(KIND = DP), ALLOCATABLE, SAVE :: inv_wsi(:)
     !! Invese imaginary freq. inv_wsi = 1/wsi. Defined for efficiency reason
     REAL(KIND = DP), ALLOCATABLE, SAVE :: deltaold(:)
@@ -1281,6 +1288,7 @@
       CALL mp_sum(shifti, inter_pool_comm)
       CALL mp_barrier(inter_pool_comm)
     ELSE ! not fbw
+      CALL start_clock('eliash_post')
       deltai(:) = zero
       znormi(:) = zero
       DO iw = 1, nsiw(itemp) ! loop over omega
@@ -1303,6 +1311,7 @@
       CALL mp_sum(deltai, inter_pool_comm)
       CALL mp_sum(znormi, inter_pool_comm)
       CALL mp_barrier(inter_pool_comm)
+      CALL stop_clock('eliash_post')
     ENDIF
     !
     IF (mpime == ionode_id) THEN
@@ -1387,6 +1396,15 @@
     CALL mp_barrier(inter_pool_comm)
     !
     IF (conv .OR. iter == nsiter) THEN
+      !
+      ! rtsc: per-rank spread of the cumulative GPU-sum time (rank 0's clock hides the slowest pool)
+      IF (rtsc_eliash_gpu()) THEN
+        tgmax = get_clock('eliash_gpu')
+        tgmin = tgmax
+        CALL mp_max(tgmax, inter_pool_comm)
+        CALL mp_min(tgmin, inter_pool_comm)
+        WRITE(stdout, '(5x, a, 2f12.2)') 'rtsc eliash_gpu cumulative min/max over pools (s):', tgmin, tgmax
+      ENDIF
       !
       IF (fbw) THEN
         ! SH: write the chemical potential for fbw runs

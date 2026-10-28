@@ -15,6 +15,7 @@
 !
 MODULE epw_gpu_eliash
   USE cudafor
+  USE cublas_v2
   IMPLICIT NONE
   PRIVATE
   INTEGER, PARAMETER :: dp = KIND(1.d0)
@@ -31,6 +32,28 @@ MODULE epw_gpu_eliash
   INTEGER :: ftab_n2 = -1
   INTEGER(8) :: sz_static = -1
   INTEGER :: nsplit = 1
+  INTEGER :: nsiw_alloc = -1, nsplit_alloc = -1, nadp_alloc = -1
+  !
+  ! Low-rank (GEMM) path. The kernel row of a pair, l(m) = 2 dosef sum_nu g2 f_nu(m) with
+  ! f_nu(m) = w_nu / (w_nu^2 + omega_m^2), lies (to ~1e-14 relative) in the span of R orthonormal
+  ! vectors u_r(m) (SVD of f over a log grid of w spanning the phonon frequencies). With
+  ! c_r(nu, q) = 2 dosef sum_m u_r(m) f_nu(m), the sums of k_fsr become, per pool,
+  !   Z(kn, r, c) = sum_s' A(kn, r, s') B(s', c)               (GEMM 1, c = iwp of ez | ed)
+  !   az(iw, kn)  = sum_{r, iwp} [u_r(|iw-iwp|) - u_r(iw+iwp-1)] Z(kn, r, iwp)        (GEMM 2)
+  !   ad(iw, kn)  = sum_{r, iwp} [u_r(|iw-iwp|) + u_r(iw+iwp-1)] Z(kn, r, N + iwp)
+  !                 - mu*s sum_iwp Z(kn, 0, N + iwp)
+  ! where A(kn, r, s') = sum over pairs (q, jbnd) of k with (jbnd, k+q) = s' of
+  ! weight * sum_nu g2 c_r (r >= 1) or weight (r = 0), built once per temperature. naz does not
+  ! depend on Delta and is computed once per temperature. Same sums, different FP order.
+  INTEGER, PARAMETER :: lr_ngrid = 400, lr_rmax = 64
+  REAL(dp), PARAMETER :: lr_svtol = 1.0E-15_dp
+  REAL(dp), DEVICE, ALLOCATABLE :: d_lra(:), d_lrz(:), d_lrb(:), d_lrwm(:), d_lrwp(:), &
+                                   d_lru(:), d_lrc(:), d_lrout(:), d_lrres(:)
+  REAL(dp), ALLOCATABLE :: lr_naz(:)
+  REAL(dp) :: lr_pit = -1.0_dp
+  INTEGER :: lr_nsiw = -1, lr_r = 0
+  LOGICAL :: lr_have_handle = .FALSE.
+  TYPE(cublasHandle) :: lr_h
   !
   PUBLIC :: ege_fsr, ege_reset
   !
@@ -54,7 +77,283 @@ CONTAINS
     IF (ALLOCATED(d_ez)) DEALLOCATE(d_ez, d_ed)
     ftab_pit = -1.0_dp; ftab_n2 = -1
     sz_static = -1
+    nsiw_alloc = -1; nsplit_alloc = -1; nadp_alloc = -1
+    CALL lr_free()
   END SUBROUTINE ege_reset
+  !
+  SUBROUTINE lr_free()
+    IF (ALLOCATED(d_lra)) DEALLOCATE(d_lra)
+    IF (ALLOCATED(d_lrz)) DEALLOCATE(d_lrz)
+    IF (ALLOCATED(d_lrb)) DEALLOCATE(d_lrb)
+    IF (ALLOCATED(d_lrwm)) DEALLOCATE(d_lrwm, d_lrwp)
+    IF (ALLOCATED(d_lru)) DEALLOCATE(d_lru)
+    IF (ALLOCATED(d_lrc)) DEALLOCATE(d_lrc)
+    IF (ALLOCATED(d_lrout)) DEALLOCATE(d_lrout)
+    IF (ALLOCATED(d_lrres)) DEALLOCATE(d_lrres)
+    IF (ALLOCATED(lr_naz)) DEALLOCATE(lr_naz)
+    lr_pit = -1.0_dp; lr_nsiw = -1; lr_r = 0
+  END SUBROUTINE lr_free
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_lrcoef(n2, nr, ncol, wf, eps_ac, pit, scal, u, c, res)
+    !! c(r, col) = scal * sum_m u(m, r) f_col(m), f_col(m) = w / (w^2 + (2 (m-1) pit)^2) (0 if
+    !! w <= eps_ac); res(col) = max_m |f - sum_r u c / scal| / f(1): the projection residual.
+    INTEGER, VALUE :: n2, nr, ncol
+    REAL(dp), VALUE :: eps_ac, pit, scal
+    REAL(dp), DEVICE :: wf(ncol), u(n2, nr), c(nr, ncol), res(ncol)
+    INTEGER :: col, m, r
+    REAL(dp) :: w, om, f, acc(lr_rmax), rec, e
+    col = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    IF (col > ncol) RETURN
+    w = wf(col)
+    IF (w <= eps_ac) THEN
+      DO r = 1, nr
+        c(r, col) = 0.0_dp
+      ENDDO
+      res(col) = 0.0_dp
+      RETURN
+    ENDIF
+    DO r = 1, nr
+      acc(r) = 0.0_dp
+    ENDDO
+    DO m = 1, n2
+      om = DBLE(2 * (m - 1)) * pit
+      f = w / (w * w + om * om)
+      DO r = 1, nr
+        acc(r) = acc(r) + u(m, r) * f
+      ENDDO
+    ENDDO
+    e = 0.0_dp
+    DO m = 1, n2
+      om = DBLE(2 * (m - 1)) * pit
+      f = w / (w * w + om * om)
+      rec = 0.0_dp
+      DO r = 1, nr
+        rec = rec + u(m, r) * acc(r)
+      ENDDO
+      e = MAX(e, ABS(f - rec))
+    ENDDO
+    res(col) = e * w      ! relative to f(1) = 1 / w
+    DO r = 1, nr
+      c(r, col) = scal * acc(r)
+    ENDDO
+  END SUBROUTINE k_lrcoef
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_lrbuild(nkl, kl0, nb, mq, nm, nr1, nkn, nst, g2, c, ixkqf, ixqfs, &
+                                          nqfs, ekfs, w0g, wqf, a, ef0, fsthick, inv_dos)
+    !! A(kn, r, s') for kn = ibnd + nb (ikl - 1), r = 0..nr1-1, s' = jbnd + nb (kq - 1).
+    !! One thread per (kn, r); pairs in vanilla's (q, jbnd) order; no atomics (deterministic).
+    INTEGER, VALUE :: nkl, kl0, nb, mq, nm, nr1, nkn, nst
+    REAL(dp), VALUE :: ef0, fsthick, inv_dos
+    REAL(dp), DEVICE :: g2(nkl, mq, nb, nb, nm), c(nr1 - 1, nm, *), ekfs(nb, *), w0g(nb, *), wqf(*)
+    INTEGER, DEVICE :: ixkqf(nkl, *), ixqfs(nkl, *), nqfs(*)
+    REAL(dp), DEVICE :: a(nkn, 0:nr1 - 1, nst)
+    INTEGER :: r, kn, ikl, ik, ibnd, iq, iq0, kq, jbnd, nu, s
+    REAL(dp) :: weight, v
+    r = threadIdx%x - 1
+    kn = blockIdx%x
+    IF (r >= nr1) RETURN
+    ibnd = MOD(kn - 1, nb) + 1
+    ikl = (kn - 1) / nb + 1
+    ik = kl0 - 1 + ikl
+    IF (ABS(ekfs(ibnd, ik) - ef0) >= fsthick) RETURN
+    DO iq = 1, nqfs(ik)
+      iq0 = ixqfs(ikl, iq)
+      kq = ixkqf(ikl, iq0)
+      DO jbnd = 1, nb
+        IF (ABS(ekfs(jbnd, kq) - ef0) < fsthick) THEN
+          weight = wqf(iq) * w0g(jbnd, kq) * inv_dos
+          IF (r == 0) THEN
+            v = weight
+          ELSE
+            v = 0.0_dp
+            DO nu = 1, nm
+              v = v + g2(ikl, iq, ibnd, jbnd, nu) * c(r, nu, iq0)
+            ENDDO
+            v = weight * v
+          ENDIF
+          s = jbnd + nb * (kq - 1)
+          a(kn, r, s) = a(kn, r, s) + v
+        ENDIF
+      ENDDO
+    ENDDO
+  END SUBROUTINE k_lrbuild
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_lrnaz(nkn, nr1, nst, nsiw, a, dwsi, z)
+    !! z(kn, r + nr1 (iwp - 1)) = dwsi(iwp) * sum_s' A(kn, r, s') (the naz input, r >= 1).
+    INTEGER, VALUE :: nkn, nr1, nst, nsiw
+    REAL(dp), DEVICE :: a(nkn, 0:nr1 - 1, nst), dwsi(nsiw), z(nkn, 0:nr1 - 1, nsiw)
+    INTEGER :: kn, r, s, iwp
+    REAL(dp) :: t
+    kn = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    r = blockIdx%y - 1
+    IF (kn > nkn) RETURN
+    t = 0.0_dp
+    IF (r > 0) THEN
+      DO s = 1, nst
+        t = t + a(kn, r, s)
+      ENDDO
+    ENDIF
+    DO iwp = 1, nsiw
+      z(kn, r, iwp) = t * dwsi(iwp)
+    ENDDO
+  END SUBROUTINE k_lrnaz
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_lrw(n2, nr1, nsiw, u, mucs, wm, wp)
+    !! wm/wp(r + nr1 (iwp - 1), iw) = u_r(|iw - iwp|) -/+ u_r(iw + iwp - 1) (0-based kernel index);
+    !! r = 0: wm = 0, wp = -mucs.
+    INTEGER, VALUE :: n2, nr1, nsiw
+    REAL(dp), VALUE :: mucs
+    REAL(dp), DEVICE :: u(n2, nr1 - 1), wm(0:nr1 - 1, nsiw, nsiw), wp(0:nr1 - 1, nsiw, nsiw)
+    INTEGER :: r, iwp, iw
+    REAL(dp) :: lm, lp
+    iwp = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    iw = blockIdx%y
+    IF (iwp > nsiw) RETURN
+    wm(0, iwp, iw) = 0.0_dp
+    wp(0, iwp, iw) = -mucs
+    DO r = 1, nr1 - 1
+      lm = u(ABS(iw - iwp) + 1, r)
+      lp = u(iw + iwp, r)
+      wm(r, iwp, iw) = lm - lp
+      wp(r, iwp, iw) = lm + lp
+    ENDDO
+  END SUBROUTINE k_lrw
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_lrb(nsiw, nst, wsi, dwsi, adp, b)
+    !! b(iwp, s') = dw wp / sqrt(wp^2 + D^2), b(nsiw + iwp, s') = dw D / sqrt(wp^2 + D^2)
+    INTEGER, VALUE :: nsiw, nst
+    REAL(dp), DEVICE :: wsi(nsiw), dwsi(nsiw), adp(nsiw, nst), b(2 * nsiw, nst)
+    INTEGER :: iw, s
+    REAL(dp) :: d, e
+    iw = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    s = blockIdx%y
+    IF (iw > nsiw) RETURN
+    d = adp(iw, s)
+    e = dwsi(iw) / SQRT(wsi(iw) * wsi(iw) + d * d)
+    b(iw, s) = e * wsi(iw)
+    b(nsiw + iw, s) = e * d
+  END SUBROUTINE k_lrb
+  !
+  SUBROUTINE lr_setup(nkl, kl0, nkfs, nb, mq, nm, nqtot, nsiw, n2, wf, ef0, fsthick, eps_ac, &
+                      dosef, pit, inv_dos, mucs, ok)
+    !! Per temperature: basis u_r, coefficients c_r(nu, q), A, the GEMM-2 kernels and naz.
+    INTEGER, INTENT(IN) :: nkl, kl0, nkfs, nb, mq, nm, nqtot, nsiw, n2
+    REAL(dp), INTENT(IN) :: wf(nm * nqtot), ef0, fsthick, eps_ac, dosef, pit, inv_dos, mucs
+    LOGICAL, INTENT(OUT) :: ok
+    INTEGER :: istat, i, m, ng, nr, nr1, nkn, nst, lwork, info, ncol, j
+    REAL(dp) :: wmin, wmax, w, om, resmax
+    REAL(dp), ALLOCATABLE :: f(:, :), s(:), u(:, :), vt(:, :), work(:), res(:)
+    INTEGER(8) :: na
+    !
+    ok = .FALSE.
+    ncol = nm * nqtot
+    wmin = HUGE(1.0_dp); wmax = 0.0_dp
+    DO i = 1, ncol
+      IF (wf(i) > eps_ac) THEN
+        wmin = MIN(wmin, wf(i)); wmax = MAX(wmax, wf(i))
+      ENDIF
+    ENDDO
+    IF (wmax <= 0.0_dp) RETURN
+    ! SVD of f over a log grid of w (columns scaled to max 1)
+    ng = lr_ngrid
+    ALLOCATE(f(n2, ng), s(MIN(n2, ng)), u(n2, MIN(n2, ng)), vt(1, 1))
+    DO j = 1, ng
+      w = wmin * (wmax / wmin)**(DBLE(j - 1) / DBLE(ng - 1))
+      IF (ng == 1 .OR. wmax <= wmin) w = wmin
+      DO m = 1, n2
+        om = DBLE(2 * (m - 1)) * pit
+        f(m, j) = w * w / (w * w + om * om)
+      ENDDO
+    ENDDO
+    ALLOCATE(work(1))
+    CALL DGESVD('S', 'N', n2, ng, f, n2, s, u, n2, vt, 1, work, -1, info)
+    lwork = INT(work(1)); DEALLOCATE(work); ALLOCATE(work(lwork))
+    CALL DGESVD('S', 'N', n2, ng, f, n2, s, u, n2, vt, 1, work, lwork, info)
+    IF (info /= 0) RETURN
+    nr = 0
+    DO i = 1, MIN(n2, ng)
+      IF (s(i) > lr_svtol * s(1)) nr = i
+    ENDDO
+    nr = MIN(nr + 1, MIN(n2, ng), lr_rmax)
+    nr1 = nr + 1
+    nkn = nb * nkl
+    nst = nb * nkfs
+    na = INT(nkn, 8) * nr1 * nst
+    IF (na * 8 > 6_8 * 1024**3) RETURN     ! > 6 GB per pool: keep the direct kernel
+    !
+    CALL lr_free()
+    ALLOCATE(d_lru(n2 * nr), d_lrc(nr * ncol), d_lrres(ncol), res(ncol))
+    istat = cudaMemcpy(d_lru, u, n2 * nr); CALL chk(istat, 'H2D u')
+    CALL k_lrcoef<<<(ncol + 127) / 128, 128>>>(n2, nr, ncol, d_wf, eps_ac, pit, 2.0_dp * dosef, &
+         d_lru, d_lrc, d_lrres)
+    istat = cudaGetLastError(); CALL chk(istat, 'k_lrcoef')
+    res = d_lrres
+    resmax = MAXVAL(res)
+    IF (resmax > 1.0E-12_dp) THEN
+      WRITE(*, '(a, es10.3, a)') ' epw_gpu_eliash: low-rank residual ', resmax, ', using the direct kernel'
+      CALL lr_free()
+      RETURN
+    ENDIF
+    !
+    ALLOCATE(d_lra(na))
+    istat = cudaMemset(d_lra, 0.0_dp, na); CALL chk(istat, 'memset A')
+    CALL k_lrbuild<<<nkn, 32 * ((nr1 + 31) / 32)>>>(nkl, kl0, nb, mq, nm, nr1, nkn, nst, d_g2, &
+         d_lrc, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, d_wqf, d_lra, ef0, fsthick, inv_dos)
+    istat = cudaGetLastError(); CALL chk(istat, 'k_lrbuild')
+    !
+    ALLOCATE(d_lrwm(nr1 * nsiw * nsiw), d_lrwp(nr1 * nsiw * nsiw))
+    CALL k_lrw<<<dim3((nsiw + 127) / 128, nsiw, 1), dim3(128, 1, 1)>>>(n2, nr1, nsiw, d_lru, mucs, &
+         d_lrwm, d_lrwp)
+    istat = cudaGetLastError(); CALL chk(istat, 'k_lrw')
+    ALLOCATE(d_lrz(INT(nkn, 8) * nr1 * 2 * nsiw), d_lrb(2 * nsiw * nst), d_lrout(2 * nsiw * nkn))
+    ! naz (Delta independent)
+    CALL k_lrnaz<<<dim3((nkn + 127) / 128, nr1, 1), dim3(128, 1, 1)>>>(nkn, nr1, nst, nsiw, d_lra, &
+         d_dwsi, d_lrz)
+    istat = cudaGetLastError(); CALL chk(istat, 'k_lrnaz')
+    CALL lr_handle()
+    istat = cublasDgemm(lr_h, CUBLAS_OP_T, CUBLAS_OP_T, nsiw, nkn, nr1 * nsiw, 1.0_dp, d_lrwm, &
+                        nr1 * nsiw, d_lrz, nkn, 0.0_dp, d_lrout, nsiw)
+    CALL chk(istat, 'dgemm naz')
+    ALLOCATE(lr_naz(nsiw * nkn))
+    istat = cudaMemcpy(lr_naz, d_lrout, nsiw * nkn); CALL chk(istat, 'D2H naz')
+    lr_pit = pit; lr_nsiw = nsiw; lr_r = nr
+    ok = .TRUE.
+    IF (kl0 == 1) WRITE(*, '(a, i4, a, i4, a, es10.3, a, f8.1, a)') ' epw_gpu_eliash: low rank R = ', &
+       nr, ' for 2N = ', n2, ', max residual ', resmax, ', A ', DBLE(na) * 8.0_dp / 1024.0_dp**2, ' MB'
+    DEALLOCATE(f, s, u, vt, work, res)
+  END SUBROUTINE lr_setup
+  !
+  SUBROUTINE lr_handle()
+    INTEGER :: istat
+    IF (lr_have_handle) RETURN
+    istat = cublasCreate(lr_h); CALL chk(istat, 'cublasCreate')
+    lr_have_handle = .TRUE.
+  END SUBROUTINE lr_handle
+  !
+  SUBROUTINE lr_iter(nkl, nkfs, nb, nsiw, naz, az, ad)
+    !! One application of the summed kernel to the current Delta (d_adp).
+    INTEGER, INTENT(IN) :: nkl, nkfs, nb, nsiw
+    REAL(dp), INTENT(OUT) :: naz(nsiw * nb * nkl), az(nsiw * nb * nkl), ad(nsiw * nb * nkl)
+    INTEGER :: istat, nkn, nst, nr1, mm, jj
+    nkn = nb * nkl; nst = nb * nkfs; nr1 = lr_r + 1
+    mm = nkn * nr1; jj = nr1 * nsiw
+    CALL k_lrb<<<dim3((nsiw + 127) / 128, nst, 1), dim3(128, 1, 1)>>>(nsiw, nst, d_wsi, d_dwsi, &
+         d_adp, d_lrb)
+    istat = cudaGetLastError(); CALL chk(istat, 'k_lrb')
+    ! Z(kn + nkn r, c) = sum_s' A(kn + nkn r, s') b(c, s')
+    istat = cublasDgemm(lr_h, CUBLAS_OP_N, CUBLAS_OP_T, mm, 2 * nsiw, nst, 1.0_dp, d_lra, mm, &
+                        d_lrb, 2 * nsiw, 0.0_dp, d_lrz, mm)
+    CALL chk(istat, 'dgemm Z')
+    istat = cublasDgemm(lr_h, CUBLAS_OP_T, CUBLAS_OP_T, nsiw, nkn, jj, 1.0_dp, d_lrwm, jj, &
+                        d_lrz, nkn, 0.0_dp, d_lrout, nsiw)
+    CALL chk(istat, 'dgemm az')
+    istat = cublasDgemm(lr_h, CUBLAS_OP_T, CUBLAS_OP_T, nsiw, nkn, jj, 1.0_dp, d_lrwp, jj, &
+                        d_lrz(INT(nkn, 8) * jj + 1:), nkn, 0.0_dp, d_lrout(nsiw * nkn + 1:), nsiw)
+    CALL chk(istat, 'dgemm ad')
+    istat = cudaMemcpy(az, d_lrout, nsiw * nkn); CALL chk(istat, 'D2H az')
+    istat = cudaMemcpy(ad, d_lrout(nsiw * nkn + 1:), nsiw * nkn); CALL chk(istat, 'D2H ad')
+    naz = lr_naz
+  END SUBROUTINE lr_iter
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_ftab(n2, nm, nqtot, wf, eps_ac, pit, ftab)
     !! ftab(m, nu, q) = wf(nu,q) / (wf^2 + omega_m^2), omega_m = 2 (m-1) pi T (lambdar_aniso_ver1)
@@ -370,11 +669,13 @@ CONTAINS
     INTEGER(8) :: sz
     INTEGER :: istat, nthr, nchunk, ic, ib, ik, iw, maxq, n2p, ntile
     INTEGER :: shbytes
-    LOGICAL :: uniform
+    LOGICAL :: uniform, lrok, lrchk
+    REAL(dp), ALLOCATABLE :: chk_n(:, :, :), chk_z(:, :, :), chk_d(:, :, :)
     CHARACTER(LEN = 16) :: envval
     REAL(dp), ALLOCATABLE :: part(:, :, :, :, :)
     TYPE(dim3) :: grd, blk
     !
+    lrchk = .FALSE.
     IF (nkl <= 0) RETURN
     IF (nsiw > 1024) CALL chk(1, 'nsiw > 1024 not supported')
     ! temperature-independent arrays: upload once (g2 is fixed for the whole run)
@@ -392,9 +693,13 @@ CONTAINS
     nsplit = MAX(1, MIN(maxq, (8 * 108 + nkl * nb - 1) / (nkl * nb)))
     nchunk = (maxq + nsplit - 1) / nsplit
     nsplit = (maxq + nchunk - 1) / nchunk
-    IF (ALLOCATED(d_wsi)) DEALLOCATE(d_wsi, d_dwsi, d_wsn, d_adp, d_part)
-    ALLOCATE(d_wsi(nsiw), d_dwsi(nsiw), d_wsn(nsiw), d_adp(nsiw * nb * nkfs), &
-             d_part(nsiw * 3 * nb * nkl * nsplit))
+    ! per-temperature buffers: reallocate only when the sizes change (cudaFree synchronises)
+    IF (nsiw /= nsiw_alloc .OR. nsplit /= nsplit_alloc .OR. nsiw * nb * nkfs /= nadp_alloc) THEN
+      IF (ALLOCATED(d_wsi)) DEALLOCATE(d_wsi, d_dwsi, d_wsn, d_adp, d_part)
+      ALLOCATE(d_wsi(nsiw), d_dwsi(nsiw), d_wsn(nsiw), d_adp(nsiw * nb * nkfs), &
+               d_part(nsiw * 3 * nb * nkl * nsplit))
+      nsiw_alloc = nsiw; nsplit_alloc = nsplit; nadp_alloc = nsiw * nb * nkfs
+    ENDIF
     d_wsi = wsi; d_dwsi = dwsi; d_wsn = wsn; d_adp = adp
     !
     istat = cudaGetLastError()   ! clear an error left pending by earlier (non-rtsc) code
@@ -403,11 +708,25 @@ CONTAINS
       IF (wsn(iw) /= iw - 1) uniform = .FALSE.
     ENDDO
     uniform = uniform .AND. (n2 == 2 * nsiw)
-    ! Default kernel: k_fsr. On the B1 proxy k_fsr4/k_fsr5 were not faster at 10 K (the sum is
-    ! FP64-issue bound) and k_fsr5's reassociation moved the near-zero pi-gap peak of B1 smoke
-    ! out of the gate. RTSC_EPW_ELIASH_KERNEL=4 or 5 selects them.
+    ! Default: low-rank GEMM path (uniform grid). RTSC_EPW_ELIASH_KERNEL=1 selects the direct
+    ! kernel k_fsr; 4 or 5 the register-window variants k_fsr4/k_fsr5.
     CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_KERNEL', envval)
+    IF (uniform .AND. TRIM(envval) /= '1' .AND. TRIM(envval) /= '4' .AND. TRIM(envval) /= '5') THEN
+      lrok = (pit == lr_pit .AND. nsiw == lr_nsiw)
+      IF (.NOT. lrok) CALL lr_setup(nkl, kl0, nkfs, nb, mq, nm, nqtot, nsiw, n2, wf, ef0, fsthick, &
+                                    eps_ac, dosef, pit, inv_dos, mucs, lrok)
+      IF (lrok) THEN
+        CALL lr_iter(nkl, nkfs, nb, nsiw, naz, az, ad)
+        CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_CHECK', envval)
+        IF (TRIM(envval) /= '1') RETURN
+        ! check mode: also run k_fsr on the same input and report the max relative differences
+        ALLOCATE(chk_n(nsiw, nb, nkl), chk_z(nsiw, nb, nkl), chk_d(nsiw, nb, nkl))
+        chk_n = naz; chk_z = az; chk_d = ad
+        lrchk = .TRUE.
+      ENDIF
+    ENDIF
     IF (TRIM(envval) /= '4' .AND. TRIM(envval) /= '5') uniform = .FALSE.
+    IF (lrchk) uniform = .FALSE.
     IF (uniform) THEN
       ! kernel factor table for this temperature
       IF (pit /= ftab_pit .OR. n2 /= ftab_n2) THEN
@@ -469,6 +788,14 @@ CONTAINS
       ENDDO
     ENDDO
     DEALLOCATE(part)
+    IF (lrchk) THEN
+      WRITE(*, '(a, i5, 3es11.3)') ' epw_gpu_eliash check: kl0, max rel diff naz/az/ad ', kl0, &
+        MAXVAL(ABS(chk_n - naz)) / MAX(MAXVAL(ABS(naz)), TINY(1.0_dp)), &
+        MAXVAL(ABS(chk_z - az)) / MAX(MAXVAL(ABS(az)), TINY(1.0_dp)), &
+        MAXVAL(ABS(chk_d - ad)) / MAX(MAXVAL(ABS(ad)), TINY(1.0_dp))
+      naz = chk_n; az = chk_z; ad = chk_d
+      DEALLOCATE(chk_n, chk_z, chk_d)
+    ENDIF
   END SUBROUTINE ege_fsr
   !
 END MODULE epw_gpu_eliash
