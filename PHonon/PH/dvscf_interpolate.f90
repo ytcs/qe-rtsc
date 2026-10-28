@@ -662,12 +662,17 @@ MODULE dvscf_interpolate
     INTEGER, INTENT(IN) :: sign
     !
     INTEGER :: imode, na, ig, ipol, is
+    INTEGER :: ir, i1, i2, i3, m(3), ios
+    LOGICAL :: full_box
+    CHARACTER(LEN=16) :: envs
     REAL(DP) :: arg
     COMPLEX(DP) :: gtau
     COMPLEX(DP), ALLOCATABLE :: aux1(:)
     COMPLEX(DP), ALLOCATABLE :: aux2(:)
     COMPLEX(DP), ALLOCATABLE :: eigqts(:)
     !
+    CALL get_environment_variable('RTSC_DQ', envs, STATUS=ios)
+    full_box = (ios == 0 .AND. TRIM(envs) == '1' .AND. dfftp%nproc == 1)
     CALL start_clock('dvscf_shift')
     !
     ALLOCATE(aux1(dfftp%nnr))
@@ -696,6 +701,31 @@ MODULE dvscf_interpolate
         CALL fwfft('Rho', aux1, dfftp)
         !
         na = ((imode - 1) / 3) + 1
+        !
+        ! rtsc (RTSC_DQ=1, serial FFT): shift every component of the FFT box, not only the
+        ! G-sphere. The induced potential has components outside the sphere (xc in real space);
+        ! dropping them made the q -> R -> q round trip inexact even at the q of the input grid.
+        IF (full_box) THEN
+          DO ir = 1, dfftp%nr1x * dfftp%nr2x * dfftp%nr3x
+            i1 = MOD(ir - 1, dfftp%nr1x)
+            i2 = MOD((ir - 1) / dfftp%nr1x, dfftp%nr2x)
+            i3 = (ir - 1) / (dfftp%nr1x * dfftp%nr2x)
+            IF (i1 >= dfftp%nr1 .OR. i2 >= dfftp%nr2 .OR. i3 >= dfftp%nr3) CYCLE
+            m(1) = i1; m(2) = i2; m(3) = i3
+            IF (2 * m(1) > dfftp%nr1) m(1) = m(1) - dfftp%nr1
+            IF (2 * m(2) > dfftp%nr2) m(2) = m(2) - dfftp%nr2
+            IF (2 * m(3) > dfftp%nr3) m(3) = m(3) - dfftp%nr3
+            gtau = eigts1(m(1), na) * eigts2(m(2), na) * eigts3(m(3), na) * eigqts(na)
+            DO ipol = 1, 3
+              IF (shift_half(ipol) .AND. MOD(m(ipol), 2) /= 0) gtau = -gtau
+            ENDDO
+            IF (sign == -1) gtau = CONJG(gtau)
+            aux2(ir) = aux1(ir) * gtau
+          ENDDO
+          CALL invfft('Rho', aux2, dfftp)
+          dvscf_q(:, is, imode) = aux2
+          CYCLE
+        ENDIF
         !
         DO ig = 1, ngm
           gtau = eigts1(mill(1,ig), na) * eigts2(mill(2,ig), na) * &

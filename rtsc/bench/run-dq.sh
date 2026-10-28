@@ -45,7 +45,7 @@ q2r() { cat > sub/dq2r.in <<EOF
   do_charge_neutral = .false.
 /
 EOF
-        (cd sub && OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 -x OMP_NUM_THREADS "$BIN"/dvscf_q2r.x \
+        (cd sub && RTSC_DQ=1 OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 -x RTSC_DQ -x OMP_NUM_THREADS "$BIN"/dvscf_q2r.x \
            -in dq2r.in > dq2r.out < /dev/null); }
 stage q2r q2r
 export RTSC_DQ=1 RTSC_DQ_WPOT=$W/sub/w_pot/
