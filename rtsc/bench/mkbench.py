@@ -136,7 +136,7 @@ def main(sysid, variant):
     k = g["kscf"]
     (out / "scf.in").write_text(pw(s, "scf", f"K_POINTS automatic\n{k} {k} {k} 0 0 0\n"))
     (out / "ph.in").write_text(ph(s, g))
-    (out / "nscf.in").write_text(pw(s, "nscf", kfull(g["kq"]), f"\n    nbnd = {s['nbnd']}\n    nosym = .true."))
+    (out / "nscf.in").write_text(pw(s, "nscf", kfull(g["kq"]), f"\n    nbnd = {s['nbnd']}"))
     (out / "epw.in").write_text(epw(s, g))
     print(f"wrote {out}")
 
