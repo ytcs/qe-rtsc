@@ -1,9 +1,21 @@
 # qe-rtsc
 
 The RTSC campaign's fork of Quantum ESPRESSO, branched from the `qe-7.6`
-release tag. EPW is included in this tree. The program, the milestone
-definition and the benchmark ledger live in the campaign workspace
-(`../MILESTONE-1.md`, `../groups/compute/`).
+release tag. EPW is included in this tree. Everything specific to the fork
+lives under `rtsc/`:
+
+- `bench/`: frozen benchmark inputs (`mkbench.py` generates them) and the
+  timed pipeline runner `run.sh`.
+- `pod/`: GPU build script for the NVHPC image on RunPod.
+- `pseudo.sh`: fetches the SG15 pseudopotentials the benchmarks use.
+
+Benchmark rules (baseline, accuracy gate, timing) are in MILESTONE-1.md
+in the campaign workspace.
+
+On a GPU pod:
+
+    git clone https://github.com/ytcs/qe-rtsc && cd qe-rtsc && git checkout rtsc
+    rtsc/pseudo.sh && rtsc/pod/build-gpu.sh . 80      # 80 = A100, 90 = H100
 
 ## Branches and tags
 
@@ -28,5 +40,4 @@ licence is compatible and record the decision here:
 | python-sscha / CellConstructor | check before import | — |
 | phonopy, pymatgen, ASE | BSD / MIT / LGPL | interface-level use only |
 
-Changes are distributed under QE's terms. The repo stays private until the
-owner decides otherwise.
+Changes are distributed under QE's terms (GPL).
