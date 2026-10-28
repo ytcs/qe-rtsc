@@ -131,6 +131,8 @@
     USE epw_onemkl
 #endif
   !
+  USE input,            ONLY : rtsc_lpolar => lpolar
+  USE global_var,       ONLY : rtsc_qrpl => qrpl
   IMPLICIT NONE
   !
   INTEGER, INTENT(in) :: dims
@@ -169,6 +171,9 @@
   !! Buffer file name
   LOGICAL :: already_skipped
   LOGICAL :: rtsc_need_vme
+  !! rtsc: .FALSE. when no consumer of the electron velocities vmef is active
+  INTEGER :: rtsc_ir
+  !! rtsc: counter for the host-side Fourier factors
   !! rtsc: .FALSE. when no consumer of the electron velocities vmef is active
   CHARACTER(LEN = 16) :: rtsc_env
   !! rtsc: environment switch
@@ -1237,7 +1242,8 @@
           ENDDO
 #if defined(__CUDA)
           !$acc end parallel
-          !$acc update self(cfac_batch)
+          ! rtsc: no copy of cfac_batch to the host (2*nkf*nrr_k per q); the k loop below builds
+          ! cfac/cfacq on the host only for the (k, k+q) pairs inside the Fermi window
 #else
           !$omp end target teams distribute parallel do
           !$omp target update from(cfac_batch)
@@ -1283,7 +1289,9 @@
           ! -------------------------------------------------------------
           !
           CALL start_clock('epq_rrf')
-          CALL rrwan2bloch_batch(nbndsub, nrr_k, nkf, cfac_batch, rrf_batch)
+          ! rtsc: rrf (Berry connection) only enters the polar / quadrupole long-range term of
+          ! ephwan2bloch; skip it (and its per-q host/device copies) otherwise
+          IF (rtsc_lpolar .OR. rtsc_qrpl) CALL rrwan2bloch_batch(nbndsub, nrr_k, nkf, cfac_batch, rrf_batch)
           CALL stop_clock('epq_rrf')
           CALL start_clock('epq_kloop')
           !
@@ -1317,8 +1325,17 @@
                 cufkk = cuf_batch(:, :, ikk)
                 cufkq = cuf_batch(:, :, ikq)
                 !
+#if defined(__CUDA)
+                DO rtsc_ir = 1, nrr_k
+                  cfac(rtsc_ir) = EXP(ci * twopi * (irvec_r(1, rtsc_ir) * xkq_batch(1, ikk) + &
+                    irvec_r(2, rtsc_ir) * xkq_batch(2, ikk) + irvec_r(3, rtsc_ir) * xkq_batch(3, ikk)))
+                  cfacq(rtsc_ir) = EXP(ci * twopi * (irvec_r(1, rtsc_ir) * xkq_batch(1, ikq) + &
+                    irvec_r(2, rtsc_ir) * xkq_batch(2, ikq) + irvec_r(3, rtsc_ir) * xkq_batch(3, ikq)))
+                ENDDO
+#else
                 cfac = cfac_batch(:, ikk)
                 cfacq = cfac_batch(:, ikq)
+#endif
                 !
                 rrf = rrf_batch(:, :, :, ikk)
                 !
