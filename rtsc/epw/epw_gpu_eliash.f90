@@ -164,6 +164,7 @@ CONTAINS
     shbytes = 8 * (n2 + 3 * nsiw)
     blk = dim3(nthr, 1, 1)
     grd = dim3(nkl, nb, nsplit)
+    istat = cudaGetLastError()   ! clear an error left pending by earlier (non-rtsc) code
     CALL k_fsr<<<grd, blk, shbytes>>>(nkl, kl0, nb, mq, nm, nsiw, n2, nchunk, &
          d_g2, d_wf, d_ixkqf, d_ixqfs, d_nqfs, d_ekfs, d_w0g, d_wqf, d_wsi, d_wsn, d_dwsi, d_adp, &
          d_part, ef0, fsthick, eps_ac, dosef, pit, inv_dos, mucs)
