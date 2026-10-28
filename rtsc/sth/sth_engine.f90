@@ -100,6 +100,32 @@ MODULE sth_engine
   COMPLEX(dp), DEVICE, ALLOCATABLE :: d_box2(:,:)
   INTEGER, PINNED, ALLOCATABLE, SAVE :: h_nact(:)
   !
+  ! Mixed precision (sth_mp, RTSC_STH_MP=1; groups/compute/MIXED-LOG.md). Defect correction per
+  ! column on A = H_kq - e_n + alpha_pv P_v, which is fixed for all SCF calls of one irrep:
+  !   FP64 state  x = dpsi, b = dvpsi (dV psi + orthogonalize, FP64 as before), Ax (kept across calls)
+  !   round:      r = Ax - b (FP64); converged if sqrt(<h_diag r, r>) < thresh (the cgsolve_all test,
+  !               on the true FP64 residual); otherwise solve A e = -r by the cgsolve_all PCG in FP32
+  !               (C2C cuFFT, CGEMM, FP32 W/vrs/D/h_diag; per-column dots accumulated in FP64) to
+  !               max(sth_mp_safe*thresh, sth_mp_eta*|r|), then x += e and Ax = A x in FP64.
+  ! A call therefore costs one FP64 operator application per round (usually one) plus the FP32 CG
+  ! steps, against 1 + (CG steps) FP64 applications on the FP64 path. dvpsi, orthogonalize and
+  ! incdrhoscf (drho) are unchanged and FP64.
+  INTEGER, PARAMETER :: sp = SELECTED_REAL_KIND(6, 37)
+  LOGICAL, PUBLIC, SAVE :: sth_mp = .FALSE.        ! set before sth_engine_init (per q)
+  REAL(dp), PUBLIC, SAVE :: sth_mp_eta = 1.0e-4_dp, sth_mp_safe = 0.5_dp
+  INTEGER, PUBLIC, SAVE :: sth_mp_maxround = 10
+  INTEGER(8), PUBLIC, SAVE :: sth_n64 = 0, sth_n32 = 0   ! FP64 / FP32 column applications, last solve
+  INTEGER, PUBLIC, SAVE :: sth_nround = 0
+  REAL(dp), PUBLIC, SAVE :: sth_t_cg64 = 0                ! FP64 applications inside the MP CG (sth_timing)
+  LOGICAL, SAVE :: mp_q = .FALSE.                  ! the per-q state has the FP32 copies
+  LOGICAL, SAVE :: ax_valid = .FALSE.              ! d_g holds A d_dpsi (FP64) on every valid slot
+  INTEGER, SAVE :: plans32(0:MAXPLAN-1) = 0, nplan32 = 0
+  REAL(sp), DEVICE, ALLOCATABLE :: s_vrs(:), s_hd(:,:,:), s_g2(:,:)
+  REAL(dp), DEVICE, ALLOCATABLE :: d_tol(:)
+  INTEGER, DEVICE, ALLOCATABLE :: d_iconv(:), d_oact(:)
+  COMPLEX(sp), DEVICE, ALLOCATABLE :: s_W(:,:,:), s_dmat(:,:), s_box(:,:)
+  COMPLEX(sp), DEVICE, ALLOCATABLE :: s_e(:,:), s_g(:,:), s_h(:,:), s_t(:,:), s_cf(:,:), s_cf2(:,:)
+  !
 CONTAINS
   !
   !=================================================================================================
@@ -624,6 +650,312 @@ CONTAINS
     ENDDO
   END SUBROUTINE k_drho
   !
+  !-------------------------------------------------------------------------------------------------
+  ! mixed precision (sth_mp): FP32 operator, FP32 PCG with FP64 dots, FP64 round control
+  !-------------------------------------------------------------------------------------------------
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_d2s_c(a, b, n)
+    ! a (FP32) = b (FP64)
+    INTEGER(8), VALUE :: n
+    COMPLEX(sp) :: a(n)
+    COMPLEX(dp) :: b(n)
+    INTEGER(8) :: i
+    i = INT(blockIdx%x - 1, 8) * blockDim%x + threadIdx%x
+    DO WHILE (i <= n)
+      a(i) = CMPLX(b(i), KIND=sp)
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_d2s_c
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_d2s_r(a, b, n)
+    INTEGER(8), VALUE :: n
+    REAL(sp) :: a(n)
+    REAL(dp) :: b(n)
+    INTEGER(8) :: i
+    i = INT(blockIdx%x - 1, 8) * blockDim%x + threadIdx%x
+    DO WHILE (i <= n)
+      a(i) = REAL(b(i), sp)
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_d2s_r
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_zero_s(a, n)
+    INTEGER(8), VALUE :: n
+    COMPLEX(sp) :: a(n)
+    INTEGER(8) :: i
+    i = INT(blockIdx%x - 1, 8) * blockDim%x + threadIdx%x
+    DO WHILE (i <= n)
+      a(i) = (0.0_sp, 0.0_sp)
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_zero_s
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_scatter_s(box, x, list, s0, nnr, npwx, nslot, npert, nksq, inv)
+    ! FP32 k_scatter_full
+    INTEGER, VALUE :: s0, nnr, npwx, nslot, npert, nksq
+    COMPLEX(sp) :: box(nnr, *), x(npwx, *)
+    INTEGER :: list(*), inv(nnr, nksq)
+    INTEGER :: j, s, k, ir, ig
+    j = blockIdx%y
+    s = list(s0 + j)
+    k = (s - 1) / (nslot * npert) + 1
+    ir = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    IF (ir <= nnr) THEN
+      ig = inv(ir, k)
+      IF (ig > 0) THEN
+        box(ir, j) = x(ig, s)
+      ELSE
+        box(ir, j) = (0.0_sp, 0.0_sp)
+      ENDIF
+    ENDIF
+  END SUBROUTINE k_scatter_s
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_vmul_s(box, v, nnr)
+    INTEGER, VALUE :: nnr
+    COMPLEX(sp) :: box(nnr, *)
+    REAL(sp) :: v(nnr)
+    INTEGER :: ir, j
+    j = blockIdx%y
+    ir = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    IF (ir <= nnr) box(ir, j) = box(ir, j) * v(ir)
+  END SUBROUTINE k_vmul_s
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_gather_h_s(y, x, box, list, s0, nnr, npwx, nslot, npert, nksq, nbnd, &
+                                             npwq, idxq, g2, etk, scale)
+    ! FP32 k_gather_h: y = g2kin x + Vloc x - e_n x ; rows > npwq zeroed
+    INTEGER, VALUE :: s0, nnr, npwx, nslot, npert, nksq, nbnd
+    REAL(sp), VALUE :: scale
+    COMPLEX(sp) :: y(npwx, *), x(npwx, *), box(nnr, *)
+    INTEGER :: list(*), npwq(nksq), idxq(npwx, nksq)
+    REAL(sp) :: g2(npwx, nksq)
+    REAL(dp) :: etk(nbnd, nksq)
+    INTEGER :: j, s, k, n, ig
+    COMPLEX(sp) :: xv
+    j = blockIdx%y
+    s = list(s0 + j)
+    k = (s - 1) / (nslot * npert) + 1
+    n = MOD(s - 1, nslot) + 1
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    IF (ig <= npwx) THEN
+      IF (ig <= npwq(k)) THEN
+        xv = x(ig, s)
+        y(ig, s) = g2(ig, k) * xv + box(idxq(ig, k), j) * scale - REAL(etk(n, k), sp) * xv
+      ELSE
+        y(ig, s) = (0.0_sp, 0.0_sp)
+      ENDIF
+    ENDIF
+  END SUBROUTINE k_gather_h_s
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_coef_h_s(cf2, cf, dmat, nproj, nkb, nslot, npert, nksq, nockq, alpha)
+    ! FP32 k_coef_h
+    INTEGER, VALUE :: nproj, nkb, nslot, npert, nksq
+    REAL(sp), VALUE :: alpha
+    COMPLEX(sp) :: cf2(nproj, *), cf(nproj, *), dmat(nkb, nkb)
+    INTEGER :: nockq(nksq)
+    INTEGER :: i, s, k, j, m
+    COMPLEX(sp) :: acc
+    s = blockIdx%x
+    i = threadIdx%x
+    IF (i > nproj) RETURN
+    k = (s - 1) / (nslot * npert) + 1
+    IF (i <= nkb) THEN
+      acc = (0.0_sp, 0.0_sp)
+      DO j = 1, nkb
+        acc = acc + dmat(i, j) * cf(j, s)
+      ENDDO
+      cf2(i, s) = acc
+    ELSE
+      m = i - nkb
+      IF (m <= nockq(k)) THEN
+        cf2(i, s) = alpha * cf(i, s)
+      ELSE
+        cf2(i, s) = (0.0_sp, 0.0_sp)
+      ENDIF
+    ENDIF
+  END SUBROUTINE k_coef_h_s
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_check_s(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
+                                          cnt, tol, first)
+    ! k_check on FP32 g, h with an FP64 dot and a per-column tolerance tol(s)
+    INTEGER, VALUE :: nslot, npert, npwx, nksq, first
+    INTEGER :: list(*), npwq(nksq), conv(*), cnt(*)
+    REAL(sp) :: hd(npwx, nslot, nksq)
+    REAL(dp) :: rho(*), tol(*)
+    COMPLEX(sp) :: g(npwx, *), h(npwx, *)
+    REAL(dp), SHARED :: red(RB)
+    REAL(sp), SHARED :: gam
+    INTEGER, SHARED :: cvd
+    INTEGER :: s, k, n, ig, nq, tid, st, istat
+    REAL(dp) :: acc, rn
+    COMPLEX(sp) :: gv
+    tid = threadIdx%x
+    s = list(blockIdx%x)
+    k = (s - 1) / (nslot * npert) + 1
+    n = MOD(s - 1, nslot) + 1
+    nq = npwq(k)
+    acc = 0.0_dp
+    DO ig = tid, nq, blockDim%x
+      gv = g(ig, s)
+      acc = acc + REAL(hd(ig, n, k) * (REAL(gv)**2 + AIMAG(gv)**2), dp)
+    ENDDO
+    red(tid) = acc
+    CALL syncthreads()
+    st = blockDim%x / 2
+    DO WHILE (st > 0)
+      IF (tid <= st) red(tid) = red(tid) + red(tid + st)
+      CALL syncthreads()
+      st = st / 2
+    ENDDO
+    IF (tid == 1) THEN
+      rn = red(1)
+      istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
+      IF (SQRT(rn) < tol(s)) THEN
+        conv(s) = 1
+        cvd = 1
+      ELSE
+        cvd = 0
+        IF (first == 1) THEN
+          gam = 0.0_sp
+        ELSE
+          gam = REAL(rn / rho(s), sp)
+        ENDIF
+        rho(s) = rn
+      ENDIF
+    ENDIF
+    CALL syncthreads()
+    IF (cvd == 0) THEN
+      IF (first == 1) THEN
+        DO ig = tid, nq, blockDim%x
+          h(ig, s) = -(g(ig, s) * hd(ig, n, k))
+        ENDDO
+      ELSE
+        DO ig = tid, nq, blockDim%x
+          h(ig, s) = -(g(ig, s) * hd(ig, n, k)) + gam * h(ig, s)
+        ENDDO
+      ENDIF
+    ENDIF
+  END SUBROUTINE k_check_s
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_update_s(list, nslot, npert, npwx, nksq, npwq, h, g, t, e)
+    ! k_update on FP32 vectors, FP64 dots: lambda = -<h|g>/<h|t> ; e += lambda h ; g += lambda t
+    INTEGER, VALUE :: nslot, npert, npwx, nksq
+    INTEGER :: list(*), npwq(nksq)
+    COMPLEX(sp) :: h(npwx, *), g(npwx, *), t(npwx, *), e(npwx, *)
+    REAL(dp), SHARED :: ra(RB), rc(RB)
+    REAL(sp), SHARED :: lam
+    INTEGER :: s, k, ig, nq, tid, st
+    REAL(dp) :: a, c
+    COMPLEX(sp) :: hv, gv, tv
+    tid = threadIdx%x
+    s = list(blockIdx%x)
+    k = (s - 1) / (nslot * npert) + 1
+    nq = npwq(k)
+    a = 0.0_dp
+    c = 0.0_dp
+    DO ig = tid, nq, blockDim%x
+      hv = h(ig, s)
+      gv = g(ig, s)
+      tv = t(ig, s)
+      a = a + REAL(REAL(hv) * REAL(gv) + AIMAG(hv) * AIMAG(gv), dp)
+      c = c + REAL(REAL(hv) * REAL(tv) + AIMAG(hv) * AIMAG(tv), dp)
+    ENDDO
+    ra(tid) = a
+    rc(tid) = c
+    CALL syncthreads()
+    st = blockDim%x / 2
+    DO WHILE (st > 0)
+      IF (tid <= st) THEN
+        ra(tid) = ra(tid) + ra(tid + st)
+        rc(tid) = rc(tid) + rc(tid + st)
+      ENDIF
+      CALL syncthreads()
+      st = st / 2
+    ENDDO
+    IF (tid == 1) lam = REAL(-ra(1) / rc(1), sp)
+    CALL syncthreads()
+    DO ig = tid, nq, blockDim%x
+      e(ig, s) = e(ig, s) + lam * h(ig, s)
+      g(ig, s) = g(ig, s) + lam * t(ig, s)
+    ENDDO
+  END SUBROUTINE k_update_s
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_mp_round(list, nslot, npert, npwx, nksq, npwq, hd, ax, b, sg, se, conv, &
+                                           iconv, tol, thresh, eta, safe)
+    ! start of a round, per column of list: r = Ax - b (FP64); converged (conv = 1) if
+    ! sqrt(<h_diag r, r>) < thresh; otherwise g32 = r, e32 = 0, inner tolerance
+    ! tol = max(safe*thresh, eta*|r|), iconv = 0
+    INTEGER, VALUE :: nslot, npert, npwx, nksq
+    REAL(dp), VALUE :: thresh, eta, safe
+    INTEGER :: list(*), npwq(nksq), conv(*), iconv(*)
+    REAL(dp) :: hd(npwx, nslot, nksq), tol(*)
+    COMPLEX(dp) :: ax(npwx, *), b(npwx, *)
+    COMPLEX(sp) :: sg(npwx, *), se(npwx, *)
+    REAL(dp), SHARED :: red(RB)
+    INTEGER :: s, k, n, ig, nq, tid, st
+    REAL(dp) :: acc, rn
+    COMPLEX(dp) :: r
+    tid = threadIdx%x
+    s = list(blockIdx%x)
+    k = (s - 1) / (nslot * npert) + 1
+    n = MOD(s - 1, nslot) + 1
+    nq = npwq(k)
+    acc = 0.0_dp
+    DO ig = tid, npwx, blockDim%x
+      IF (ig <= nq) THEN
+        r = ax(ig, s) - b(ig, s)
+        acc = acc + hd(ig, n, k) * (REAL(r, dp)**2 + AIMAG(r)**2)
+        sg(ig, s) = CMPLX(r, KIND=sp)
+      ELSE
+        sg(ig, s) = (0.0_sp, 0.0_sp)
+      ENDIF
+      se(ig, s) = (0.0_sp, 0.0_sp)
+    ENDDO
+    red(tid) = acc
+    CALL syncthreads()
+    st = blockDim%x / 2
+    DO WHILE (st > 0)
+      IF (tid <= st) red(tid) = red(tid) + red(tid + st)
+      CALL syncthreads()
+      st = st / 2
+    ENDDO
+    IF (tid == 1) THEN
+      rn = SQRT(red(1))
+      IF (rn < thresh) THEN
+        conv(s) = 1
+      ELSE
+        conv(s) = 0
+        iconv(s) = 0
+        tol(s) = MAX(safe * thresh, eta * rn)
+      ENDIF
+    ENDIF
+  END SUBROUTINE k_mp_round
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_mp_addx(list, nslot, npert, npwx, nksq, npwq, x, e)
+    ! x (FP64) += e (FP32), per column of list
+    INTEGER, VALUE :: nslot, npert, npwx, nksq
+    INTEGER :: list(*), npwq(nksq)
+    COMPLEX(dp) :: x(npwx, *)
+    COMPLEX(sp) :: e(npwx, *)
+    INTEGER :: s, k, ig
+    s = list(blockIdx%x)
+    k = (s - 1) / (nslot * npert) + 1
+    DO ig = threadIdx%x, npwq(k), blockDim%x
+      x(ig, s) = x(ig, s) + CMPLX(e(ig, s), KIND=dp)
+    ENDDO
+  END SUBROUTINE k_mp_addx
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_copy_list(a, b, list, npwx)
+    ! a(:, s) = b(:, s) for s in list
+    INTEGER, VALUE :: npwx
+    INTEGER :: list(*)
+    COMPLEX(dp) :: a(npwx, *), b(npwx, *)
+    INTEGER :: s, ig
+    s = list(blockIdx%x)
+    DO ig = threadIdx%x, npwx, blockDim%x
+      a(ig, s) = b(ig, s)
+    ENDDO
+  END SUBROUTINE k_copy_list
+  !
   !=================================================================================================
   ! host helpers
   !=================================================================================================
@@ -746,7 +1078,207 @@ CONTAINS
     ENDDO
     nplan = 0
     plan_nnr = 0
+    CALL destroy_plans32()
   END SUBROUTINE destroy_plans
+  !
+  SUBROUTINE make_plans32()
+    ! C2C plans with the same batch sizes as the Z2Z plans (sth_mp)
+    INTEGER :: ip, istat, n(3), emb(3)
+    IF (nplan32 == nplan) RETURN
+    CALL destroy_plans32()
+    n = (/ nr(3), nr(2), nr(1) /)
+    emb = (/ nrx(3), nrx(2), nrx(1) /)
+    DO ip = 0, nplan - 1
+      istat = cufftPlanMany(plans32(ip), 3, n, emb, 1, nnr, emb, 1, nnr, CUFFT_C2C, 2**ip)
+      CALL chk(istat, 'cufftPlanMany (C2C)')
+      istat = cufftSetStream(plans32(ip), strm)
+      CALL chk(istat, 'cufftSetStream (C2C)')
+      nplan32 = ip + 1
+    ENDDO
+  END SUBROUTINE make_plans32
+  !
+  SUBROUTINE destroy_plans32()
+    INTEGER :: ip, istat
+    DO ip = 0, nplan32 - 1
+      istat = cufftDestroy(plans32(ip))
+      plans32(ip) = 0
+    ENDDO
+    nplan32 = 0
+  END SUBROUTINE destroy_plans32
+  !
+  SUBROUTINE fft_exec_s(ip, a, dir)
+    INTEGER, INTENT(IN) :: ip, dir
+    COMPLEX(sp), DEVICE :: a(*)
+    INTEGER :: istat
+    istat = cufftExecC2C(plans32(ip), a, a, dir)
+    CALL chk(istat, 'cufftExecC2C')
+  END SUBROUTINE fft_exec_s
+  !
+  SUBROUTINE gemm_proj_s(x, cf)
+    COMPLEX(sp), DEVICE :: x(npwx, *), cf(nproj, *)
+    INTEGER :: istat
+    istat = cublasCgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nproj, nslot * npert, npwx, &
+            (1.0_sp, 0.0_sp), s_W, npwx, INT(npwx, 8) * nproj, x, npwx, INT(npwx, 8) * nslot * npert, &
+            (0.0_sp, 0.0_sp), cf, nproj, INT(nproj, 8) * nslot * npert, nksq)
+    CALL chk(istat, 'cublasCgemmStridedBatched (proj)')
+  END SUBROUTINE gemm_proj_s
+  !
+  SUBROUTINE gemm_back_s(cf, y)
+    COMPLEX(sp), DEVICE :: cf(nproj, *), y(npwx, *)
+    INTEGER :: istat
+    istat = cublasCgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, nslot * npert, nproj, &
+            (1.0_sp, 0.0_sp), s_W, npwx, INT(npwx, 8) * nproj, cf, nproj, INT(nproj, 8) * nslot * npert, &
+            (1.0_sp, 0.0_sp), y, npwx, INT(npwx, 8) * nslot * npert, nksq)
+    CALL chk(istat, 'cublasCgemmStridedBatched (back)')
+  END SUBROUTINE gemm_back_s
+  !
+  SUBROUTINE apply_op_s(x, y, list, nl)
+    ! FP32 apply_op: y = (H_kq - e_n + alpha_pv P_v) x on the nl columns list(1:nl)
+    COMPLEX(sp), DEVICE :: x(npwx, *), y(npwx, *)
+    INTEGER, DEVICE :: list(*)
+    INTEGER, INTENT(IN) :: nl
+    INTEGER :: s0, nb, ip
+    REAL(sp) :: scale
+    scale = 1.0_sp / REAL(nr(1) * nr(2) * nr(3), sp)
+    CALL gemm_proj_s(x, s_cf)
+    CALL k_coef_h_s<<<nsl, 32 * ((nproj + 31) / 32), 0, strm>>>(s_cf2, s_cf, s_dmat, nproj, nkb, nslot, &
+         npert, nksq, d_nockq, REAL(alpha_pv, sp))
+    CALL kerr('coef_h_s')
+    s0 = 0
+    DO WHILE (s0 < nl)
+      nb = MIN(sth_bmax, nl - s0)
+      ip = plan_for(nb)
+      nb = 2**ip
+      CALL k_scatter_s<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(s_box, x, list, s0, nnr, npwx, &
+           nslot, npert, nksq, d_inv)
+      CALL kerr('scatter_s')
+      CALL fft_exec_s(ip, s_box, CUFFT_INVERSE)
+      CALL k_vmul_s<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(s_box, s_vrs, nnr)
+      CALL kerr('vmul_s')
+      CALL fft_exec_s(ip, s_box, CUFFT_FORWARD)
+      CALL k_gather_h_s<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(y, x, s_box, list, s0, nnr, npwx, &
+           nslot, npert, nksq, nbnd, d_npwq, d_idxkq, s_g2, d_etk, scale)
+      CALL kerr('gather_h_s')
+      s0 = s0 + nb
+    ENDDO
+    CALL gemm_back_s(s_cf2, y)
+  END SUBROUTINE apply_op_s
+  !
+  SUBROUTINE d2s_c(a, b, n)
+    COMPLEX(sp), DEVICE :: a(*)
+    COMPLEX(dp), DEVICE :: b(*)
+    INTEGER(8), INTENT(IN) :: n
+    CALL k_d2s_c<<<MIN(INT((n + TPB - 1) / TPB), 4096), TPB, 0, strm>>>(a, b, n)
+    CALL kerr('d2s_c')
+  END SUBROUTINE d2s_c
+  !
+  SUBROUTINE d2s_r(a, b, n)
+    REAL(sp), DEVICE :: a(*)
+    REAL(dp), DEVICE :: b(*)
+    INTEGER(8), INTENT(IN) :: n
+    CALL k_d2s_r<<<MIN(INT((n + TPB - 1) / TPB), 4096), TPB, 0, strm>>>(a, b, n)
+    CALL kerr('d2s_r')
+  END SUBROUTINE d2s_r
+  !
+  SUBROUTINE zero_s(a, n)
+    COMPLEX(sp), DEVICE :: a(*)
+    INTEGER(8), INTENT(IN) :: n
+    IF (n <= 0) RETURN
+    CALL k_zero_s<<<MIN(INT((n + TPB - 1) / TPB), 4096), TPB, 0, strm>>>(a, n)
+    CALL kerr('zero_s')
+  END SUBROUTINE zero_s
+  !
+  SUBROUTINE mp_cg(thresh, nout)
+    ! the FP32 PCG of one round on the columns d_oact(1:nout): solve A e = -r from e = 0 (r = g32 on
+    ! entry) to the per-column tolerance d_tol; the iteration counts go to d_cnt / d_kter as in the
+    ! FP64 path
+    REAL(dp), INTENT(IN) :: thresh
+    INTEGER, INTENT(IN) :: nout
+    INTEGER :: istat, iter, nact, first
+    CALL k_icopy<<<nblk(nout, TPB), TPB, 0, strm>>>(d_act, d_oact, nout)
+    CALL kerr('icopy (mp)')
+    nact = nout
+    DO iter = 1, maxter
+      first = 0
+      IF (iter == 1) first = 1
+      CALL k_check_s<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, s_hd, s_g, s_h, &
+           d_rho, d_iconv, d_cnt, d_tol, first)
+      CALL kerr('check_s')
+      CALL k_kter<<<nblk(ngrp, TPB), TPB, 0, strm>>>(ngrp, npert, nksq, d_nock, d_cnt, d_kter)
+      CALL kerr('kter')
+      CALL k_compact<<<1, 1024, 0, strm>>>(d_act, d_act2, nact, d_iconv, d_nact)
+      CALL kerr('compact')
+      istat = cudaMemcpyAsync(h_nact, d_nact, 1, strm)
+      CALL tsync()
+      nact = h_nact(1)
+      sth_nsteps = sth_nsteps + 1
+      IF (nact == 0) EXIT
+      CALL apply_op_s(s_h, s_t, d_act, nact)
+      sth_n32 = sth_n32 + nact
+      CALL k_update_s<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, s_h, s_g, s_t, s_e)
+      CALL kerr('update_s')
+    ENDDO
+  END SUBROUTINE mp_cg
+  !
+  SUBROUTINE mp_solve(first_iter, thresh)
+    ! the CG part of sth_engine_solve in mixed precision (see the module header); sets d_conv
+    INTEGER :: istat, nout, ir
+    LOGICAL, INTENT(IN) :: first_iter
+    REAL(dp), INTENT(IN) :: thresh
+    REAL(dp) :: ta
+    sth_n64 = 0; sth_n32 = 0; sth_nround = 0
+    sth_t_cg64 = 0
+    sth_nsteps = 0
+    d_conv = 0
+    d_cnt = 0
+    d_kter = 0.0_dp
+    d_rho = 0.0_dp
+    istat = cudaDeviceSynchronize()
+    IF (first_iter) THEN
+      CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
+      CALL zero_c(d_g, INT(npwx, 8) * nsl)          ! A 0 = 0
+      ax_valid = .TRUE.
+    ENDIF
+    IF (.NOT. ax_valid) THEN
+      ! warm start from outside (restart, or a previous FP64-path solve): Ax in FP64 once
+      CALL apply_op(d_dpsi, d_t, d_valid, nvalid)
+      CALL k_copy_list<<<nvalid, TPB, 0, strm>>>(d_g, d_t, d_valid, npwx)
+      CALL kerr('copy_list')
+      sth_n64 = sth_n64 + nvalid
+      ax_valid = .TRUE.
+    ENDIF
+    CALL k_icopy<<<nblk(nvalid, TPB), TPB, 0, strm>>>(d_oact, d_valid, nvalid)
+    nout = nvalid
+    DO ir = 1, sth_mp_maxround + 1
+      ! r = Ax - b; test; FP32 start vectors for the columns still open
+      CALL k_mp_round<<<nout, sth_rb, 0, strm>>>(d_oact, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_d0, &
+           s_g, s_e, d_conv, d_iconv, d_tol, thresh, sth_mp_eta, sth_mp_safe)
+      CALL kerr('mp_round')
+      CALL k_compact<<<1, 1024, 0, strm>>>(d_oact, d_act2, nout, d_conv, d_nact)
+      CALL kerr('compact (mp)')
+      istat = cudaMemcpyAsync(h_nact, d_nact, 1, strm)
+      CALL tsync()
+      nout = h_nact(1)
+      IF (nout == 0 .OR. ir > sth_mp_maxround) EXIT
+      sth_nround = ir
+      CALL mp_cg(thresh, nout)
+      ! x += e ; Ax = A x (FP64, into d_t, then copied to d_g on these columns only: apply_op leaves
+      ! the other slots of its output undefined)
+      CALL k_mp_addx<<<nout, TPB, 0, strm>>>(d_oact, nslot, npert, npwx, nksq, d_npwq, d_dpsi, s_e)
+      CALL kerr('mp_addx')
+      IF (sth_timing) THEN
+        CALL tsync(); ta = wtime()
+      ENDIF
+      CALL apply_op(d_dpsi, d_t, d_oact, nout)
+      CALL k_copy_list<<<nout, TPB, 0, strm>>>(d_g, d_t, d_oact, npwx)
+      CALL kerr('copy_list')
+      IF (sth_timing) THEN
+        CALL tsync(); sth_t_cg64 = sth_t_cg64 + wtime() - ta
+      ENDIF
+      sth_n64 = sth_n64 + nout
+    ENDDO
+    sth_ncolapp = sth_n32 + sth_n64
+  END SUBROUTINE mp_solve
   !
   SUBROUTINE fft_exec(ip, a, dir)
     INTEGER, INTENT(IN) :: ip, dir
@@ -812,6 +1344,27 @@ CONTAINS
       ENDDO
     ENDDO
   END SUBROUTINE ortho_exact
+  !
+  SUBROUTINE ortho_batched()
+    ! orthogonalize as ortho_exact, but with two strided-batched ZGEMMs over k on all slots (FP64).
+    ! Used with sth_mp, where the exact vanilla GEMM shapes no longer matter: 2 launches instead of
+    ! 2 nksq npert (latency-bound on consumer GPUs). Invalid slots and padding rows are zero on input
+    ! and stay zero.
+    INTEGER :: istat
+    istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nbnd, nslot * npert, npwx, &
+            (1.0_dp, 0.0_dp), d_W(1, nkb + 1, 1), npwx, INT(npwx, 8) * nproj, d_d0, npwx, INT(npwx, 8) * nslot * npert, &
+            (0.0_dp, 0.0_dp), d_ps, nbnd, INT(nbnd, 8) * nslot * npert, nksq)
+    CALL chk(istat, 'cublasZgemmStridedBatched (ortho ps)')
+    CALL k_scale_wwg<<<nsl, 32 * ((nbnd + 31) / 32), 0, strm>>>(d_ps, d_wwg, nbnd, nslot, npert, nksq, d_nock)
+    CALL kerr('scale_wwg')
+    CALL k_scale_wg1<<<4096, TPB, 0, strm>>>(d_d0, d_wg1, npwx, nslot, npert, nksq, d_nock, &
+         INT(npwx, 8) * nsl)
+    CALL kerr('scale_wg1')
+    istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, nslot * npert, nbnd, &
+            (1.0_dp, 0.0_dp), d_W(1, nkb + 1, 1), npwx, INT(npwx, 8) * nproj, d_ps, nbnd, INT(nbnd, 8) * nslot * npert, &
+            (-1.0_dp, 0.0_dp), d_d0, npwx, INT(npwx, 8) * nslot * npert, nksq)
+    CALL chk(istat, 'cublasZgemmStridedBatched (ortho back)')
+  END SUBROUTINE ortho_batched
   !
   SUBROUTINE apply_op(x, y, list, nl)
     ! y = (H_kq - e_n + alpha_pv P_v) x on the nl columns list(1:nl); other slots of y are garbage
@@ -982,6 +1535,9 @@ CONTAINS
     ENDIF
     ! memory check (bytes): column arrays, psi(r) cache, FFT box, W
     need = 16_8 * npwx * nsl * 7 + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
+    ! sth_mp: FP32 W, h_diag, g2kin, box (+ C2C plan work areas) and the irrep's FP32 column arrays
+    IF (sth_mp) need = need + 8_8 * npwx * nproj * nksq + 4_8 * npwx * (nslot + 1) * nksq + 8_8 * nnr * sth_bmax * 3 &
+                            + (8_8 * npwx * 4 + 16_8 * nproj + 12_8) * nsl
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
     BLOCK
@@ -1051,6 +1607,22 @@ CONTAINS
     CALL k_hprec<<<nbox, RB, 0, strm>>>(d_hd, d_W, d_g2, d_npwq, d_nock, npwx, nproj, nkb, nslot, nksq)
     CALL kerr('hprec')
     !
+    ! sth_mp: FP32 copies of the operator data
+    mp_q = sth_mp
+    IF (mp_q) THEN
+      ALLOCATE(s_W(npwx, nproj, nksq), s_hd(npwx, nslot, nksq), s_g2(npwx, nksq), s_vrs(nnr), s_dmat(nkb, nkb))
+      ALLOCATE(s_box(nnr, sth_bmax))
+      CALL d2s_c(s_W, d_W, INT(npwx, 8) * nproj * nksq)
+      CALL d2s_r(s_hd, d_hd, INT(npwx, 8) * nslot * nksq)
+      CALL d2s_r(s_g2, d_g2, INT(npwx, 8) * nksq)
+      CALL d2s_r(s_vrs, d_vrs, INT(nnr, 8))
+      CALL d2s_c(s_dmat, d_dmat, INT(nkb, 8) * nkb)
+      CALL zero_s(s_box, INT(nnr, 8) * sth_bmax)
+      CALL make_plans32()
+      CALL tsync()
+      CALL sth_mem_sample()
+    ENDIF
+    !
     ! psi_k(r) for n <= nocc_k: scatter evc at k+G, inverse FFT in place (no cache: keep evc only)
     ALLOCATE(d_evc(npwx, nbox))
     d_evc = h_evc
@@ -1088,7 +1660,13 @@ CONTAINS
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
                                      d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
+    CALL irrep_free_mp()
   END SUBROUTINE irrep_free
+  !
+  SUBROUTINE irrep_free_mp()
+    IF (ALLOCATED(s_e)) DEALLOCATE(s_e, s_g, s_h, s_t, s_cf, s_cf2, d_tol, d_iconv, d_oact)
+    ax_valid = .FALSE.
+  END SUBROUTINE irrep_free_mp
   !
   SUBROUTINE irrep_stage(npert_)
     INTEGER, INTENT(IN) :: npert_
@@ -1131,7 +1709,9 @@ CONTAINS
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
+    CALL irrep_free_mp()
     need = 16_8 * npwx * nsl * 7
+    IF (mp_q) need = need + (8_8 * npwx * 4 + 16_8 * nproj + 12_8) * nsl
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
     IF (need > freeb - 512_8 * 1024**2) THEN
@@ -1172,6 +1752,19 @@ CONTAINS
     CALL zero_c(d_t, INT(npwx, 8) * nsl)
     CALL zero_c(d_cf, INT(nproj, 8) * nsl)
     CALL zero_c(d_cf2, INT(nproj, 8) * nsl)
+    IF (mp_q) THEN
+      ALLOCATE(s_e(npwx, nsl), s_g(npwx, nsl), s_h(npwx, nsl), s_t(npwx, nsl), s_cf(nproj, nsl), s_cf2(nproj, nsl))
+      ALLOCATE(d_tol(nsl), d_iconv(nsl), d_oact(nsl))
+      CALL zero_s(s_e, INT(npwx, 8) * nsl)
+      CALL zero_s(s_g, INT(npwx, 8) * nsl)
+      CALL zero_s(s_h, INT(npwx, 8) * nsl)
+      CALL zero_s(s_t, INT(npwx, 8) * nsl)
+      CALL zero_s(s_cf, INT(nproj, 8) * nsl)
+      CALL zero_s(s_cf2, INT(nproj, 8) * nsl)
+      d_iconv = 0
+      d_tol = 0.0_dp
+    ENDIF
+    ax_valid = .FALSE.
     CALL tsync()
     CALL sth_mem_sample()
     ready = .TRUE.
@@ -1181,6 +1774,7 @@ CONTAINS
     !! restore the staged warm start (for repeated timing runs of the same call)
     d_dpsi = h_dpsi0
     h_dpsi_valid = .FALSE.
+    ax_valid = .FALSE.
   END SUBROUTINE sth_engine_reset_dpsi
   !
   SUBROUTINE sth_engine_solve(first_iter, thresh, dvscf, drho, tot_num_iter, tot_cg_calls, nfail)
@@ -1238,12 +1832,20 @@ CONTAINS
     ! One ZGEMM pair per (k, pert) with exactly the shapes of orthogonalize.f90 (m = nbnd, n = nocc_k,
     ! k = npwq), so that the right-hand side matches vanilla's rounding as closely as possible: the
     ! screened, projected dvpsi can be a strong cancellation, and its rounding feeds every CG step.
-    CALL ortho_exact()
+    IF (mp_q) THEN
+      CALL ortho_batched()
+    ELSE
+      CALL ortho_exact()
+    ENDIF
     IF (sth_timing) THEN
       CALL tsync(); t1 = wtime(); sth_t_ortho = t1 - t0; t0 = t1
     ENDIF
     !
     ! CG (cgsolve_all), all columns at once
+    IF (mp_q) THEN
+      CALL mp_solve(first_iter, thresh)
+    ELSE
+    ax_valid = .FALSE.
     IF (first_iter) CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
     d_conv = 0
     d_cnt = 0
@@ -1279,6 +1881,8 @@ CONTAINS
       CALL kerr('update')
       IF (sth_debug_slot > 0) CALL debug_step(iter)
     ENDDO
+    sth_n64 = sth_ncolapp; sth_n32 = 0; sth_nround = 0
+    ENDIF
     IF (sth_timing) THEN
       CALL tsync(); t1 = wtime(); sth_t_cg = t1 - t0; t0 = t1
     ENDIF
@@ -1427,6 +2031,8 @@ CONTAINS
     IF (ALLOCATED(d_box2)) DEALLOCATE(d_box2)
     IF (ALLOCATED(d_evc)) DEALLOCATE(d_evc)
     IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+    IF (ALLOCATED(s_W)) DEALLOCATE(s_W, s_hd, s_g2, s_vrs, s_dmat, s_box)
+    mp_q = .FALSE.
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
   !

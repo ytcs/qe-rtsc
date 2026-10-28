@@ -17,6 +17,11 @@
 ! RTSC_STRICT=1 (scored runs, rtsc/bench/run-fork.sh): with RTSC_STH=1, a call that does not run on
 ! the engine (unsupported case or engine declined) stops ph.x instead of taking the vanilla loop.
 !
+! RTSC_STH_MP=1: the engine's CG runs in mixed precision (FP32 inner PCG, FP64 defect correction
+! to the same thresh; rtsc/sth/sth_engine.f90 header). RTSC_MP_ETA / RTSC_MP_SAFE: the inner
+! tolerance max(safe*thresh, eta*|r|) (defaults 1e-4, 0.5). With RTSC_STH_TIME=1 each call also
+! prints its rounds and FP64 / FP32 column applications.
+!
 ! sth_batched_end_q (do_phonon, after each q) releases the per-q engine state and the device blocks
 ! the NVHPC runtime keeps after DEALLOCATE, and prints one line with the q's device-memory high-water.
 !
@@ -33,6 +38,7 @@ MODULE sth_batched
   INTEGER, SAVE :: st_npert = -1, st_iudvpsi = -1, st_nksq = -1
   COMPLEX(DP), SAVE :: st_key = (0.d0, 0.d0)
   REAL(DP), SAVE :: st_xq(3) = 1.d10        ! q of the per-q engine state
+  INTEGER(8), SAVE :: tot64 = 0, tot32 = 0   ! column applications of this q (FP64 / FP32)
   !
 CONTAINS
   !
@@ -44,6 +50,19 @@ CONTAINS
     CALL get_environment_variable(name, s, STATUS=ios)
     IF (ios == 0) sth_env_flag = (TRIM(s) == '1')
   END FUNCTION sth_env_flag
+  !
+  SUBROUTINE env_real(name, val)
+    !! val = the environment variable's value if it is set and reads as a number; unchanged otherwise
+    CHARACTER(LEN=*), INTENT(IN) :: name
+    REAL(DP), INTENT(INOUT) :: val
+    CHARACTER(LEN=32) :: s
+    INTEGER :: ios
+    REAL(DP) :: v
+    CALL get_environment_variable(name, s, STATUS=ios)
+    IF (ios /= 0 .OR. LEN_TRIM(s) == 0) RETURN
+    READ(s, *, IOSTAT=ios) v
+    IF (ios == 0) val = v
+  END SUBROUTINE env_real
   !
   !--------------------------------------------------------------------------------------------
   SUBROUTINE sth_batched_kernel(first_iter, time_reversed, npert, lrdvpsi, iudvpsi, thresh, &
@@ -73,7 +92,9 @@ CONTAINS
     USE wvfct,            ONLY : nbnd, npwx
     USE eqv,              ONLY : dpsi, dvpsi
 #if defined(__CUDA)
-    USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready
+    USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready, &
+                                 sth_n64, sth_n32, sth_nround, sth_nsteps, sth_timing, sth_t_dpot, &
+                                 sth_t_ortho, sth_t_cg, sth_t_cg64, sth_t_drho
     USE qpoint,           ONLY : xq
 #endif
     !
@@ -91,6 +112,7 @@ CONTAINS
     COMPLEX(DP) :: key
     COMPLEX(DP), ALLOCATABLE :: dv(:,:), dr(:,:)
     LOGICAL :: reinit
+    REAL(DP) :: tscale
 #endif
     !
     done = .FALSE.
@@ -139,9 +161,18 @@ CONTAINS
     ALLOCATE(dv(dffts%nnr, npert), dr(dffts%nnr, npert))
     dv(:, :) = dvscfins(:, 1, :)
     dr(:, :) = drhoout(:, 1, :)
-    CALL sth_engine_solve(first_iter, thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
+    sth_timing = sth_env_flag('RTSC_STH_TIME')
+    ! RTSC_STH_THRESH_SCALE (diagnostic only, changes the answer): the engine solves to scale*thresh
+    tscale = 1.d0
+    CALL env_real('RTSC_STH_THRESH_SCALE', tscale)
+    CALL sth_engine_solve(first_iter, tscale * thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
     drhoout(:, 1, :) = dr(:, :)
     DEALLOCATE(dv, dr)
+    tot64 = tot64 + sth_n64; tot32 = tot32 + sth_n32
+    IF (sth_env_flag('RTSC_STH_TIME')) WRITE(stdout, '(5x,"rtsc sth: thresh ",ES9.2,", rounds ",I0,", steps ",I0, &
+         &", column applies FP64 ",I0,", FP32 ",I0,"; s: dpot ",F6.3," ortho ",F6.3," cg ",F6.3," (FP64 ",F6.3, &
+         &") drho ",F6.3)') thresh, sth_nround, sth_nsteps, sth_n64, sth_n32, sth_t_dpot, sth_t_ortho, sth_t_cg, &
+         sth_t_cg64, sth_t_drho
     !
     ! dpsi goes back to iudwf once per irrep (sth_batched_flush, end of dfpt_kernel) or before the
     ! engine state is replaced; nothing reads iudwf between the calls of one irrep on this path
@@ -196,6 +227,8 @@ CONTAINS
     CALL sth_mem_sample(after)        ! the next q's high-water starts from this baseline
     WRITE(stdout, '(5x,"rtsc mem: q ",I0,", nksq ",I0,": device high-water ",F6.2," GiB, after release ", &
          &F6.2," GiB (of ",F6.2,")")') iq, nksq, REAL(hw, DP) / gib, REAL(after, DP) / gib, REAL(tot, DP) / gib
+    WRITE(stdout, '(5x,"rtsc sth: q ",I0,": column applies FP64 ",I0,", FP32 ",I0)') iq, tot64, tot32
+    tot64 = 0; tot32 = 0
 #endif
   END SUBROUTINE sth_batched_end_q
   !
@@ -349,7 +382,8 @@ CONTAINS
     USE qpoint,           ONLY : nksq, ikks, ikqs
     USE eqv,              ONLY : dpsi, dvpsi, evq
     USE sth_engine,       ONLY : sth_engine_init, sth_engine_set_global, sth_engine_set_k, &
-                                 sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup
+                                 sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup, &
+                                 sth_mp, sth_mp_eta, sth_mp_safe
     !
     LOGICAL, INTENT(IN) :: first_iter
     INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
@@ -363,6 +397,10 @@ CONTAINS
     REAL(DP), EXTERNAL :: wgauss, w0gauss
     !
     CALL start_clock('sth_init')
+    ! mixed precision (per q; the FP32 copies are built by sth_engine_setup)
+    sth_mp = sth_env_flag('RTSC_STH_MP')
+    CALL env_real('RTSC_MP_ETA', sth_mp_eta)
+    CALL env_real('RTSC_MP_SAFE', sth_mp_safe)
     nslot = 0
     DO ik = 1, nksq
       nslot = MAX(nslot, nbnd_occ(ikks(ik)))
