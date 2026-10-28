@@ -112,6 +112,7 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_mp_maxround = 10
   INTEGER(8), PUBLIC, SAVE :: sth_n64 = 0, sth_n32 = 0   ! FP64 / FP32 column applications, last solve
   INTEGER, PUBLIC, SAVE :: sth_nround = 0
+  REAL(dp), PUBLIC, SAVE :: sth_t_cg64 = 0                ! FP64 applications inside the MP CG (sth_timing)
   LOGICAL, SAVE :: mp_q = .FALSE.                  ! the per-q state has the FP32 copies
   LOGICAL, SAVE :: ax_valid = .FALSE.              ! d_g holds A d_dpsi (FP64) on every valid slot
   INTEGER, SAVE :: plans32(0:MAXPLAN-1) = 0, nplan32 = 0
@@ -1193,7 +1194,9 @@ CONTAINS
     INTEGER :: istat, nout, ir
     LOGICAL, INTENT(IN) :: first_iter
     REAL(dp), INTENT(IN) :: thresh
+    REAL(dp) :: ta
     sth_n64 = 0; sth_n32 = 0; sth_nround = 0
+    sth_t_cg64 = 0
     sth_nsteps = 0
     d_conv = 0
     d_cnt = 0
@@ -1232,9 +1235,15 @@ CONTAINS
       ! the other slots of its output undefined)
       CALL k_mp_addx<<<nout, TPB, 0, strm>>>(d_oact, nslot, npert, npwx, nksq, d_npwq, d_dpsi, s_e)
       CALL kerr('mp_addx')
+      IF (sth_timing) THEN
+        CALL tsync(); ta = wtime()
+      ENDIF
       CALL apply_op(d_dpsi, d_t, d_oact, nout)
       CALL k_copy_list<<<nout, TPB, 0, strm>>>(d_g, d_t, d_oact, npwx)
       CALL kerr('copy_list')
+      IF (sth_timing) THEN
+        CALL tsync(); sth_t_cg64 = sth_t_cg64 + wtime() - ta
+      ENDIF
       sth_n64 = sth_n64 + nout
     ENDDO
     sth_ncolapp = sth_n32 + sth_n64

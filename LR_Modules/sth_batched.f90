@@ -93,7 +93,8 @@ CONTAINS
     USE eqv,              ONLY : dpsi, dvpsi
 #if defined(__CUDA)
     USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready, &
-                                 sth_n64, sth_n32, sth_nround, sth_nsteps
+                                 sth_n64, sth_n32, sth_nround, sth_nsteps, sth_timing, sth_t_dpot, &
+                                 sth_t_ortho, sth_t_cg, sth_t_cg64, sth_t_drho
     USE qpoint,           ONLY : xq
 #endif
     !
@@ -159,12 +160,15 @@ CONTAINS
     ALLOCATE(dv(dffts%nnr, npert), dr(dffts%nnr, npert))
     dv(:, :) = dvscfins(:, 1, :)
     dr(:, :) = drhoout(:, 1, :)
+    sth_timing = sth_env_flag('RTSC_STH_TIME')
     CALL sth_engine_solve(first_iter, thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
     drhoout(:, 1, :) = dr(:, :)
     DEALLOCATE(dv, dr)
     tot64 = tot64 + sth_n64; tot32 = tot32 + sth_n32
     IF (sth_env_flag('RTSC_STH_TIME')) WRITE(stdout, '(5x,"rtsc sth: thresh ",ES9.2,", rounds ",I0,", steps ",I0, &
-         &", column applies FP64 ",I0,", FP32 ",I0)') thresh, sth_nround, sth_nsteps, sth_n64, sth_n32
+         &", column applies FP64 ",I0,", FP32 ",I0,"; s: dpot ",F6.3," ortho ",F6.3," cg ",F6.3," (FP64 ",F6.3, &
+         &") drho ",F6.3)') thresh, sth_nround, sth_nsteps, sth_n64, sth_n32, sth_t_dpot, sth_t_ortho, sth_t_cg, &
+         sth_t_cg64, sth_t_drho
     !
     ! dpsi goes back to iudwf once per irrep (sth_batched_flush, end of dfpt_kernel) or before the
     ! engine state is replaced; nothing reads iudwf between the calls of one irrep on this path
