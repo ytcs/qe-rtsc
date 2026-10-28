@@ -50,8 +50,8 @@ MODULE epw_gpu_eliash
   REAL(dp), DEVICE, ALLOCATABLE :: d_lra(:), d_lrz(:), d_lrb(:), d_lrwm(:), d_lrwp(:), &
                                    d_lru(:), d_lrc(:), d_lrout(:), d_lrres(:)
   REAL(dp), ALLOCATABLE :: lr_naz(:)
-  REAL(dp) :: lr_pit = -1.0_dp
-  INTEGER :: lr_nsiw = -1, lr_r = 0
+  REAL(dp) :: lr_pit = -1.0_dp, lr_fail_pit = -1.0_dp
+  INTEGER :: lr_nsiw = -1, lr_r = 0, lr_fail_nsiw = -1
   LOGICAL :: lr_have_handle = .FALSE.
   TYPE(cublasHandle) :: lr_h
   !
@@ -77,6 +77,7 @@ CONTAINS
     IF (ALLOCATED(d_ez)) DEALLOCATE(d_ez, d_ed)
     ftab_pit = -1.0_dp; ftab_n2 = -1
     sz_static = -1
+    lr_fail_pit = -1.0_dp; lr_fail_nsiw = -1
     nsiw_alloc = -1; nsplit_alloc = -1; nadp_alloc = -1
     CALL lr_free()
   END SUBROUTINE ege_reset
@@ -253,7 +254,10 @@ CONTAINS
         wmin = MIN(wmin, wf(i)); wmax = MAX(wmax, wf(i))
       ENDIF
     ENDDO
-    IF (wmax <= 0.0_dp) RETURN
+    IF (wmax <= 0.0_dp) THEN
+      IF (kl0 == 1) WRITE(*, '(a)') ' epw_gpu_eliash: no phonon above eps_acoustic'
+      RETURN
+    ENDIF
     ! SVD of f over a log grid of w (columns scaled to max 1)
     ng = lr_ngrid
     ALLOCATE(f(n2, ng), s(MIN(n2, ng)), u(n2, MIN(n2, ng)), vt(1, 1))
@@ -269,7 +273,10 @@ CONTAINS
     CALL DGESVD('S', 'N', n2, ng, f, n2, s, u, n2, vt, 1, work, -1, info)
     lwork = INT(work(1)); DEALLOCATE(work); ALLOCATE(work(lwork))
     CALL DGESVD('S', 'N', n2, ng, f, n2, s, u, n2, vt, 1, work, lwork, info)
-    IF (info /= 0) RETURN
+    IF (info /= 0) THEN
+      IF (kl0 == 1) WRITE(*, '(a, i0)') ' epw_gpu_eliash: DGESVD info ', info
+      RETURN
+    ENDIF
     nr = 0
     DO i = 1, MIN(n2, ng)
       IF (s(i) > lr_svtol * s(1)) nr = i
@@ -279,7 +286,11 @@ CONTAINS
     nkn = nb * nkl
     nst = nb * nkfs
     na = INT(nkn, 8) * nr1 * nst
-    IF (na * 8 > 6_8 * 1024**3) RETURN     ! > 6 GB per pool: keep the direct kernel
+    IF (na * 8 > 6_8 * 1024**3) THEN     ! > 6 GB per pool: keep the direct kernel
+      IF (kl0 == 1) WRITE(*, '(a, f10.1, a)') ' epw_gpu_eliash: A would need ', &
+         DBLE(na) * 8.0_dp / 1024.0_dp**3, ' GB per pool (cap 6 GB)'
+      RETURN
+    ENDIF
     !
     CALL lr_free()
     ALLOCATE(d_lru(n2 * nr), d_lrc(nr * ncol), d_lrres(ncol), res(ncol))
@@ -760,8 +771,15 @@ CONTAINS
     CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_KERNEL', envval)
     IF (uniform .AND. TRIM(envval) /= '1' .AND. TRIM(envval) /= '4' .AND. TRIM(envval) /= '5') THEN
       lrok = (pit == lr_pit .AND. nsiw == lr_nsiw)
-      IF (.NOT. lrok) CALL lr_setup(nkl, kl0, nkfs, nb, mq, nm, nqtot, nsiw, n2, wf, ef0, fsthick, &
-                                    eps_ac, dosef, pit, inv_dos, mucs, lrok)
+      IF (.NOT. lrok .AND. .NOT. (pit == lr_fail_pit .AND. nsiw == lr_fail_nsiw)) THEN
+        CALL lr_setup(nkl, kl0, nkfs, nb, mq, nm, nqtot, nsiw, n2, wf, ef0, fsthick, eps_ac, &
+                      dosef, pit, inv_dos, mucs, lrok)
+        IF (.NOT. lrok) THEN
+          ! remember the failure for this temperature: no new setup attempt every iteration
+          lr_fail_pit = pit; lr_fail_nsiw = nsiw
+          IF (kl0 == 1) WRITE(*, '(a)') ' epw_gpu_eliash: low-rank setup not possible, using the direct kernel k_fsr'
+        ENDIF
+      ENDIF
       IF (lrok) THEN
         CALL lr_iter(nkl, nkfs, nb, nsiw, naz, az, ad)
         CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_CHECK', envval)
