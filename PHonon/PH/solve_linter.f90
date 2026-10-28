@@ -72,7 +72,7 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   USE dfpt_kernels,         ONLY : dfpt_kernel
   USE phus,                 ONLY : becsumort
   USE recover_mod,          ONLY : write_rec
-  USE rtsc_dq,              ONLY : dq_active, dq_solve_irrep, dq_add_dyn
+  USE rtsc_dq,              ONLY : dq_active, dq_solve_irrep
   !
   IMPLICIT NONE
   !
@@ -274,8 +274,6 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
      IF (lmultipole) CALL write_epsilon(npe, dfpt_data%drhop)
      !
      CALL drhodvus (irr, imode0, dfpt_data%dvscfp, npe)
-     ! rtsc: stationary correction of the one-shot pass (after drhodvus, which resets dyn_rec)
-     IF (dq_active()) CALL dq_add_dyn(imode0, npe)
      IF (nlcc_any) CALL dynmat_nlcc (imode0, dfpt_data%drhop, npe)
      !
      ! Write charge density to file

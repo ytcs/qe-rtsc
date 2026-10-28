@@ -10,8 +10,9 @@
 !  - dynamical matrix: QE's drhodv/drhodvloc from dpsi and dn_out (Hellmann-Feynman form, error linear
 !    in dV_in - dV*), plus the stationary correction
 !       C(i,j) = - int conj(dn_out_i) (dV_in_j - dV_out_j),   dV_out = Hxc response to dn_out,
-!    which makes the irrep block variational: its error is bilinear in the errors of dn_out
-!    (RTSC_DQ_VAR=0 leaves it out). Hermitized downstream (symdynph_gq).
+!    for every pair of modes of the q (dq_finish_dyn, after phqscf: irreps of the same symmetry
+!    type are coupled in dyn), which makes dyn stationary: its error is bilinear in the errors of
+!    dn_out (RTSC_DQ_VAR=0 leaves it out). Hermitized downstream (symdynph_gq).
 !  - printed per irrep: |dV_out - dV_in| / |dV_in| (the interpolation-quality meter) and max |C|.
 ! Gamma runs the normal SCF (metals need the Fermi shift there; Gamma is on every subgrid).
 ! RTSC_DQ_THRESH: Sternheimer threshold of the pass (default 1e-8 = 0.1 sqrt(tr2_ph = 1e-14)).
@@ -21,13 +22,14 @@ MODULE rtsc_dq
   USE kinds, ONLY : DP
   IMPLICIT NONE
   PRIVATE
-  PUBLIC :: dq_active, dq_solve_irrep, dq_add_dyn, dq_end_q
+  PUBLIC :: dq_active, dq_solve_irrep, dq_finish_dyn, dq_end_q
   !
   LOGICAL, SAVE :: have_q = .FALSE.
   REAL(DP), SAVE :: dq_xq(3) = 1.d10
   COMPLEX(DP), ALLOCATABLE, SAVE :: dv_all(:,:,:)  ! (dfftp%nnr, nspin_mag, 3 nat): interpolated dV_ind, u basis
-  COMPLEX(DP), ALLOCATABLE, SAVE :: corr(:,:)      ! (npe, npe) stationary correction of the last irrep
-  INTEGER, SAVE :: corr_i0 = -1, corr_npe = 0
+  COMPLEX(DP), ALLOCATABLE, SAVE :: dn_all(:,:)    ! (dfftp%nnr, 3 nat): dn_out of every mode (last pass)
+  COMPLEX(DP), ALLOCATABLE, SAVE :: r_all(:,:)     ! (dfftp%nnr, 3 nat): dV_in - dV_out of every mode
+  LOGICAL, ALLOCATABLE, SAVE :: done_mode(:)
   !
 CONTAINS
   !
@@ -120,6 +122,7 @@ CONTAINS
     USE units_lr,          ONLY : iudwf, lrdwf
     USE eqv,               ONLY : dpsi
     USE qpoint,            ONLY : nksq, xq
+    USE ions_base,         ONLY : nat
     USE control_lr,        ONLY : convt, lnoloc, alpha_mix, nmix_ph, tr2_ph
     USE dv_of_drho_lr,     ONLY : dv_of_drho
     USE apply_dpot_mod,    ONLY : apply_dpot_allocate, apply_dpot_deallocate
@@ -219,20 +222,18 @@ CONTAINS
       CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     ENDDO
     !
-    ! stationary correction C(i,j) = - int conj(dn_out_i) (dV_in_j - dV_out_j), last pass
-    IF (ALLOCATED(corr)) DEALLOCATE(corr)
-    ALLOCATE(corr(npe, npe))
-    DO jpert = 1, npe
-      DO ipert = 1, npe
-        corr(ipert, jpert) = - DOT_PRODUCT(dfpt_data%drhop(:, 1, ipert), vin(:, 1, jpert) - vout(:, 1, jpert)) &
-                             * omega / REAL(dfftp%nr1 * dfftp%nr2 * dfftp%nr3, DP)
-      ENDDO
+    ! keep dn_out and the residual dV_in - dV_out of this irrep's modes for the stationary correction,
+    ! which couples every pair of modes of the q (irreps of the same symmetry type are coupled in dyn)
+    IF (.NOT. ALLOCATED(dn_all)) THEN
+      ALLOCATE(dn_all(dfftp%nnr, 3 * nat), r_all(dfftp%nnr, 3 * nat), done_mode(3 * nat))
+      done_mode = .FALSE.
+    ENDIF
+    DO ipert = 1, npe
+      dn_all(:, imode0 + ipert) = dfpt_data%drhop(:, 1, ipert)
+      r_all(:, imode0 + ipert) = vin(:, 1, ipert) - vout(:, 1, ipert)
+      done_mode(imode0 + ipert) = .TRUE.
     ENDDO
-    CALL mp_sum(corr, intra_bgrp_comm)
-    IF (env_is('RTSC_DQ_VAR', '0')) corr = (0.d0, 0.d0)
-    corr_i0 = imode0
-    corr_npe = npe
-    WRITE(stdout, '(5x,"rtsc dq: ",I0," pass(es), max|C| = ",es10.3)') nit, MAXVAL(ABS(corr))
+    WRITE(stdout, '(5x,"rtsc dq: ",I0," pass(es)")') nit
     !
     ! dvscf of this irrep (written by solve_linter for EPW, and used nowhere else): the dV_in of
     ! the last pass
@@ -247,29 +248,41 @@ CONTAINS
   END SUBROUTINE dq_solve_irrep
   !
   !------------------------------------------------------------------------------------------------
-  SUBROUTINE dq_add_dyn(imode0, npe)
+  SUBROUTINE dq_finish_dyn()
     !------------------------------------------------------------------------------------------------
-    !! add the stationary correction of this irrep to dyn and dyn_rec (after drhodvus, which resets
-    !! dyn_rec; before drhodv, which adds the Hellmann-Feynman part)
-    USE dynmat, ONLY : dyn, dyn_rec
-    INTEGER, INTENT(IN) :: imode0, npe
+    !! after phqscf (all irreps of this q): add the stationary correction to dyn (pattern basis),
+    !!    C(i,j) = - int conj(dn_out_i) (dV_in_j - dV_out_j)   for all modes i, j,
+    !! so that the Hermitized dyn is stationary (error bilinear in the dn_out errors). The
+    !! Hellmann-Feynman part (drhodv) fills the same rows i against all columns j.
+    USE io_global, ONLY : stdout
+    USE mp,        ONLY : mp_sum
+    USE mp_bands,  ONLY : intra_bgrp_comm
+    USE fft_base,  ONLY : dfftp
+    USE cell_base, ONLY : omega
+    USE ions_base, ONLY : nat
+    USE dynmat,    ONLY : dyn
+    COMPLEX(DP), ALLOCATABLE :: c(:,:)
     INTEGER :: i, j
-    IF (.NOT. ALLOCATED(corr) .OR. corr_i0 /= imode0 .OR. corr_npe /= npe) &
-      CALL errore('rtsc_dq', 'dq_add_dyn: no correction for this irrep', 1)
-    DO j = 1, npe
-      DO i = 1, npe
-        dyn(imode0 + i, imode0 + j) = dyn(imode0 + i, imode0 + j) + corr(i, j)
-        dyn_rec(imode0 + i, imode0 + j) = dyn_rec(imode0 + i, imode0 + j) + corr(i, j)
+    IF (.NOT. dq_active()) RETURN
+    IF (.NOT. ALLOCATED(dn_all)) RETURN
+    IF (.NOT. ALL(done_mode)) CALL errore('rtsc_dq', 'dq_finish_dyn: not every mode of this q was solved', 1)
+    ALLOCATE(c(3 * nat, 3 * nat))
+    DO j = 1, 3 * nat
+      DO i = 1, 3 * nat
+        c(i, j) = - DOT_PRODUCT(dn_all(:, i), r_all(:, j)) * omega / REAL(dfftp%nr1 * dfftp%nr2 * dfftp%nr3, DP)
       ENDDO
     ENDDO
-    DEALLOCATE(corr)
-    corr_i0 = -1
-  END SUBROUTINE dq_add_dyn
+    CALL mp_sum(c, intra_bgrp_comm)
+    IF (env_is('RTSC_DQ_VAR', '0')) c = (0.d0, 0.d0)
+    dyn = dyn + c
+    WRITE(stdout, '(5x,"rtsc dq: stationary correction added to dyn, max|C| = ",ES10.3)') MAXVAL(ABS(c))
+    DEALLOCATE(c)
+  END SUBROUTINE dq_finish_dyn
   !
   !------------------------------------------------------------------------------------------------
   SUBROUTINE dq_end_q()
     IF (ALLOCATED(dv_all)) DEALLOCATE(dv_all)
-    IF (ALLOCATED(corr)) DEALLOCATE(corr)
+    IF (ALLOCATED(dn_all)) DEALLOCATE(dn_all, r_all, done_mode)
     have_q = .FALSE.
     dq_xq = 1.d10
   END SUBROUTINE dq_end_q

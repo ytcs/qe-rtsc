@@ -49,7 +49,7 @@ SUBROUTINE do_phonon(auxdyn)
   USE control_flags,  ONLY : use_gpu
   USE environment,   ONLY : print_cuda_info
   USE sth_batched,   ONLY : sth_batched_end_q
-  USE rtsc_dq,       ONLY : dq_end_q
+  USE rtsc_dq,       ONLY : dq_end_q, dq_finish_dyn
   
   IMPLICIT NONE
   !
@@ -119,6 +119,7 @@ SUBROUTINE do_phonon(auxdyn)
      IF ( trans ) THEN
         !
         CALL phqscf()
+        CALL dq_finish_dyn()   ! rtsc: RTSC_DQ stationary correction (no-op otherwise)
         IF (lmultipole) CALL write_drhoun()
         IF (.NOT. lmultipole) CALL dynmatrix_new(iq)
         !
