@@ -3,8 +3,8 @@
 
 Checks lambda and w_log (1 %), Allen-Dynes Tc (max(2 %, 0.5 K)), and at every temperature the
 mean leading-edge gap (mean of delta(0) over the Fermi-surface states in *.imag_aniso_gap_FS_<T>,
-2 %) and the two peak positions of the gap distribution *.imag_aniso_gap0_<T> (3 %, MgB2
-two-gap structure). Also prints the epmatwp difference when both runs wrote one.
+2 %) and the two peak positions of the gap distribution (3 %, MgB2
+two-gap structure; peaks of the smoothed per-state gap density, see peaks()). Also prints the epmatwp difference when both runs wrote one.
 """
 import glob
 import os
@@ -33,15 +33,17 @@ def row(name, a, b, tol_rel, tol_abs=0.0):
     print(f"{name:36s} ref {a:12.6f} test {b:12.6f}  rel {rel:9.2e}  {verdict}")
 
 
-def peaks(f):
-    a = np.loadtxt(f)
-    x, y = a[:, 1], a[:, 4]
-    loc = [i for i in range(1, len(y) - 1)
-           if y[i] >= y[i - 1] and y[i] > y[i + 1] and y[i] > 0.02 * y.max()]
+def peaks(gaps, width=1.0, sep=3.0):
+    """Two highest maxima, at least `sep` meV apart, of the Gaussian-smoothed (`width` meV)
+    density of the per-state leading-edge gaps. The raw *.imag_aniso_gap0_* histogram is too
+    spiky on these grids: its argmax flips between near-equal bins from run to run."""
+    x = np.arange(gaps.min() - 3 * width, gaps.max() + 3 * width, 0.01)
+    y = np.exp(-0.5 * ((x[:, None] - gaps[None, :]) / width) ** 2).sum(axis=1)
+    loc = [i for i in range(1, len(y) - 1) if y[i] >= y[i - 1] and y[i] > y[i + 1]]
     loc.sort(key=lambda i: -y[i])
     sel = []
     for i in loc:
-        if all(abs(x[i] - x[j]) > 1.0 for j in sel):
+        if all(abs(x[i] - x[j]) > sep for j in sel):
             sel.append(i)
         if len(sel) == 2:
             break
@@ -64,7 +66,7 @@ for f in sorted(glob.glob(os.path.join(ref, "*.imag_aniso_gap_FS_*"))):
     a = np.loadtxt(f, comments="#")[:, -1]
     b = np.loadtxt(g, comments="#")[:, -1]
     row(f"mean leading-edge gap {T} K [meV]", a.mean(), b.mean(), 0.02)
-    pa, pb = peaks(f.replace("gap_FS", "gap0")), peaks(g.replace("gap_FS", "gap0"))
+    pa, pb = peaks(a), peaks(b)
     if len(pa) == 2 and len(pb) == 2:
         for i in range(2):
             row(f"  gap peak {i + 1} at {T} K [meV]", pa[i], pb[i], 0.03)
