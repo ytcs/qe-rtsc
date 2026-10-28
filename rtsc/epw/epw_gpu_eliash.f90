@@ -169,8 +169,8 @@ CONTAINS
          d_part, ef0, fsthick, eps_ac, dosef, pit, inv_dos, mucs)
     istat = cudaGetLastError(); CALL chk(istat, 'k_fsr launch')
     ALLOCATE(part(nsiw, 3, nb, nkl, nsplit))
-    part = d_part
     istat = cudaDeviceSynchronize(); CALL chk(istat, 'k_fsr')
+    istat = cudaMemcpy(part, d_part, nsiw * 3 * nb * nkl * nsplit); CALL chk(istat, 'D2H part')
     naz = 0.0_dp; az = 0.0_dp; ad = 0.0_dp
     DO ic = 1, nsplit
       DO ik = 1, nkl
