@@ -2,7 +2,7 @@
 ! rtsc: starting wavefunctions for the ph.x nscf (c_bands_nscf_ph) by symmetry rotation of the scf
 ! wavefunctions in the restart directory, instead of random vectors.
 !
-! Enabled by RTSC_NSCF_ROT=1 (off by default). Davidson then runs exactly as in vanilla, to the
+! On by default; RTSC_NSCF_ROT=0 gives vanilla's random start. Davidson then runs exactly as in vanilla, to the
 ! same threshold (ethr_nscf = 1e-9/nelec), from a much better start. The start only changes how
 ! many Davidson iterations are needed; it cannot change what Davidson converges to beyond ethr
 ! (vanilla's own result already depends on its random start at that level). If no symmetry image
@@ -50,8 +50,9 @@ CONTAINS
     COMPLEX(DP), ALLOCATABLE :: w(:)
     !
     CALL nscf_start_free()
+    ! on by default (passed the nscf gate on the full B1 smoke); RTSC_NSCF_ROT=0 restores vanilla
     CALL get_environment_variable('RTSC_NSCF_ROT', s, STATUS=ios)
-    IF (ios /= 0 .OR. TRIM(s) /= '1') RETURN
+    IF (ios == 0 .AND. TRIM(s) == '0') RETURN
     IF (noncolin .OR. gamma_only .OR. lsda .OR. nproc_bgrp /= 1) RETURN
     CALL start_clock('nscf_rot')
     dir = nscf_start_dir
