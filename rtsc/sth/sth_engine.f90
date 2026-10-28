@@ -94,6 +94,10 @@ MODULE sth_engine
   TYPE(cublasHandle), SAVE :: hblas
   LOGICAL, SAVE :: have_handles = .FALSE.
   INTEGER, SAVE :: plans(0:MAXPLAN-1) = 0, nplan = 0, plan_nnr = 0, plan_nr(3) = 0
+  ! psi_k(r) cache (nnr x nslot*nksq) or, when it does not fit (or RTSC_STH_NOPSIR=1), psi_k(r)
+  ! rebuilt per column chunk from evc into d_box2 (one extra batched inverse FFT per chunk)
+  LOGICAL, SAVE :: psir_cached = .TRUE.
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_box2(:,:)
   INTEGER, PINNED, ALLOCATABLE, SAVE :: h_nact(:)
   !
 CONTAINS
@@ -547,9 +551,23 @@ CONTAINS
     IF (n <= nock(k) .AND. ig <= npw(k)) psir(idxk(ig, k), b) = evc(ig, b)
   END SUBROUTINE k_scatter_evc
   !
-  ATTRIBUTES(GLOBAL) SUBROUTINE k_dvpsir(box, psir, dv, list, s0, nnr, nslot, npert)
-    ! apply_dpot: box(:, j) = dvscf(:, p) * psi_kn(r)
-    INTEGER, VALUE :: s0, nnr, nslot, npert
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_psir_chunk(box, evc, list, s0, nnr, npwx, nslot, npert, nksq, npw, idxk)
+    ! no-cache psi(r): box(:, j) (pre-zeroed) <- evc of column list(s0+j)'s band at the k FFT indices
+    INTEGER, VALUE :: s0, nnr, npwx, nslot, npert, nksq
+    COMPLEX(dp) :: box(nnr, *), evc(npwx, *)
+    INTEGER :: list(*), npw(nksq), idxk(npwx, nksq)
+    INTEGER :: j, s, k, n, ig
+    j = blockIdx%y
+    s = list(s0 + j)
+    k = (s - 1) / (nslot * npert) + 1
+    n = MOD(s - 1, nslot) + 1
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    IF (ig <= npw(k)) box(idxk(ig, k), j) = evc(ig, n + nslot * (k - 1))
+  END SUBROUTINE k_psir_chunk
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_dvpsir(box, psir, dv, list, s0, nnr, nslot, npert, pj)
+    ! apply_dpot: box(:, j) = dvscf(:, p) * psi_kn(r); pj = 1: psir is per chunk column (no cache)
+    INTEGER, VALUE :: s0, nnr, nslot, npert, pj
     COMPLEX(dp) :: box(nnr, *), psir(nnr, *), dv(nnr, *)
     INTEGER :: list(*)
     INTEGER :: j, s, k, n, p, b, ir
@@ -559,6 +577,7 @@ CONTAINS
     n = MOD(s - 1, nslot) + 1
     p = MOD((s - 1) / nslot, npert) + 1
     b = n + nslot * (k - 1)
+    IF (pj == 1) b = j
     ir = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     IF (ir <= nnr) box(ir, j) = psir(ir, b) * dv(ir, p)
   END SUBROUTINE k_dvpsir
@@ -577,9 +596,10 @@ CONTAINS
     IF (ig <= npwq(k)) d(ig, s) = d(ig, s) + box(idxq(ig, k), j) * scale
   END SUBROUTINE k_gather_add
   !
-  ATTRIBUTES(GLOBAL) SUBROUTINE k_drho(drho, box, psir, list, s0, nb, nnr, nslot, npert, wgt)
-    ! incdrhoscf: drho(r, p) += sum_j wgt(k_j) conj(psi_{k_j n_j}(r)) dpsi_j(r); deterministic order
-    INTEGER, VALUE :: s0, nb, nnr, nslot, npert
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_drho(drho, box, psir, list, s0, nb, nnr, nslot, npert, wgt, pj)
+    ! incdrhoscf: drho(r, p) += sum_j wgt(k_j) conj(psi_{k_j n_j}(r)) dpsi_j(r); deterministic order;
+    ! pj = 1: psir is per chunk column (no cache)
+    INTEGER, VALUE :: s0, nb, nnr, nslot, npert, pj
     COMPLEX(dp) :: drho(nnr, *), box(nnr, *), psir(nnr, *)
     INTEGER :: list(*)
     REAL(dp) :: wgt(*)
@@ -596,6 +616,7 @@ CONTAINS
       n = MOD(s - 1, nslot) + 1
       p = MOD((s - 1) / nslot, npert) + 1
       b = n + nslot * (k - 1)
+      IF (pj == 1) b = j
       acc(p) = acc(p) + wgt(k) * (CONJG(psir(ir, b)) * box(ir, j))
     ENDDO
     DO p = 1, npert
@@ -706,6 +727,16 @@ CONTAINS
     plan_nnr = nnr
     plan_nr = nr
   END SUBROUTINE make_plans
+  !
+  SUBROUTINE psir_chunk(s0, nb, ip)
+    !! no-cache mode: psi_kn(r) of the nb = 2**ip columns list(s0+1 .. s0+nb) into d_box2
+    INTEGER, INTENT(IN) :: s0, nb, ip
+    CALL zero_c(d_box2, INT(nnr, 8) * nb)
+    CALL k_psir_chunk<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_box2, d_evc, d_valid, s0, nnr, npwx, &
+         nslot, npert, nksq, d_npw, d_idxk)
+    CALL kerr('psir_chunk')
+    CALL fft_exec(ip, d_box2, CUFFT_INVERSE)
+  END SUBROUTINE psir_chunk
   !
   SUBROUTINE destroy_plans()
     INTEGER :: ip, istat
@@ -953,6 +984,26 @@ CONTAINS
     need = 16_8 * npwx * nsl * 7 + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
+    BLOCK
+      CHARACTER(LEN=8) :: sv
+      INTEGER :: ios
+      INTEGER(8) :: need_nc
+      CALL get_environment_variable('RTSC_STH_NOPSIR', sv, STATUS=ios)
+      ! without the psi(r) cache: evc stays on the device and one more FFT box holds a chunk's psi(r)
+      need_nc = need - 16_8 * nnr * nbox + 16_8 * npwx * nbox + 16_8 * nnr * sth_bmax
+      psir_cached = .NOT. (ios == 0 .AND. TRIM(sv) == '1')
+      IF (psir_cached .AND. need > freeb - 1024_8**3 .AND. need_nc <= freeb - 1024_8**3) THEN
+        WRITE(*, '(A,F8.2,A,F8.2,A,F8.2,A)') 'sth_engine: psi(r) cache needs ', REAL(need) / 1024.0**3, &
+             ' GiB, free ', REAL(freeb) / 1024.0**3, ' GiB: psi(r) recomputed per chunk (', &
+             REAL(need_nc) / 1024.0**3, ' GiB)'
+        psir_cached = .FALSE.
+      ENDIF
+      IF (.NOT. psir_cached) THEN
+        need = need_nc
+        IF (ios == 0 .AND. TRIM(sv) == '1') WRITE(*, '(A,F8.2,A)') &
+             'sth_engine: psi(r) recomputed per chunk (RTSC_STH_NOPSIR=1), needs ', REAL(need) / 1024.0**3, ' GiB'
+      ENDIF
+    END BLOCK
     IF (need > freeb - 1024_8**3) THEN
       WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
            REAL(freeb) / 1024.0**3, ' GiB'
@@ -984,7 +1035,11 @@ CONTAINS
     END BLOCK
     !
     ALLOCATE(d_box(nnr, sth_bmax))
-    ALLOCATE(d_psir(nnr, nbox))
+    IF (psir_cached) THEN
+      ALLOCATE(d_psir(nnr, nbox))
+    ELSE
+      ALLOCATE(d_box2(nnr, sth_bmax))
+    ENDIF
     istat = cudaDeviceSynchronize()
     CALL sth_mem_sample()
     !
@@ -996,10 +1051,11 @@ CONTAINS
     CALL k_hprec<<<nbox, RB, 0, strm>>>(d_hd, d_W, d_g2, d_npwq, d_nock, npwx, nproj, nkb, nslot, nksq)
     CALL kerr('hprec')
     !
-    ! psi_k(r) for n <= nocc_k: scatter evc at k+G, inverse FFT in place
-    CALL zero_c(d_psir, INT(nnr, 8) * nbox)
-      ALLOCATE(d_evc(npwx, nbox))
-      d_evc = h_evc
+    ! psi_k(r) for n <= nocc_k: scatter evc at k+G, inverse FFT in place (no cache: keep evc only)
+    ALLOCATE(d_evc(npwx, nbox))
+    d_evc = h_evc
+    IF (psir_cached) THEN
+      CALL zero_c(d_psir, INT(nnr, 8) * nbox)
       CALL k_scatter_evc<<<dim3(nblk(npwx, TPB), nbox, 1), TPB, 0, strm>>>(d_psir, d_evc, nnr, npwx, &
            nslot, nksq, d_npw, d_nock, d_idxk)
       CALL kerr('scatter_evc')
@@ -1016,6 +1072,7 @@ CONTAINS
       ENDDO
       CALL tsync()
       DEALLOCATE(d_evc)
+    ENDIF
     DEALLOCATE(h_evc, h_W)
     istat = cudaDeviceSynchronize()
     CALL chk(istat, 'setup')
@@ -1157,8 +1214,14 @@ CONTAINS
         nb = MIN(sth_bmax, nvalid - s0)
         ip = plan_for(nb)
         nb = 2**ip
-        CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
-             nnr, nslot, npert)
+        IF (psir_cached) THEN
+          CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
+               nnr, nslot, npert, 0)
+        ELSE
+          CALL psir_chunk(s0, nb, ip)
+          CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_box2, d_dv, d_valid, s0, &
+               nnr, nslot, npert, 1)
+        ENDIF
         CALL kerr('dvpsir')
         CALL fft_exec(ip, d_box, CUFFT_FORWARD)
         CALL k_gather_add<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_d0, d_box, d_valid, s0, nnr, &
@@ -1231,8 +1294,14 @@ CONTAINS
            npwx, nslot, npert, nksq, d_inv)
       CALL kerr('scatter (drho)')
       CALL fft_exec(ip, d_box, CUFFT_INVERSE)
-      CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
-           npert, d_wgt)
+      IF (psir_cached) THEN
+        CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
+             npert, d_wgt, 0)
+      ELSE
+        CALL psir_chunk(s0, nb, ip)
+        CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_box2, d_valid, s0, nb, nnr, nslot, &
+             npert, d_wgt, 1)
+      ENDIF
       CALL kerr('drho')
       s0 = s0 + nb
     ENDDO
@@ -1353,7 +1422,10 @@ CONTAINS
     IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
     IF (ALLOCATED(d_npw)) DEALLOCATE(d_npw, d_npwq, d_nock, d_nockq, d_idxk, d_idxkq, d_g2, d_etk, &
                                      d_hd, d_wwg, d_wg1, d_wgt, d_W)
-    IF (ALLOCATED(d_box)) DEALLOCATE(d_box, d_psir)
+    IF (ALLOCATED(d_box)) DEALLOCATE(d_box)
+    IF (ALLOCATED(d_psir)) DEALLOCATE(d_psir)
+    IF (ALLOCATED(d_box2)) DEALLOCATE(d_box2)
+    IF (ALLOCATED(d_evc)) DEALLOCATE(d_evc)
     IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
