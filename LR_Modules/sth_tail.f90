@@ -89,7 +89,7 @@ CONTAINS
             ENDDO
           ENDDO
         ELSE
-          !$acc parallel loop collapse(3) private(ac)
+          !$acc parallel loop collapse(3) gang vector private(ac)
           DO k = 1, nr3
             DO j = 1, nr2
               DO i = 1, nr1
@@ -104,8 +104,10 @@ CONTAINS
                 IF (rk < 1) rk = rk + nr3
                 arg = gfm(1) * (i - 1) + gfm(2) * (j - 1) + gfm(3) * (k - 1)
                 ph = CMPLX(COS(arg), SIN(arg), KIND=DP)
+                !$acc loop seq
                 DO ipert = 1, np
                   x = (0.d0, 0.d0)
+                  !$acc loop seq
                   DO jpert = 1, np
                     x = x + upm(jpert, ipert) * dvtosym(ri, rj, rk, is, jpert) * ph
                   ENDDO
@@ -138,13 +140,15 @@ CONTAINS
           ENDDO
         ENDDO
       ENDDO
-      !$acc parallel loop collapse(3) private(ac)
+      !$acc parallel loop collapse(3) gang vector private(ac)
       DO k = 1, nr3
         DO j = 1, nr2
           DO i = 1, nr1
+            !$acc loop seq
             DO ipert = 1, np
               ac(ipert) = (0.d0, 0.d0)
             ENDDO
+            !$acc loop seq
             DO isym = 1, ns
               ri = ss(1, 1, isym) * (i - 1) + ss(2, 1, isym) * (j - 1) + ss(3, 1, isym) * (k - 1) - ftau(1, isym)
               ri = MOD(ri, nr1) + 1
@@ -157,8 +161,10 @@ CONTAINS
               IF (rk < 1) rk = rk + nr3
               arg = gf(1, isym) * (i - 1) + gf(2, isym) * (j - 1) + gf(3, isym) * (k - 1)
               ph = CMPLX(COS(arg), SIN(arg), KIND=DP)
+              !$acc loop seq
               DO ipert = 1, np
                 x = (0.d0, 0.d0)
+                !$acc loop seq
                 DO jpert = 1, np
                   x = x + up(jpert, ipert, isym) * dvtosym(ri, rj, rk, is, jpert) * ph
                 ENDDO
@@ -169,6 +175,7 @@ CONTAINS
                 ENDIF
               ENDDO
             ENDDO
+            !$acc loop seq
             DO ipert = 1, np
               dvsym(i, j, k, ipert) = ac(ipert)
             ENDDO

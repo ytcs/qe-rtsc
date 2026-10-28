@@ -37,6 +37,7 @@ SUBROUTINE c_bands_nscf_ph( )
   USE io_files,             ONLY : tmp_dir, prefix
   USE uspp_init,            ONLY : init_us_2
   USE sth_nscf_start,       ONLY : nscf_start_prepare, nscf_start_get, nscf_start_free
+  USE sth_nscf_batched,     ONLY : nscf_batched_run
   !
   IMPLICIT NONE
   !
@@ -46,6 +47,8 @@ SUBROUTINE c_bands_nscf_ph( )
   ! ik_: k-point already done in a previous run
   ! ik : counter on k points
   LOGICAL :: exst, exst_mem
+  LOGICAL, ALLOCATABLE :: kdone(:)
+  ! rtsc: k-points already diagonalized by the batched Davidson
   !
   REAL(DP), EXTERNAL :: get_clock
   !
@@ -78,7 +81,13 @@ SUBROUTINE c_bands_nscf_ph( )
   ! rtsc: rotated scf wavefunctions as Davidson starting vectors (RTSC_NSCF_ROT=1)
   CALL nscf_start_prepare()
   !
+  ! rtsc: batched Davidson over all k on the GPU (RTSC_STH=1); the loop below handles the rest
+  ALLOCATE(kdone(nks))
+  CALL nscf_batched_run(ik_, kdone, avg_iter)
+  !
   k_loop: DO ik = ik_+1, nks
+     !
+     IF (kdone(ik)) CYCLE
      !
      ! ... Set k-point, spin, kinetic energy, needed by Hpsi
      !
@@ -170,6 +179,7 @@ SUBROUTINE c_bands_nscf_ph( )
   END DO k_loop
   !
   CALL nscf_start_free()
+  DEALLOCATE(kdone)
   CALL mp_sum( avg_iter, inter_pool_comm )
   avg_iter = avg_iter / nkstot
   !

@@ -140,7 +140,7 @@ subroutine drhodv (nu_i0, nper, drhos)
               CALL becscal(fact,dalpq(ipol,ipert),nkb,nbnd)
            ENDDO
         ENDDO
-        call drhodvnl (ik, ikk, nper, nu_i0, dynwrk, becp1, alphap, dbecq, dalpq)
+        call drhodvnl_nc (ik, ikk, nper, nu_i0, dynwrk, becp1, alphap, dbecq, dalpq)
         CYCLE
      ENDIF
      call init_us_2 (npwq, igk_k(1,ikq), xk (1, ikq), vkb, .true.)
@@ -278,3 +278,85 @@ subroutine drhodv (nu_i0, nper, drhos)
   call stop_clock ('drhodv')
   return
 end subroutine drhodv
+!
+!-----------------------------------------------------------------------
+subroutine drhodvnl_nc (ik, ikk, nper, nu_i0, wdyn, becp1, alphap, dbecq, dalpq)
+  !-----------------------------------------------------------------------
+  !! rtsc: drhodvnl for norm-conserving, collinear pseudopotentials (no okvan, no noncolin, one band
+  !! group), the engine path of drhodv. Same loops and operation order as drhodvnl; deff is deeq for
+  !! every band (compute_deff without okvan), taken once from the host copy instead of a GPU kernel
+  !! and copy-out per band.
+  !
+  USE kinds,      ONLY : DP
+  USE ions_base,  ONLY : nat, ntyp => nsp, ityp
+  USE uspp,       ONLY : nkb, deeq
+  USE uspp_param, ONLY : nh, nhm
+  USE becmod,     ONLY : bec_type
+  USE wvfct,      ONLY : nbnd
+  USE klist,      ONLY : wk
+  USE lsda_mod,   ONLY : current_spin
+  USE qpoint,     ONLY : nksq
+  USE mp_bands,   ONLY : intra_bgrp_comm
+  USE mp,         ONLY : mp_sum
+  implicit none
+  integer :: ik, ikk, nper, nu_i0
+  TYPE(bec_type) :: dbecq(nper), dalpq(3,nper), becp1(nksq), alphap(3,nksq)
+  complex(DP) :: wdyn (3 * nat, 3 * nat)
+  complex(DP) :: dynwrk (3 * nat, 3 * nat)
+  complex(DP), allocatable :: ps1 (:,:), ps2 (:,:,:)
+  real(DP), allocatable :: deff(:,:,:)
+  integer :: ibnd, ijkb0, ih, jh, ikb, jkb, ipol, iper, na, nt, mu, nu
+  !
+  allocate (ps1 (nkb, nbnd), ps2 (nkb, nbnd, 3), deff (nhm, nhm, nat))
+  ps1 = (0.d0, 0.d0)
+  ps2 = (0.d0, 0.d0)
+  dynwrk (:, :) = (0.d0, 0.d0)
+  deff(:,:,:) = deeq(:,:,:,current_spin)
+  do ibnd = 1, nbnd
+     ijkb0 = 0
+     do nt = 1, ntyp
+        do na = 1, nat
+           if (ityp (na) == nt) then
+              do ih = 1, nh (nt)
+                 ikb = ijkb0 + ih
+                 do jh = 1, nh (nt)
+                    jkb = ijkb0 + jh
+                    ps1 (ikb, ibnd) = ps1 (ikb, ibnd) + deff(ih,jh,na)*becp1(ik)%k(jkb,ibnd)
+                    do ipol = 1, 3
+                       ps2 (ikb, ibnd, ipol) = ps2 (ikb, ibnd, ipol) + &
+                            deff(ih,jh,na) * alphap(ipol,ik)%k(jkb,ibnd)
+                    enddo
+                 enddo
+              enddo
+              ijkb0 = ijkb0 + nh (nt)
+           endif
+        enddo
+     enddo
+  enddo
+  ijkb0 = 0
+  do nt = 1, ntyp
+     do na = 1, nat
+        if (ityp (na) == nt) then
+           do ipol = 1, 3
+              mu = 3 * (na - 1) + ipol
+              do ibnd = 1, nbnd
+                 do ih = 1, nh (nt)
+                    ikb = ijkb0 + ih
+                    do iper = 1, nper
+                       nu = nu_i0 + iper
+                       dynwrk (nu, mu) = dynwrk (nu, mu) + &
+                            2.d0 * wk (ikk) * (ps2 (ikb, ibnd, ipol) * &
+                            CONJG(dbecq(iper)%k(ikb, ibnd) ) + &
+                            ps1(ikb,ibnd) * CONJG(dalpq(ipol,iper)%k(ikb,ibnd)))
+                    enddo
+                 enddo
+              enddo
+           enddo
+           ijkb0 = ijkb0 + nh (nt)
+        endif
+     enddo
+  enddo
+  call mp_sum ( dynwrk, intra_bgrp_comm )
+  wdyn (:,:) = wdyn (:,:) + dynwrk (:,:)
+  deallocate (ps1, ps2, deff)
+end subroutine drhodvnl_nc

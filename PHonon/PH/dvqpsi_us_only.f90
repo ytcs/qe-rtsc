@@ -377,7 +377,8 @@ SUBROUTINE dvqpsi_us_only_acc (ik, uact, becp1, alphap)
   USE klist,      ONLY : xk, ngk, igk_k
   USE ions_base,  ONLY : nat, ityp
   USE wvfct,      ONLY : nbnd, npwx, et
-  USE uspp,       ONLY : nkb, vkb, ofsbeta
+  USE uspp,       ONLY : nkb, vkb, ofsbeta, deeq
+  USE lsda_mod,   ONLY : current_spin
   USE uspp_param, ONLY : nh, nhm
   USE qpoint,     ONLY : nksq, ikks, ikqs
   USE becmod,     ONLY : bec_type
@@ -403,8 +404,9 @@ SUBROUTINE dvqpsi_us_only_acc (ik, uact, becp1, alphap)
   ALLOCATE (ps1(nkb, nbnd), ps2(nkb, nbnd, 3), deff(nhm, nhm, nat))
   ps1(:,:) = (0.d0, 0.d0)
   ps2(:,:,:) = (0.d0, 0.d0)
+  ! norm-conserving: compute_deff gives deeq for every band (one host copy instead of a GPU kernel per band)
+  deff(:,:,:) = deeq(:,:,:,current_spin)
   DO ibnd = 1, nbnd
-     CALL compute_deff(deff, et(ibnd,ikk))
      DO na = 1, nat
         nt = ityp(na)
         mu = 3 * (na - 1)

@@ -68,6 +68,7 @@ MODULE sth_engine
   !
   ! device state
   INTEGER, DEVICE, ALLOCATABLE :: d_npw(:), d_npwq(:), d_nock(:), d_nockq(:), d_idxk(:,:), d_idxkq(:,:)
+  INTEGER, DEVICE, ALLOCATABLE :: d_inv(:,:)          ! FFT index -> k+q plane-wave index (0: outside)
   INTEGER, DEVICE, ALLOCATABLE :: d_valid(:), d_act(:), d_act2(:), d_conv(:), d_cnt(:), d_nact(:)
   REAL(dp), DEVICE, ALLOCATABLE :: d_g2(:,:), d_etk(:,:), d_hd(:,:,:), d_wwg(:,:,:), d_wg1(:,:)
   REAL(dp), DEVICE, ALLOCATABLE :: d_vrs(:), d_wgt(:), d_rho(:), d_kter(:), d_av(:), d_cv(:)
@@ -160,6 +161,26 @@ CONTAINS
     ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     IF (ig <= npwq(k)) box(idxq(ig, k), j) = x(ig, s)
   END SUBROUTINE k_scatter
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_scatter_full(box, x, list, s0, nnr, npwx, nslot, npert, nksq, inv)
+    ! box(:, j) <- x(:, list(s0+j)) at the k+q FFT indices, zero elsewhere (no separate zeroing pass)
+    INTEGER, VALUE :: s0, nnr, npwx, nslot, npert, nksq
+    COMPLEX(dp) :: box(nnr, *), x(npwx, *)
+    INTEGER :: list(*), inv(nnr, nksq)
+    INTEGER :: j, s, k, ir, ig
+    j = blockIdx%y
+    s = list(s0 + j)
+    k = (s - 1) / (nslot * npert) + 1
+    ir = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    IF (ir <= nnr) THEN
+      ig = inv(ir, k)
+      IF (ig > 0) THEN
+        box(ir, j) = x(ig, s)
+      ELSE
+        box(ir, j) = (0.0_dp, 0.0_dp)
+      ENDIF
+    ENDIF
+  END SUBROUTINE k_scatter_full
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_vmul(box, v, nnr)
     INTEGER, VALUE :: nnr
@@ -616,16 +637,13 @@ CONTAINS
     CALL kerr('zero')
   END SUBROUTINE zero_c
   !
-  ! smallest plan index whose batch (2**ip) holds nb columns
+  ! largest plan index whose batch (2**ip) does not exceed nb columns: the column chunks are exact
+  ! powers of two, so no FFT runs on padding boxes (cuFFT gives the same bits for any batch size)
   INTEGER FUNCTION plan_for(nb)
     INTEGER, INTENT(IN) :: nb
-    INTEGER :: ip
     plan_for = nplan - 1
-    DO ip = 0, nplan - 1
-      IF (2**ip >= nb) THEN
-        plan_for = ip
-        RETURN
-      ENDIF
+    DO WHILE (plan_for > 0 .AND. 2**plan_for > nb)
+      plan_for = plan_for - 1
     ENDDO
   END FUNCTION plan_for
   !
@@ -739,10 +757,10 @@ CONTAINS
     DO WHILE (s0 < nl)
       nb = MIN(sth_bmax, nl - s0)
       ip = plan_for(nb)
+      nb = 2**ip
       np = 2**ip
-      CALL zero_c(d_box, INT(nnr, 8) * np)
-      CALL k_scatter<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_box, x, list, s0, nnr, npwx, &
-           nslot, npert, nksq, d_npwq, d_idxkq)
+      CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, x, list, s0, nnr, npwx, &
+           nslot, npert, nksq, d_inv)
       CALL kerr('scatter')
       CALL fft_exec(ip, d_box, CUFFT_INVERSE)
       CALL k_vmul<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_vrs, nnr)
@@ -891,7 +909,7 @@ CONTAINS
       have_handles = .TRUE.
     ENDIF
     ! memory check (bytes): column arrays, psi(r) cache, FFT box, W
-    need = 16_8 * npwx * nsl * 7 + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq
+    need = 16_8 * npwx * nsl * 7 + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
     istat = cudaMemGetInfo(freeb, totb)
     IF (need > freeb - 1024_8**3) THEN
       WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
@@ -907,6 +925,21 @@ CONTAINS
     d_idxk = h_idxk; d_idxkq = h_idxkq; d_g2 = h_g2; d_etk = h_etk; d_wwg = h_wwg; d_wg1 = h_wg1
     d_wgt = 2.0_dp * h_wk / omega
     d_W = h_W
+    BLOCK
+      INTEGER, ALLOCATABLE :: hinv(:,:)
+      INTEGER :: ig
+      ALLOCATE(hinv(nnr, nksq))
+      hinv = 0
+      DO ik = 1, nksq
+        DO ig = 1, h_npwq(ik)
+          hinv(h_idxkq(ig, ik), ik) = ig
+        ENDDO
+      ENDDO
+      IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+      ALLOCATE(d_inv(nnr, nksq))
+      d_inv = hinv
+      DEALLOCATE(hinv)
+    END BLOCK
     !
     ALLOCATE(d_box(nnr, sth_bmax))
     ALLOCATE(d_psir(nnr, nbox))
@@ -1078,6 +1111,7 @@ CONTAINS
       DO WHILE (s0 < nvalid)
         nb = MIN(sth_bmax, nvalid - s0)
         ip = plan_for(nb)
+        nb = 2**ip
         CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
              nnr, nslot, npert)
         CALL kerr('dvpsir')
@@ -1146,10 +1180,10 @@ CONTAINS
     DO WHILE (s0 < nvalid)
       nb = MIN(sth_bmax, nvalid - s0)
       ip = plan_for(nb)
+      nb = 2**ip
       np = 2**ip
-      CALL zero_c(d_box, INT(nnr, 8) * np)
-      CALL k_scatter<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_dpsi, d_valid, s0, nnr, &
-           npwx, nslot, npert, nksq, d_npwq, d_idxkq)
+      CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_dpsi, d_valid, s0, nnr, &
+           npwx, nslot, npert, nksq, d_inv)
       CALL kerr('scatter (drho)')
       CALL fft_exec(ip, d_box, CUFFT_INVERSE)
       CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
@@ -1274,6 +1308,7 @@ CONTAINS
     IF (ALLOCATED(d_npw)) DEALLOCATE(d_npw, d_npwq, d_nock, d_nockq, d_idxk, d_idxkq, d_g2, d_etk, &
                                      d_hd, d_wwg, d_wg1, d_wgt, d_W)
     IF (ALLOCATED(d_box)) DEALLOCATE(d_box, d_psir)
+    IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
   END SUBROUTINE sth_engine_free
   !
   SUBROUTINE sth_engine_shutdown()
