@@ -91,7 +91,7 @@ def phonons(s, calc):
     from phonopy.structure.atoms import PhonopyAtoms
     u = PhonopyAtoms(symbols=[x.specie.symbol for x in s], cell=s.lattice.matrix, scaled_positions=s.frac_coords)
     dim = supercell_dim(s)
-    ph = Phonopy(u, supercell_matrix=np.diag(dim), primitive_matrix=None)
+    ph = Phonopy(u, supercell_matrix=np.diag(dim), primitive_matrix="P")
     ph.generate_displacements(distance=0.01)
     forces = []
     for sc in ph.supercells_with_displacements:
