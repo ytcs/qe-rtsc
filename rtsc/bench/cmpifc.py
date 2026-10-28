@@ -37,8 +37,8 @@ for exe, inp in (("q2r.x", "q2r.in"), ("matdyn.x", "matdyn.in")):
 txt = open(os.path.join(w, "sub.freq")).read()
 nb = int(re.search(r"nbnd=\s*(\d+)", txt).group(1))
 nums = [float(x) for x in txt.split("/", 1)[1].split()]
-step = 3 + nb
-mat = [np.array(nums[i * step + 3:(i + 1) * step]) for i in range(nq)]
+step = len(nums) // nq          # q line (3 coordinates, plus the path length in recent matdyn) + nb
+mat = [np.array(nums[(i + 1) * step - nb:(i + 1) * step]) for i in range(nq)]
 
 
 def freqs(i):
