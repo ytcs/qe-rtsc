@@ -666,7 +666,9 @@
       ! Load lwin from ukk file
       !
       xq(:) = zero
+      CALL start_clock('ep_loadumat')
       CALL loadumat(nbndep, nbndsub, nk_loc, nkpts, xq, cu, cuq, lwin, lwinq, exband, w_centers)
+      CALL stop_clock('ep_loadumat')
       !
       ! Group et_all into degenerate groups
       !
@@ -851,7 +853,9 @@
         ! SP: First the vlocq needs to be initialized properly with the first
         !     q in the star
         xq = xq0
+        CALL start_clock('ep_init_q')
         CALL init(.FALSE.)
+        CALL stop_clock('ep_init_q')
         !
         ! retrieve the q in the star
         xq = sxq(:, iq)
@@ -874,7 +878,9 @@
         !
         ! Prepare the kmap for the refolding
         !
+        CALL start_clock('ep_createkmap')
         CALL createkmap(xq)
+        CALL stop_clock('ep_createkmap')
         !
         IF (iverbosity == 1) THEN
           !
@@ -1002,7 +1008,9 @@
         !
         IF (compute_dmat) CALL write_qmap(nqc, iq_irr, iq_first, isym, isym1, s, ft, timerev)
         !
+        CALL start_clock('ep_loadumat')
         CALL loadumat(nbndep, nbndsub, nk_loc, nkpts, xq, cu, cuq, lwin, lwinq, exband, w_centers)
+        CALL stop_clock('ep_loadumat')
         !
         !   calculate the sandwiches
         !
@@ -1025,8 +1033,10 @@
           ! Read the dvscf from file and add the Ewald part.
           CALL dvscf_read(imode0, iq_irr, nqc_irr, npe, xq0, dvscfins, timerev)
           ! Reconstruct the EPC on the full BZ from the IBZ read from file.
+          CALL start_clock('ep_coarse_c')
           CALL ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
                                  isym, xq0, nqc, el_ph_mat, epmatq, timerev)
+          CALL stop_clock('ep_coarse_c')
           !
           !
           DEALLOCATE(dvscfins, STAT = ierr)
@@ -1044,7 +1054,9 @@
         ! ZD: Store cz2 for ex-ph calculation when nedded
         cz2_out(:,:) = cz2(:,:)
         !
+        CALL start_clock('ep_rotepmat')
         CALL rotate_epmat(cz1, cz2, xq, nqc, lwin, lwinq, exband, timerev)
+        CALL stop_clock('ep_rotepmat')
         !DBSP
         !write(*,*)'epmatq(:,:,2,:,nqc)',SUM(epmatq(:,:,2,:,nqc))
         !write(*,*)'epmatq(:,:,2,:,nqc)**2',SUM((REAL(REAL(epmatq(:,:,2,:,nqc))))**2)+&
@@ -1065,7 +1077,9 @@
           ! SP: First the vlocq need to be initialized propertly with the first
           !     q in the star
           xq = -xq0
+          CALL start_clock('ep_init_q')
           CALL init(.FALSE.)
+          CALL stop_clock('ep_init_q')
           !
           ! retrieve the q in the star
           xq = -sxq(:, iq)
@@ -1095,9 +1109,13 @@
           !
           !  prepare the kmap for the refolding
           !
+          CALL start_clock('ep_createkmap')
           CALL createkmap(xq)
+          CALL stop_clock('ep_createkmap')
           !
+          CALL start_clock('ep_loadumat')
           CALL loadumat(nbndep, nbndsub, nk_loc, nkpts, xq, cu, cuq, lwin, lwinq, exband, w_centers)
+          CALL stop_clock('ep_loadumat')
           !
           xq0 = -xq0
           !
@@ -1113,8 +1131,10 @@
             ! Read the dvscf from file and add the Ewald part.
             CALL dvscf_read(imode0, iq_irr, nqc_irr, npe, xq0, dvscfins, timerev)
             ! Reconstruct the EPC on the full BZ from the IBZ read from file.
+            CALL start_clock('ep_coarse_c')
             CALL ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
                                    isym, xq0, nqc, el_ph_mat, epmatq, timerev)
+            CALL stop_clock('ep_coarse_c')
             !
             DEALLOCATE(dvscfins, STAT = ierr)
             IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating dvscfins', 1)
@@ -1131,7 +1151,9 @@
           ! ZD: Store cz2 for ex-ph calculation when nedded
           cz2_out(:,:) = cz2(:,:)
           !
+          CALL start_clock('ep_rotepmat')
           CALL rotate_epmat(cz1, cz2, xq, nqc, lwin, lwinq, exband, timerev)
+          CALL stop_clock('ep_rotepmat')
           !
           ! ZD: Calculate the ex-ph matrix
           IF (exciton) THEN

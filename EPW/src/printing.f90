@@ -1749,6 +1749,16 @@
     CALL print_clock('fft')
     CALL print_clock('ffts')
     CALL print_clock('fftw')
+    ! rtsc: finer breakdown of the coarse stage
+    CALL print_clock('dvscf_read')
+    CALL print_clock('ep_init_q')
+    CALL print_clock('ep_createkmap')
+    CALL print_clock('ep_loadumat')
+    CALL print_clock('ep_rotepmat')
+    CALL print_clock('ep_coarse_c')
+    CALL print_clock('ep_wfcread')
+    CALL print_clock('ep_prolog')
+    CALL print_clock('ep_gpu_k')
     WRITE(stdout, '(5x)')
     CALL print_clock('ELPHWAN')
     WRITE(stdout, '(5x, a)') 'INITIALIZATION: '

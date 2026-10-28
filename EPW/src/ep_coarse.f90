@@ -514,6 +514,7 @@
       !
       ipooltmp = ipool
       !
+      CALL start_clock('ep_wfcread')
       CALL readwfc(ipooltmp, nkq, evc)
       !
       !
@@ -528,6 +529,8 @@
       ! in parallel ipooltmp is for k and ipool is for k+q
       !
       CALL readwfc(ipool, nkq, evq)
+      CALL stop_clock('ep_wfcread')
+      CALL start_clock('ep_prolog')
       !
       ! --------------------------------------------------
       !  Calculate SO(3) in cartesian from s_axis_to_cart
@@ -697,8 +700,11 @@
       !   Calculation of the matrix element
       ! --------------------------------------------------
       !
+      CALL stop_clock('ep_prolog')
       IF (use_gpu) THEN
+        CALL start_clock('ep_gpu_k')
         CALL ep_gpu_k()
+        CALL stop_clock('ep_gpu_k')
       ELSE
       DO ipert = 1, npe
         !
