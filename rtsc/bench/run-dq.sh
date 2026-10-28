@@ -8,7 +8,10 @@
 #   ph2    ph.x on the full grid with RTSC_DQ=1: q /= Gamma one Sternheimer pass from the interpolated
 #          dvscf (PH/rtsc_dq.f90), Gamma self-consistent
 #   collect, nscf, epw as run-fork.sh
-# FROM=<stage> skips the stages before it (dev reruns; not a timing).
+# FROM=<stage> skips the stages before it (dev reruns; not a timing; never after the nscf stage has run in
+# <workdir>: nscf overwrites <prefix>.save).
+# Result 2026-10-28 (RTX 4090, groups/compute/DQ-LOG.md): fails the MILESTONE-1 gate on B1 (3^3 -> 6^3) and
+# B2 (2^3 -> 4^3); ph.x 1.96x / 2.38x, end to end 1.88x / 2.13x faster than the full-grid SCF.
 set -euo pipefail
 HERE=$(dirname "$(realpath "$0")")
 IN=$(realpath "$1"); BIN=$(realpath "$2"); W=$3; NS=$4; NT=${5:-8}; NE=${6:-12}
