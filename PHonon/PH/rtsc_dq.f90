@@ -3,7 +3,7 @@
 !
 ! RTSC_DQ=1, RTSC_DQ_WPOT=<dir>: at every q /= Gamma, solve_linter calls dq_solve_irrep instead of the
 ! self-consistent dfpt_kernel. The induced potential dV_in of the irrep is Fourier-interpolated
-! (dvscf_r2q, from the w_pot that dvscf_q2r.x wrote for a coarser q-grid), its G-sphere part symmetrized,
+! (dvscf_r2q, from the w_pot that dvscf_q2r.x wrote for a coarser q-grid), used as interpolated,
 ! and one non-self-consistent Sternheimer solve gives dpsi and dn_out (on the batched engine with
 ! RTSC_STH=1: one engine call per irrep, CG from dpsi = 0, no mixing). Then:
 !  - dvscf written for EPW: dV_in (the interpolated, symmetrized potential);
@@ -156,7 +156,10 @@ CONTAINS
     DO ipert = 1, npe
       dfpt_data%dvscfp(:, :, ipert) = dv_all(:, :, imode0 + ipert)
     ENDDO
-    IF (.NOT. env_is('RTSC_DQ_NOSYM', '1')) CALL psym_sphere(dfpt_data%dvscfp, npe)   ! NOSYM: diagnostic
+    ! dV_in is used as interpolated: psymdvscf is not a projector for dV at q with S q = q + G (it
+    ! moved the exact K-point dV by 1-10 %, see psym_sphere); dn_out is symmetrized as usual, so the
+    ! pass sees the symmetric part of dV_in. RTSC_DQ_SYM=1 (diagnostic): symmetrize the sphere part.
+    IF (env_is('RTSC_DQ_SYM', '1')) CALL psym_sphere(dfpt_data%dvscfp, npe)
     CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     !
     ! RTSC_DQ_NITER passes (default 1): pass 1 solves from dpsi = 0 (engine: cold start; vanilla loop:
@@ -255,9 +258,9 @@ CONTAINS
     !------------------------------------------------------------------------------------------------
     !! psymdvscf on the G-sphere part of v only. psymdvscf multiplies by exp(i G r) for the
     !! operations with S q = q + G (G /= 0, e.g. at K); on the FFT grid that wraps components near the
-    !! box edge, so it is a projector only for functions inside the sphere (as dn is). dV_ind has
-    !! components outside it (xc in real space; B1 K point: psymdvscf moved the exact dV_ind by
-    !! 1-10 %). The outside part is kept as interpolated.
+    !! box edge, so it is a projector only for functions without weight near the box edge (as dn).
+    !! dV_ind has such weight (xc in real space): at the B1 K point psymdvscf moved the exact dV_ind
+    !! by 1-10 %, and this sphere-only variant still by 1-10 % (the sphere touches the box edge).
     USE fft_base,         ONLY : dfftp
     USE fft_interfaces,   ONLY : fwfft, invfft
     USE gvect,            ONLY : ngm
