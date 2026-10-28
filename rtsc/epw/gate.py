@@ -4,7 +4,9 @@
 Checks lambda and w_log (1 %), Allen-Dynes Tc (max(2 %, 0.5 K)), and at every temperature the
 mean leading-edge gap (mean of delta(0) over the Fermi-surface states in *.imag_aniso_gap_FS_<T>,
 2 %) and the two peak positions of the gap distribution (3 %, MgB2
-two-gap structure; peaks of the smoothed per-state gap density, see peaks()). Also prints the epmatwp difference when both runs wrote one.
+two-gap structure; peaks of the smoothed per-state gap density, see peaks(); absolute floor
+0.05 meV = 5 steps of the density grid, for near-zero pi gaps). Also prints the epmatwp
+difference when both runs wrote one.
 """
 import glob
 import os
@@ -69,7 +71,7 @@ for f in sorted(glob.glob(os.path.join(ref, "*.imag_aniso_gap_FS_*"))):
     pa, pb = peaks(a), peaks(b)
     if len(pa) == 2 and len(pb) == 2:
         for i in range(2):
-            row(f"  gap peak {i + 1} at {T} K [meV]", pa[i], pb[i], 0.03)
+            row(f"  gap peak {i + 1} at {T} K [meV]", pa[i], pb[i], 0.03, 0.05)
     else:
         print(f"  peaks at {T} K: ref {pa} test {pb} (not bimodal)")
         ok = False
