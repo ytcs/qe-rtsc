@@ -55,7 +55,7 @@ MODULE epw_gpu_eliash
   LOGICAL :: lr_have_handle = .FALSE.
   TYPE(cublasHandle) :: lr_h
   !
-  PUBLIC :: ege_fsr, ege_reset
+  PUBLIC :: ege_fsr, ege_reset, ege_pade
   !
 CONTAINS
   !
@@ -322,6 +322,53 @@ CONTAINS
        nr, ' for 2N = ', n2, ', max residual ', resmax, ', A ', DBLE(na) * 8.0_dp / 1024.0_dp**2, ' MB'
     DEALLOCATE(f, s, u, vt, work, res)
   END SUBROUTINE lr_setup
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_pade(n, nst, nsw, z, a, b, ws, pa, pb)
+    !! pade_eval (three-term recursion) for coefficient sets a and b at w = ws(iw), one thread
+    !! per (iw, state).
+    INTEGER, VALUE :: n, nst, nsw
+    COMPLEX(dp), DEVICE :: z(n), a(n, nst), b(n, nst), pa(nsw, nst), pb(nsw, nst)
+    REAL(dp), DEVICE :: ws(nsw)
+    INTEGER :: iw, is, i
+    COMPLEX(dp) :: w, t, a0, a1, a2, b0, b1, b2, c0, c1, c2, d0, d1, d2
+    iw = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    is = blockIdx%y
+    IF (iw > nsw) RETURN
+    w = CMPLX(ws(iw), 0.0_dp, KIND = dp)
+    a0 = (0.0_dp, 0.0_dp); a1 = a(1, is); b0 = (1.0_dp, 0.0_dp); b1 = (1.0_dp, 0.0_dp)
+    c0 = (0.0_dp, 0.0_dp); c1 = b(1, is); d0 = (1.0_dp, 0.0_dp); d1 = (1.0_dp, 0.0_dp)
+    DO i = 2, n
+      t = w - z(i - 1)
+      a2 = a1 + t * a(i, is) * a0
+      b2 = b1 + t * a(i, is) * b0
+      c2 = c1 + t * b(i, is) * c0
+      d2 = d1 + t * b(i, is) * d0
+      a0 = a1; a1 = a2; b0 = b1; b1 = b2
+      c0 = c1; c1 = c2; d0 = d1; d1 = d2
+    ENDDO
+    pa(iw, is) = a1 / b1
+    pb(iw, is) = c1 / d1
+  END SUBROUTINE k_pade
+  !
+  SUBROUTINE ege_pade(n, nst, nsw, z, a, b, ws, pa, pb)
+    !! Pade approximants with coefficients a(:, is), b(:, is) on the points z, evaluated at the
+    !! real frequencies ws: pa(iw, is), pb(iw, is) (as pade_eval).
+    INTEGER, INTENT(IN) :: n, nst, nsw
+    COMPLEX(dp), INTENT(IN) :: z(n), a(n, nst), b(n, nst)
+    REAL(dp), INTENT(IN) :: ws(nsw)
+    COMPLEX(dp), INTENT(OUT) :: pa(nsw, nst), pb(nsw, nst)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: dz(:), da(:, :), db(:, :), dpa(:, :), dpb(:, :)
+    REAL(dp), DEVICE, ALLOCATABLE :: dws(:)
+    INTEGER :: istat
+    IF (nst <= 0) RETURN
+    ALLOCATE(dz(n), da(n, nst), db(n, nst), dpa(nsw, nst), dpb(nsw, nst), dws(nsw))
+    dz = z; da = a; db = b; dws = ws
+    CALL k_pade<<<dim3((nsw + 127) / 128, nst, 1), dim3(128, 1, 1)>>>(n, nst, nsw, dz, da, db, &
+         dws, dpa, dpb)
+    istat = cudaGetLastError(); CALL chk(istat, 'k_pade')
+    pa = dpa; pb = dpb
+    DEALLOCATE(dz, da, db, dpa, dpb, dws)
+  END SUBROUTINE ege_pade
   !
   SUBROUTINE lr_handle()
     INTEGER :: istat

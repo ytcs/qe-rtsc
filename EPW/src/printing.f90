@@ -1827,6 +1827,7 @@
     CALL print_clock('eliash_mix')
     CALL print_clock('eliash_comm')
     CALL print_clock('eliash_post')
+    CALL print_clock('pade_cont')
     CALL print_clock('el_init')
     CALL print_clock('el_readfreq')
     CALL print_clock('el_readeig')

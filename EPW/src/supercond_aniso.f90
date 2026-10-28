@@ -15,7 +15,18 @@
   !! This module contains all the subroutines linked with superconductivity using
   !! the isotropic or anisotropic Eliashberg formalism.
   !!
+  USE kinds, ONLY : DP
   IMPLICIT NONE
+  !
+  ! rtsc: state of the global Anderson mixing and of the warm start across temperatures
+  REAL(KIND = DP), ALLOCATABLE, SAVE :: rtsc_adx(:, :), rtsc_adf(:, :), rtsc_axp(:), rtsc_afp(:)
+  !! Anderson history (differences of inputs and residuals), previous input and residual
+  REAL(KIND = DP), ALLOCATABLE, SAVE :: rtsc_dprev(:, :, :), rtsc_wprev(:)
+  !! converged Delta(iw, ibnd, ik) of the previous temperature and its frequency grid
+  INTEGER, SAVE :: rtsc_anh = 0, rtsc_anpos = 0
+  !! number of stored Anderson differences and the last slot written
+  REAL(KIND = DP), SAVE :: rtsc_anfmin = 0.d0
+  !! smallest residual norm seen in this temperature's Anderson history
   !
   CONTAINS
     !
@@ -40,7 +51,7 @@
                               adeltaip, aznormi, aznormip, ashifti, ashiftip, &
                               nkfs, nqfs, nbndfs, ekfs, ef0, agap, nbnd_cl, &
                               adeltai_cl, adeltaip_cl, nkstot_cl, siz_ir, &
-                              siz_ir_cl
+                              siz_ir_cl, wsi
     USE supercond,     ONLY : dos_quasiparticle, gen_freqgrid_iaxis, &
                               eliashberg_grid
     USE ep_constants,  ONLY : kelvin2eV, ci, zero, czero
@@ -316,6 +327,11 @@
             !
           ELSE ! not fbw
             CALL start_clock('eliash_mix')
+            IF (rtsc_opt('RTSC_EPW_ELIASH_MIX')) THEN
+              ! rtsc: one Anderson mixing over all Fermi-surface states (inner products summed
+              ! over pools) instead of an independent Broyden mixing per state
+              IF (.NOT. conv) CALL rtsc_anderson(itemp, iter, lower_bnd, upper_bnd)
+            ELSE
             DO ik = lower_bnd, upper_bnd
               DO ibnd = 1, nbndfs
                 IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
@@ -325,6 +341,7 @@
                 ENDIF
               ENDDO
             ENDDO
+            ENDIF
             ! Make everything 0 except the range of k-points we are working on
             adeltaip(:, :, 1:lower_bnd - 1) = zero
             adeltaip(:, :, lower_bnd + nks:nkfs) = zero
@@ -375,6 +392,13 @@
         ENDIF ! fbw
         !
         IF (conv) THEN
+          ! rtsc: keep this temperature's Delta(iw) for the warm start of the next one
+          IF (rtsc_opt('RTSC_EPW_ELIASH_WARM') .AND. .NOT. fbw) THEN
+            IF (ALLOCATED(rtsc_dprev)) DEALLOCATE(rtsc_dprev, rtsc_wprev)
+            ALLOCATE(rtsc_dprev(nsiw(itemp), nbndfs, nkfs), rtsc_wprev(nsiw(itemp)))
+            rtsc_dprev(:, :, :) = adeltaip(:, :, :)
+            rtsc_wprev(:) = wsi(1:nsiw(itemp))
+          ENDIF
           CALL deallocate_aniso_iaxis(1)
           !
           ! remove memory allocated for deltai, znormi, adeltaip
@@ -416,7 +440,9 @@
           IF (mod(N, 2) /= 0 ) N = N + 1
           IF (N > nsiw(itemp)) N = N - 2
         ENDIF
+        CALL start_clock('pade_cont')
         CALL pade_cont_aniso(itemp, N)
+        CALL stop_clock('pade_cont')
         !
         cname = 'pade'
         CALL eliashberg_write_raxis(itemp, cname)
@@ -1183,6 +1209,21 @@
           ENDIF
         ENDDO ! ibnd
       ENDDO ! ik
+      !
+      ! rtsc: warm start from the previous temperature's converged Delta(k, iw), linearly
+      ! interpolated in w (constant beyond the ends of the previous grid)
+      IF (rtsc_opt('RTSC_EPW_ELIASH_WARM') .AND. ALLOCATED(rtsc_dprev) .AND. .NOT. fbw) THEN
+        DO ik = 1, nkfs
+          DO ibnd = 1, nbndfs
+            IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+              DO iw = 1, nsiw(itemp)
+                adeltaip(iw, ibnd, ik) = rtsc_interp(SIZE(rtsc_wprev), rtsc_wprev, &
+                                                     rtsc_dprev(:, ibnd, ik), wsi(iw))
+              ENDDO
+            ENDIF
+          ENDDO
+        ENDDO
+      ENDIF
       !
       IF (fbw .AND. (gridsamp == 2) .AND. (icoulomb > 0)) THEN
         linsidei = .TRUE.
@@ -4393,7 +4434,14 @@
     USE parallelism,   ONLY : fkbounds
     USE low_lvl,       ONLY : mem_size_eliashberg
     !
+#if defined (__CUDA)
+    USE epw_gpu_eliash, ONLY : ege_pade
+#endif
     IMPLICIT NONE
+    INTEGER :: nst, is
+    !! rtsc: number of this pool's Fermi-surface states, counter
+    COMPLEX(KIND = DP), ALLOCATABLE :: pca(:, :), pcb(:, :), ppa(:, :), ppb(:, :)
+    !! rtsc: Pade coefficients and values of all states (GPU evaluation)
     !
     INTEGER, INTENT(in) :: itemp
     !! Counter on temperature index
@@ -4550,6 +4598,55 @@
       CALL mp_sum(delta,  inter_pool_comm)
       CALL mp_sum(shift,  inter_pool_comm)
       CALL mp_barrier(inter_pool_comm)
+#if defined (__CUDA)
+    ELSEIF (rtsc_eliash_gpu()) THEN
+      ! rtsc: coefficients on the host as above; the nsw evaluations per state on the GPU;
+      ! state sums in the same order
+      nst = 0
+      DO ik = lower_bnd, upper_bnd
+        DO ibnd = 1, nbndfs
+          IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) nst = nst + 1
+        ENDDO
+      ENDDO
+      ALLOCATE(pca(N, MAX(nst, 1)), pcb(N, MAX(nst, 1)), ppa(nsw, MAX(nst, 1)), ppb(nsw, MAX(nst, 1)))
+      DO iw = 1, N
+        z(iw) = ci * wsi(iw)
+      ENDDO
+      is = 0
+      DO ik = lower_bnd, upper_bnd
+        DO ibnd = 1, nbndfs
+          IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+            is = is + 1
+            DO iw = 1, N
+              u(iw) = cone * adeltai(iw, ibnd, ik)
+              v(iw) = cone * aznormi(iw, ibnd, ik)
+            ENDDO
+            CALL pade_coeff(N, z, u, pca(:, is))
+            CALL pade_coeff(N, z, v, pcb(:, is))
+          ENDIF
+        ENDDO
+      ENDDO
+      CALL ege_pade(N, nst, nsw, z, pca, pcb, ws, ppa, ppb)
+      is = 0
+      DO ik = lower_bnd, upper_bnd
+        DO ibnd = 1, nbndfs
+          IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+            is = is + 1
+            weight = 0.5d0 * wkfs(ik) * w0g(ibnd, ik) * inv_dos
+            DO iw = 1, nsw
+              adelta(iw, ibnd, ik) = ppa(iw, is)
+              aznorm(iw, ibnd, ik) = ppb(iw, is)
+              znorm(iw) = znorm(iw) + weight * aznorm(iw, ibnd, ik)
+              delta(iw) = delta(iw) + weight * adelta(iw, ibnd, ik)
+            ENDDO
+          ENDIF
+        ENDDO
+      ENDDO
+      DEALLOCATE(pca, pcb, ppa, ppb)
+      CALL mp_sum(znorm,  inter_pool_comm)
+      CALL mp_sum(delta,  inter_pool_comm)
+      CALL mp_barrier(inter_pool_comm)
+#endif
     ELSE
       DO ik = lower_bnd, upper_bnd
         DO ibnd = 1, nbndfs
@@ -6061,6 +6158,141 @@
     !-----------------------------------------------------------------------
     !
   !-----------------------------------------------------------------------
+    !
+    !-----------------------------------------------------------------------
+    LOGICAL FUNCTION rtsc_opt(name)
+    !-----------------------------------------------------------------------
+    !! rtsc: .TRUE. unless the environment variable name is set to 0 (default on)
+    CHARACTER(LEN = *), INTENT(IN) :: name
+    CHARACTER(LEN = 16) :: v
+    v = ' '
+    CALL GET_ENVIRONMENT_VARIABLE(name, v)
+    rtsc_opt = (TRIM(v) /= '0')
+    END FUNCTION rtsc_opt
+    !
+    !-----------------------------------------------------------------------
+    REAL(KIND = DP) FUNCTION rtsc_interp(n, x, y, x0)
+    !-----------------------------------------------------------------------
+    !! rtsc: linear interpolation of y(x) (x increasing) at x0, constant outside [x(1), x(n)]
+    INTEGER, INTENT(IN) :: n
+    REAL(KIND = DP), INTENT(IN) :: x(n), y(n), x0
+    INTEGER :: i
+    IF (x0 <= x(1)) THEN
+      rtsc_interp = y(1)
+      RETURN
+    ENDIF
+    IF (x0 >= x(n)) THEN
+      rtsc_interp = y(n)
+      RETURN
+    ENDIF
+    DO i = 2, n
+      IF (x(i) >= x0) EXIT
+    ENDDO
+    rtsc_interp = y(i - 1) + (y(i) - y(i - 1)) * (x0 - x(i - 1)) / (x(i) - x(i - 1))
+    END FUNCTION rtsc_interp
+    !
+    !-----------------------------------------------------------------------
+    SUBROUTINE rtsc_anderson(itemp, iter, lower_bnd, upper_bnd)
+    !-----------------------------------------------------------------------
+    !! rtsc: Anderson mixing of the gap over all Fermi-surface states of all pools.
+    !! x = adeltaip (input), g(x) = adeltai (output), f = g - x. With the last m differences
+    !! dX, dF: gamma = argmin |f - dF gamma| (normal equations, inner products summed over
+    !! pools), x_new = x + beta f - (dX + beta dF) gamma. On return adeltaip holds x_new on this
+    !! pool's states (the caller zeroes the other pools' k and sums over pools).
+    USE input,            ONLY : fsthick, broyden_beta, broyden_ndim
+    USE supercond_common, ONLY : nsiw, nbndfs, ekfs, ef0, adeltai, adeltaip
+    USE mp_global,        ONLY : inter_pool_comm
+    USE mp,               ONLY : mp_sum
+    !
+    INTEGER, INTENT(IN) :: itemp, iter, lower_bnd, upper_bnd
+    INTEGER :: ik, ibnd, iw, n, nloc, m, i, j, nh, info
+    INTEGER, ALLOCATABLE :: ipiv(:)
+    REAL(KIND = DP), ALLOCATABLE :: x(:), f(:), gm(:, :), rhs(:)
+    REAL(KIND = DP) :: beta, tr, fn
+    !
+    beta = broyden_beta
+    m = MAX(1, broyden_ndim)
+    nloc = 0
+    DO ik = lower_bnd, upper_bnd
+      DO ibnd = 1, nbndfs
+        IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) nloc = nloc + nsiw(itemp)
+      ENDDO
+    ENDDO
+    ALLOCATE(x(MAX(nloc, 1)), f(MAX(nloc, 1)))
+    n = 0
+    DO ik = lower_bnd, upper_bnd
+      DO ibnd = 1, nbndfs
+        IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+          DO iw = 1, nsiw(itemp)
+            n = n + 1
+            x(n) = adeltaip(iw, ibnd, ik)
+            f(n) = adeltai(iw, ibnd, ik) - x(n)
+          ENDDO
+        ENDIF
+      ENDDO
+    ENDDO
+    fn = DOT_PRODUCT(f(1:nloc), f(1:nloc))
+    CALL mp_sum(fn, inter_pool_comm)
+    fn = SQRT(fn)
+    IF (iter == 1) THEN
+      IF (ALLOCATED(rtsc_adx)) DEALLOCATE(rtsc_adx, rtsc_adf, rtsc_axp, rtsc_afp)
+      ALLOCATE(rtsc_adx(MAX(nloc, 1), m), rtsc_adf(MAX(nloc, 1), m), rtsc_axp(MAX(nloc, 1)), &
+               rtsc_afp(MAX(nloc, 1)))
+      rtsc_adx = 0.d0; rtsc_adf = 0.d0
+      rtsc_anh = 0; rtsc_anpos = 0
+      rtsc_anfmin = fn
+    ELSEIF (fn > 10.d0 * rtsc_anfmin) THEN
+      ! safeguard: the residual grew well above its best value, drop the history
+      rtsc_anh = 0; rtsc_anpos = 0
+      rtsc_anfmin = fn
+    ELSE
+      rtsc_anpos = MOD(rtsc_anpos, m) + 1
+      rtsc_anh = MIN(rtsc_anh + 1, m)
+      rtsc_adx(1:nloc, rtsc_anpos) = x(1:nloc) - rtsc_axp(1:nloc)
+      rtsc_adf(1:nloc, rtsc_anpos) = f(1:nloc) - rtsc_afp(1:nloc)
+      rtsc_anfmin = MIN(rtsc_anfmin, fn)
+    ENDIF
+    rtsc_axp(1:nloc) = x(1:nloc)
+    rtsc_afp(1:nloc) = f(1:nloc)
+    nh = rtsc_anh
+    IF (nh > 0) THEN
+      ALLOCATE(gm(nh, nh), rhs(nh), ipiv(nh))
+      DO i = 1, nh
+        DO j = 1, nh
+          gm(i, j) = DOT_PRODUCT(rtsc_adf(1:nloc, i), rtsc_adf(1:nloc, j))
+        ENDDO
+        rhs(i) = DOT_PRODUCT(rtsc_adf(1:nloc, i), f(1:nloc))
+      ENDDO
+      CALL mp_sum(gm, inter_pool_comm)
+      CALL mp_sum(rhs, inter_pool_comm)
+      tr = 0.d0
+      DO i = 1, nh
+        tr = tr + gm(i, i)
+      ENDDO
+      DO i = 1, nh
+        gm(i, i) = gm(i, i) + 1.d-12 * tr / nh
+      ENDDO
+      CALL DGESV(nh, 1, gm, nh, ipiv, rhs, nh, info)
+      IF (info /= 0) rhs(:) = 0.d0
+      DO i = 1, nh
+        x(1:nloc) = x(1:nloc) - rhs(i) * (rtsc_adx(1:nloc, i) + beta * rtsc_adf(1:nloc, i))
+      ENDDO
+      DEALLOCATE(gm, rhs, ipiv)
+    ENDIF
+    x(1:nloc) = x(1:nloc) + beta * f(1:nloc)
+    n = 0
+    DO ik = lower_bnd, upper_bnd
+      DO ibnd = 1, nbndfs
+        IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+          DO iw = 1, nsiw(itemp)
+            n = n + 1
+            adeltaip(iw, ibnd, ik) = x(n)
+          ENDDO
+        ENDIF
+      ENDDO
+    ENDDO
+    DEALLOCATE(x, f)
+    END SUBROUTINE rtsc_anderson
     !
     !-----------------------------------------------------------------------
     LOGICAL FUNCTION rtsc_eliash_gpu()
