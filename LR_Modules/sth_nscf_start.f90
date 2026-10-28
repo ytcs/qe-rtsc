@@ -86,8 +86,9 @@ CONTAINS
           ENDDO
           DEALLOCATE(w)
           ngw0(i) = igwx
-          ! cartesian (2 pi / alat) -> crystal coordinates of bg
-          xk0(:, i) = MATMUL(TRANSPOSE(at), xk)
+          ! crystal coordinates of the stored k from the reciprocal vectors stored with it
+          ! (whatever their units): xk = sum_j c_j b_j  ->  c = B^-1 xk
+          xk0(:, i) = solve3(b, xk)
         ENDIF
         CLOSE(u)
       ENDDO
@@ -193,6 +194,22 @@ CONTAINS
       lin = 1 + n1 + n2 * dfftp%nr1 + n3 * dfftp%nr1 * dfftp%nr2
     END FUNCTION lin
   END FUNCTION nscf_start_get
+  !
+  FUNCTION solve3(b, x) RESULT(c)
+    REAL(DP), INTENT(IN) :: b(3, 3), x(3)
+    REAL(DP) :: c(3), det, inv(3, 3)
+    inv(1, 1) = b(2, 2) * b(3, 3) - b(2, 3) * b(3, 2)
+    inv(1, 2) = b(1, 3) * b(3, 2) - b(1, 2) * b(3, 3)
+    inv(1, 3) = b(1, 2) * b(2, 3) - b(1, 3) * b(2, 2)
+    inv(2, 1) = b(2, 3) * b(3, 1) - b(2, 1) * b(3, 3)
+    inv(2, 2) = b(1, 1) * b(3, 3) - b(1, 3) * b(3, 1)
+    inv(2, 3) = b(1, 3) * b(2, 1) - b(1, 1) * b(2, 3)
+    inv(3, 1) = b(2, 1) * b(3, 2) - b(2, 2) * b(3, 1)
+    inv(3, 2) = b(1, 2) * b(3, 1) - b(1, 1) * b(3, 2)
+    inv(3, 3) = b(1, 1) * b(2, 2) - b(1, 2) * b(2, 1)
+    det = b(1, 1) * inv(1, 1) + b(1, 2) * inv(2, 1) + b(1, 3) * inv(3, 1)
+    c = MATMUL(inv, x) / det
+  END FUNCTION solve3
   !
   SUBROUTINE mill_of(ig, m)
     USE gvect, ONLY : mill
