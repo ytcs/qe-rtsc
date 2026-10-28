@@ -1314,6 +1314,27 @@ CONTAINS
     ENDDO
   END SUBROUTINE ortho_exact
   !
+  SUBROUTINE ortho_batched()
+    ! orthogonalize as ortho_exact, but with two strided-batched ZGEMMs over k on all slots (FP64).
+    ! Used with sth_mp, where the exact vanilla GEMM shapes no longer matter: 2 launches instead of
+    ! 2 nksq npert (latency-bound on consumer GPUs). Invalid slots and padding rows are zero on input
+    ! and stay zero.
+    INTEGER :: istat
+    istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nbnd, nslot * npert, npwx, &
+            (1.0_dp, 0.0_dp), d_W(1, nkb + 1, 1), npwx, INT(npwx, 8) * nproj, d_d0, npwx, INT(npwx, 8) * nslot * npert, &
+            (0.0_dp, 0.0_dp), d_ps, nbnd, INT(nbnd, 8) * nslot * npert, nksq)
+    CALL chk(istat, 'cublasZgemmStridedBatched (ortho ps)')
+    CALL k_scale_wwg<<<nsl, 32 * ((nbnd + 31) / 32), 0, strm>>>(d_ps, d_wwg, nbnd, nslot, npert, nksq, d_nock)
+    CALL kerr('scale_wwg')
+    CALL k_scale_wg1<<<4096, TPB, 0, strm>>>(d_d0, d_wg1, npwx, nslot, npert, nksq, d_nock, &
+         INT(npwx, 8) * nsl)
+    CALL kerr('scale_wg1')
+    istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, nslot * npert, nbnd, &
+            (1.0_dp, 0.0_dp), d_W(1, nkb + 1, 1), npwx, INT(npwx, 8) * nproj, d_ps, nbnd, INT(nbnd, 8) * nslot * npert, &
+            (-1.0_dp, 0.0_dp), d_d0, npwx, INT(npwx, 8) * nslot * npert, nksq)
+    CALL chk(istat, 'cublasZgemmStridedBatched (ortho back)')
+  END SUBROUTINE ortho_batched
+  !
   SUBROUTINE apply_op(x, y, list, nl)
     ! y = (H_kq - e_n + alpha_pv P_v) x on the nl columns list(1:nl); other slots of y are garbage
     COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
@@ -1748,7 +1769,11 @@ CONTAINS
     ! One ZGEMM pair per (k, pert) with exactly the shapes of orthogonalize.f90 (m = nbnd, n = nocc_k,
     ! k = npwq), so that the right-hand side matches vanilla's rounding as closely as possible: the
     ! screened, projected dvpsi can be a strong cancellation, and its rounding feeds every CG step.
-    CALL ortho_exact()
+    IF (mp_q) THEN
+      CALL ortho_batched()
+    ELSE
+      CALL ortho_exact()
+    ENDIF
     IF (sth_timing) THEN
       CALL tsync(); t1 = wtime(); sth_t_ortho = t1 - t0; t0 = t1
     ENDIF
