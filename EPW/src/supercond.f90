@@ -468,6 +468,9 @@
     REAL(KIND = DP) :: x1, x2, x3
     !! Cartesian coordinates of grid points nkf1, nkf2, nkf3
     REAL(KIND = DP) :: weight, weight2, weight3, weightq
+    REAL(KIND = DP), ALLOCATABLE :: wq2(:, :)
+    !! rtsc: sum over (k, n, m) pairs of weight * g2 for each (mode, q)
+    INTEGER :: lower_q, upper_q
     !! factors in lambda_eph and a2f
     REAL(KIND = DP) :: sigma
     !! smearing in delta function
@@ -524,49 +527,66 @@
     !
     l_sum = zero
     lambda_max(:) = zero
+    !
+    ! rtsc: the phonon Gaussian depends only on (mode, q), so first sum weight * g2 over the
+    ! (k, n, m) pairs into wq2(mode, q), then spread each wq2 over the frequency grid once.
+    ! Vanilla evaluated w0gauss for every pair, mode, frequency and smearing. Same sums,
+    ! different floating-point order.
+    ALLOCATE(wq2(nmodes, SIZE(wf, 2)), STAT = ierr)
+    IF (ierr /= 0) CALL errore('evaluate_a2f_lambda', 'Error allocating wq2', 1)
+    wq2(:, :) = zero
+    DO ik = lower_bnd, upper_bnd
+      DO ibnd = 1, nbndfs
+        IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
+          DO iq = 1, nqfs(ik)
+            ! iq0 - index of q-point on the full q-mesh
+            iq0 = ixqfs(ik, iq)
+            DO jbnd = 1, nbndfs
+              IF (ABS(ekfs(jbnd, ixkqf(ik, iq0)) - ef0) < fsthick) THEN
+                weight = wkfs(ik) * wqf(iq) * w0g(ibnd, ik) * w0g(jbnd, ixkqf(ik, iq0))
+                lambda_eph = 0.d0
+                DO imode = 1, nmodes
+                  IF (wf(imode, iq0) > eps_acoustic) THEN
+                    lambda_eph = lambda_eph + g2(ik, iq, ibnd, jbnd, imode) / wf(imode, iq0)
+                    wq2(imode, iq0) = wq2(imode, iq0) + weight * g2(ik, iq, ibnd, jbnd, imode)
+                  ENDIF ! wf
+                ENDDO ! imode
+                IF (lambda_eph > 0.d0) THEN
+                  l_sum = l_sum + weight * lambda_eph
+                  weight3 = wqf(iq) * w0g(jbnd, ixkqf(ik, iq0))
+                  lambda_k(ik, ibnd) = lambda_k(ik, ibnd) + weight3 * lambda_eph
+                  IF (lambda_eph > lambda_max(my_pool_id + 1)) THEN
+                    lambda_max(my_pool_id + 1) = lambda_eph
+                  ENDIF
+                ENDIF
+              ENDIF ! ekq
+            ENDDO ! jbnd
+          ENDDO ! iq
+        ENDIF ! ekk
+      ENDDO ! ibnd
+    ENDDO ! ik
+    !
+    ! all pools hold the full wq2; each pool spreads its share of the q-points
+    CALL mp_sum(wq2, inter_pool_comm)
+    CALL fkbounds(SIZE(wf, 2), lower_q, upper_q)
     DO ismear = 1, nqsmear
       sigma = degaussq + (ismear - 1) * delta_qsmear
-      DO ik = lower_bnd, upper_bnd
-        DO ibnd = 1, nbndfs
-          IF (ABS(ekfs(ibnd, ik) - ef0) < fsthick) THEN
-            DO iq = 1, nqfs(ik)
-              ! iq0 - index of q-point on the full q-mesh
-              iq0 = ixqfs(ik, iq)
-              DO jbnd = 1, nbndfs
-                IF (ABS(ekfs(jbnd, ixkqf(ik, iq0)) - ef0) < fsthick) THEN
-                  weight = wkfs(ik) * wqf(iq) * w0g(ibnd, ik) * w0g(jbnd, ixkqf(ik, iq0))
-                  lambda_eph = 0.d0
-                  DO imode = 1, nmodes
-                    IF (wf(imode, iq0) > eps_acoustic) THEN
-                      IF (ismear == 1) THEN
-                        lambda_eph = lambda_eph + g2(ik, iq, ibnd, jbnd, imode) / wf(imode, iq0)
-                      ENDIF
-                      weight2 = weight * g2(ik, iq, ibnd, jbnd, imode)
-                      DO iwph = 1, nqstep
-                        weightq  = w0gauss((wsph(iwph) - wf(imode, iq0)) / sigma, 0) / sigma
-                        a2f(iwph, ismear) = a2f(iwph, ismear) + weight2 * weightq
-                        IF (ismear == 1) THEN
-                          a2f_modeproj(imode, iwph) = a2f_modeproj(imode, iwph) + &
-                                       weight2 * weightq
-                        ENDIF
-                      ENDDO ! iwph
-                    ENDIF ! wf
-                  ENDDO ! imode
-                  IF (ismear == 1 .AND. lambda_eph > 0.d0) THEN
-                    l_sum = l_sum + weight * lambda_eph
-                    weight3 = wqf(iq) * w0g(jbnd, ixkqf(ik, iq0))
-                    lambda_k(ik, ibnd) = lambda_k(ik, ibnd) + weight3 * lambda_eph
-                    IF (lambda_eph > lambda_max(my_pool_id + 1)) THEN
-                      lambda_max(my_pool_id + 1) = lambda_eph
-                    ENDIF
-                  ENDIF
-                ENDIF ! ekq
-              ENDDO ! jbnd
-            ENDDO ! iq
-          ENDIF ! ekk
-        ENDDO ! ibnd
-      ENDDO ! ik
+      DO iq0 = lower_q, upper_q
+        DO imode = 1, nmodes
+          IF (wf(imode, iq0) > eps_acoustic .AND. wq2(imode, iq0) /= zero) THEN
+            weight2 = wq2(imode, iq0)
+            DO iwph = 1, nqstep
+              weightq  = w0gauss((wsph(iwph) - wf(imode, iq0)) / sigma, 0) / sigma
+              a2f(iwph, ismear) = a2f(iwph, ismear) + weight2 * weightq
+              IF (ismear == 1) THEN
+                a2f_modeproj(imode, iwph) = a2f_modeproj(imode, iwph) + weight2 * weightq
+              ENDIF
+            ENDDO ! iwph
+          ENDIF
+        ENDDO ! imode
+      ENDDO ! iq0
     ENDDO ! ismear
+    DEALLOCATE(wq2)
     !
     a2f(:, :) = 0.5d0 * a2f(:, :) / dosef
     a2f_modeproj(:, :) = 0.5d0 * a2f_modeproj(:, :) / dosef
