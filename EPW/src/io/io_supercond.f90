@@ -2472,6 +2472,16 @@
       ikk = 2 * ik - 1
       ikq = ikk + 1
       !
+      ! rtsc: only pairs with k and k+q in the Fermi shell are written; skip the degeneracy
+      ! averaging (all nkf k, every q) for the others. Same output.
+      IF (ixkf(lower_bnd + ik - 1) <= 0) CYCLE
+      CALL kpmq_map(xkfs(:, ixkf(lower_bnd + ik - 1)), xq, +1, nkq)
+      IF (mp_mesh_k) THEN
+        IF (ixkf(bztoibz(nkq)) <= 0) CYCLE
+      ELSE
+        IF (ixkf(nkq) <= 0) CYCLE
+      ENDIF
+      !
       ! Average the el-ph matrix elements on degenerate bands and phonon modes.
       ! HP: Adapted from: io_transport.f90
       !
