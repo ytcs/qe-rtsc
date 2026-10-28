@@ -719,6 +719,8 @@
     USE wannier2bloch, ONLY : dynwan2bloch, dynifc2blochf
     !
     IMPLICIT NONE
+    INTEGER :: rtsc_i1, rtsc_i2
+    !! rtsc: frequency-bin window of one Gaussian
     !
     INTEGER, INTENT(in) :: nrr_q
     !! number of WS points
@@ -819,7 +821,11 @@
         DO iq = 1, nqtotf
           DO imode = 1, nmodes
             IF (wf(imode, iq) > eps_acoustic) THEN
-              DO iwph = 1, nqstep
+              ! rtsc: only the bins with |ww - wf| / sigma <= sqrt(200) + 1 bin; beyond, w0gauss
+              ! is the clipped exp(-200) ~ 1e-87, below the resolution of any bin with weight
+              rtsc_i1 = MAX(1, FLOOR((wf(imode, iq) - 14.2d0 * sigma) / dw) - 1)
+              rtsc_i2 = MIN(nqstep, CEILING((wf(imode, iq) + 14.2d0 * sigma) / dw) + 1)
+              DO iwph = rtsc_i1, rtsc_i2
                 weightq  = w0gauss((ww(iwph) - wf(imode, iq)) / sigma, 0) / sigma
                 phdos(iwph, ismear) = phdos(iwph, ismear) + wqf(iq) * weightq
                 IF (ismear == 1) &
@@ -2239,7 +2245,7 @@
     !-----------------------------------------------------------------------
     !
     !-----------------------------------------------------------------------
-    SUBROUTINE write_ephmat(iqq, iq, lrepmatw2_restart, first_cycle)
+    SUBROUTINE write_ephmat(iqq, iq, lrepmatw2_restart, first_cycle, g2pre)
     !-----------------------------------------------------------------------
     !!
     !!  This routine writes the elph matrix elements in a format required
@@ -2273,6 +2279,13 @@
     !
     IMPLICIT NONE
     !
+    LOGICAL, SAVE :: rtsc_dosef_done = .FALSE.
+    !! rtsc: dosef already computed (it does not depend on q)
+    REAL(KIND = DP), SAVE :: rtsc_dosef
+    !! rtsc: cached dosef
+    LOGICAL :: rtsc_sync
+    !! rtsc: flush the ephmat file and write restart.fmt at this q
+    !
     INTEGER, INTENT(in) :: iqq
     !! Q-point index from selecq.fmt window
     INTEGER, INTENT(in) :: iq
@@ -2280,6 +2293,9 @@
     INTEGER, INTENT(inout) :: lrepmatw2_restart(npool)
     !! Current position inside the file during writing
     LOGICAL, INTENT(in) :: first_cycle
+    REAL(KIND = DP), INTENT(in), OPTIONAL :: g2pre(:)
+    !! rtsc: this q's g^2 list in the order of the loop below, computed on the GPU
+    !! (epw_gpu_fine); when present the loop is skipped
     !! Check wheter this is the first cycle after a restart.
     !
     ! Local variables
@@ -2366,9 +2382,20 @@
       ! in ephwann_shuffle
     ENDIF
     !
-    dosef = dos_ef(ngaussw, degaussw, ef0, etf, wkf, nkqf, nbndsub)
-    ! N(Ef) in the equation for lambda is the DOS per spin
-    dosef = dosef / two
+    ! rtsc: dos_ef sums wkf * w0gauss over the k points only (wkf(k+q) = 0), so it does not
+    ! depend on q; vanilla recomputed it, with an inter-pool mp_sum, for every q
+    IF (.NOT. rtsc_dosef_done) THEN
+      dosef = dos_ef(ngaussw, degaussw, ef0, etf, wkf, nkqf, nbndsub)
+      ! N(Ef) in the equation for lambda is the DOS per spin
+      dosef = dosef / two
+      rtsc_dosef = dosef
+      rtsc_dosef_done = .TRUE.
+    ELSE
+      dosef = rtsc_dosef
+    ENDIF
+    ! rtsc: flush the ephmat file and write restart.fmt every 64 q and at the last q
+    ! (vanilla: every q)
+    rtsc_sync = (MOD(iqq, 64) == 0) .OR. (iqq == totq)
     !
     ! find the bounds of k-dependent arrays in the parallel case
     nkftot = nktotf
@@ -2445,6 +2472,10 @@
     IF (iqq == 1) WRITE(iufileph) my_pool_id + 1, fermicount
     !
     xq(:) = xqf(:, iq)
+    IF (PRESENT(g2pre)) THEN
+      ind(my_pool_id + 1) = SIZE(g2pre)
+      GOTO 100
+    ENDIF
     !
     ! nkf - nr of k-points in the pool (fine mesh)
     ! for mp_mesh_k = true nkf is nr of irreducible k-points in the pool
@@ -2453,6 +2484,16 @@
       !
       ikk = 2 * ik - 1
       ikq = ikk + 1
+      !
+      ! rtsc: only pairs with k and k+q in the Fermi shell are written; skip the degeneracy
+      ! averaging (all nkf k, every q) for the others. Same output.
+      IF (ixkf(lower_bnd + ik - 1) <= 0) CYCLE
+      CALL kpmq_map(xkfs(:, ixkf(lower_bnd + ik - 1)), xq, +1, nkq)
+      IF (mp_mesh_k) THEN
+        IF (ixkf(bztoibz(nkq)) <= 0) CYCLE
+      ELSE
+        IF (ixkf(nkq) <= 0) CYCLE
+      ENDIF
       !
       ! Average the el-ph matrix elements on degenerate bands and phonon modes.
       ! HP: Adapted from: io_transport.f90
@@ -2555,26 +2596,33 @@
       !
     ENDDO ! ik's
     !
+100 CONTINUE
     lrepmatw2_merge = lrepmatw2_merge + ind(my_pool_id + 1)
     !
     ! Save to file restart information in formatted way for possible restart
-    lrepmatw2_restart(:) = 0
-    lrepmatw2_restart(my_pool_id + 1) = lrepmatw2_merge
-    CALL mp_sum(lrepmatw2_restart, inter_pool_comm)
-    CALL mp_barrier(inter_pool_comm)
+    ! rtsc: only needed when restart.fmt is written (rtsc_sync, same q on every pool); vanilla
+    ! did this inter-pool mp_sum + barrier for every q
+    IF (rtsc_sync) THEN
+      lrepmatw2_restart(:) = 0
+      lrepmatw2_restart(my_pool_id + 1) = lrepmatw2_merge
+      CALL mp_sum(lrepmatw2_restart, inter_pool_comm)
+      CALL mp_barrier(inter_pool_comm)
+    ENDIF
     !
     IF (ind(my_pool_id + 1) > 0) THEN
       !WRITE(*, *) my_pool_id + 1, ind(my_pool_id + 1), lrepmatw2_merge
-      DO ifil = 1, ind(my_pool_id + 1)
-        !WRITE(iufileph, '(ES20.10)') tmp_g2(ifil)
-        WRITE(iufileph) tmp_g2(ifil)
-      ENDDO
+      ! rtsc: one WRITE for the whole q (stream access: same bytes as one WRITE per element)
+      IF (PRESENT(g2pre)) THEN
+        WRITE(iufileph) g2pre(1:ind(my_pool_id + 1))
+      ELSE
+        WRITE(iufileph) tmp_g2(1:ind(my_pool_id + 1))
+      ENDIF
       !
-      FLUSH(iufileph)
+      IF (rtsc_sync) FLUSH(iufileph)
       !
     ENDIF
     !
-    IF (my_pool_id == 0) THEN
+    IF (my_pool_id == 0 .AND. rtsc_sync) THEN
       dummy = 0
       ! format is compatible with IBTE
       OPEN(UNIT = iunrestart, FILE = 'restart.fmt')

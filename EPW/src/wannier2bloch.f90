@@ -3190,6 +3190,68 @@
     !---------------------------------------------------------------------------
     !
     !---------------------------------------------------------------------------
+    SUBROUTINE rtsc_ephwan2blochp_batch(nmodes, nqb, xxqb, irvec_g, nrr_g, epmatfb, nbnd, nrr_k)
+    !---------------------------------------------------------------------------
+    !! rtsc: ephwan2blochp (etf_mem = 0) for nqb q-points at once. One ZGEMM on the pool's
+    !! device-resident epmatwp slice (N = nqb instead of N = 1) and one inter-pool mp_sum of
+    !! the whole batch instead of nmodes reductions per q. Same sums as ephwan2blochp.
+    !! epmatfb(:, j) is epmatf (nbnd, nbnd, nrr_k, nmodes) for q-point xxqb(:, j) (crystal).
+    !---------------------------------------------------------------------------
+    USE kinds,            ONLY : DP
+    USE global_var,       ONLY : epmatwp, irg_start, irg_stop, nirg_loc
+    USE ep_constants,     ONLY : twopi, ci, czero, cone
+    USE mp,               ONLY : mp_sum
+    USE mp_pools,         ONLY : inter_pool_comm
+#if defined(__CUDA)
+    USE cublas
+#endif
+    !
+    IMPLICIT NONE
+    !
+    INTEGER, INTENT(in) :: nmodes, nqb, nrr_g, nbnd, nrr_k
+    INTEGER, INTENT(in) :: irvec_g(3, nrr_g)
+    REAL(KIND = DP), INTENT(in) :: xxqb(3, nqb)
+    COMPLEX(KIND = DP), INTENT(out) :: epmatfb(nbnd * nbnd * nrr_k * nmodes * nqb)
+    !
+    INTEGER :: ir, j, ierr
+    INTEGER(8) :: m
+    REAL(KIND = DP) :: rdotk
+    COMPLEX(KIND = DP), ALLOCATABLE :: cfacb(:, :)
+    !
+    CALL start_clock('ephW2Bp')
+    m = INT(nbnd, 8) * nbnd * nrr_k * nmodes
+    ALLOCATE(cfacb(MAX(nirg_loc, 1), nqb), STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_ephwan2blochp_batch', 'Error allocating cfacb', 1)
+    cfacb(:, :) = czero
+    DO j = 1, nqb
+      DO ir = irg_start, irg_stop
+        rdotk = twopi * DOT_PRODUCT(xxqb(:, j), DBLE(irvec_g(:, ir)))
+        cfacb(ir - irg_start + 1, j) = EXP(ci * rdotk)
+      ENDDO
+    ENDDO
+    epmatfb(:) = czero
+    IF (nirg_loc > 0) THEN
+#if defined(__CUDA)
+      !$acc data copyin(cfacb) copyout(epmatfb)
+      !$acc host_data use_device(epmatwp, cfacb, epmatfb)
+      CALL CUBLASZGEMM('n', 'n', INT(m), nqb, nirg_loc, cone, epmatwp, INT(m), &
+                       cfacb, MAX(nirg_loc, 1), czero, epmatfb, INT(m))
+      !$acc end host_data
+      !$acc end data
+#else
+      CALL ZGEMM('n', 'n', INT(m), nqb, nirg_loc, cone, epmatwp, INT(m), &
+                 cfacb, MAX(nirg_loc, 1), czero, epmatfb, INT(m))
+#endif
+    ENDIF
+    CALL mp_sum(epmatfb, inter_pool_comm)
+    DEALLOCATE(cfacb)
+    CALL stop_clock('ephW2Bp')
+    !
+    !---------------------------------------------------------------------------
+    END SUBROUTINE rtsc_ephwan2blochp_batch
+    !---------------------------------------------------------------------------
+    !
+    !---------------------------------------------------------------------------
     SUBROUTINE ephwan2blochp_dist(nmodes, xxq, irvec_g, nrr_g, epmatf, nbnd, nrr_k)
     !---------------------------------------------------------------------------
     !!

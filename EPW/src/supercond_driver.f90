@@ -52,17 +52,31 @@
           WRITE(stdout, '(5x, "Solve isotropic Eliashberg equations")')
         ENDIF
         WRITE(stdout, '(5x, a/)') REPEAT('=', 67)
+        CALL start_clock('el_init')
         CALL eliashberg_init()
+        CALL stop_clock('el_init')
         IF (fila2f == ' ') THEN
+          CALL start_clock('el_readfreq')
           CALL read_frequencies()
+          CALL stop_clock('el_readfreq')
+          CALL start_clock('el_readeig')
           CALL read_eigenvalues()
+          CALL stop_clock('el_readeig')
+          CALL start_clock('el_readkq')
           CALL read_kqmap()
+          CALL stop_clock('el_readkq')
+          CALL start_clock('el_readeph')
           CALL read_ephmat()
+          CALL stop_clock('el_readeph')
+          CALL start_clock('el_finda2f')
           CALL find_a2f()
+          CALL stop_clock('el_finda2f')
           CALL deallocate_eliashberg_elphon()
         ENDIF
         !
+        CALL start_clock('el_reada2f')
         CALL read_a2f()
+        CALL stop_clock('el_reada2f')
         CALL estimate_tc_gap()
         IF (gap_edge > 0.d0) THEN
           gap0 = gap_edge
@@ -78,8 +92,12 @@
           WRITE(stdout, '(5x, "Solve adiabatic FSR isotropic Eliashberg equations (image para)")')
         ENDIF
         WRITE(stdout, '(5x, a/)') REPEAT('=', 67)
+        CALL start_clock('el_init')
         CALL eliashberg_init()
+        CALL stop_clock('el_init')
+        CALL start_clock('el_reada2f')
         CALL read_a2f()
+        CALL stop_clock('el_reada2f')
         CALL estimate_tc_gap()
         IF (gap_edge > 0.d0) THEN
           gap0 = gap_edge
@@ -99,36 +117,66 @@
         WRITE(stdout, '(5x, "Solve anisotropic Eliashberg equations")')
       ENDIF
       WRITE(stdout, '(5x, a/)') REPEAT('=', 67)
+      CALL start_clock('el_init')
       CALL eliashberg_init()
+      CALL stop_clock('el_init')
+      CALL start_clock('el_readfreq')
       CALL read_frequencies()
+      CALL stop_clock('el_readfreq')
+      CALL start_clock('el_readeig')
       CALL read_eigenvalues()
+      CALL stop_clock('el_readeig')
+      CALL start_clock('el_readkq')
       CALL read_kqmap()
+      CALL stop_clock('el_readkq')
+      CALL start_clock('el_readeph')
       CALL read_ephmat()
+      CALL stop_clock('el_readeph')
       IF (icoulomb > 0) THEN
         CALL read_eigen_cl()
         CALL find_indices_ik_cl()
         CALL find_nbnd_offset()
       ENDIF
+      CALL start_clock('el_finda2f')
       CALL find_a2f()
+      CALL stop_clock('el_finda2f')
+      CALL start_clock('el_reada2f')
       CALL read_a2f()
+      CALL stop_clock('el_reada2f')
       CALL estimate_tc_gap()
       IF (gap_edge > 0.d0) THEN
         gap0 = gap_edge
       ENDIF
+      CALL start_clock('el_aniso')
       CALL eliashberg_aniso_iaxis()
+      CALL stop_clock('el_aniso')
     ENDIF
     !
     IF (.NOT. liso .AND. .NOT. laniso) THEN
       WRITE(stdout, '(/5x, a)') REPEAT('=', 67)
       WRITE(stdout, '(5x, "Calculate Eliashberg spectral function")')
       WRITE(stdout, '(5x, a/)') REPEAT('=', 67)
+      CALL start_clock('el_init')
       CALL eliashberg_init()
+      CALL stop_clock('el_init')
+      CALL start_clock('el_readfreq')
       CALL read_frequencies()
+      CALL stop_clock('el_readfreq')
+      CALL start_clock('el_readeig')
       CALL read_eigenvalues()
+      CALL stop_clock('el_readeig')
+      CALL start_clock('el_readkq')
       CALL read_kqmap()
+      CALL stop_clock('el_readkq')
+      CALL start_clock('el_readeph')
       CALL read_ephmat()
+      CALL stop_clock('el_readeph')
+      CALL start_clock('el_finda2f')
       CALL find_a2f()
+      CALL stop_clock('el_finda2f')
+      CALL start_clock('el_reada2f')
       CALL read_a2f()
+      CALL stop_clock('el_reada2f')
       CALL estimate_tc_gap()
       CALL deallocate_eliashberg_elphon()
     ENDIF

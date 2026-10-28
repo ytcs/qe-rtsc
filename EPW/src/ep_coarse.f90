@@ -169,9 +169,28 @@
     DEALLOCATE(dvscfin, STAT = ierr)
     IF (ierr /= 0) CALL errore('dvscf_read', 'Error deallocating dvscfin', 1)
     !
+    CALL stop_clock('dvscf_read')  ! rtsc: was never stopped
+    !
     !-----------------------------------------------------------------------
     END SUBROUTINE dvscf_read
     !-----------------------------------------------------------------------
+    LOGICAL FUNCTION ep_coarse_gpu_ok()
+    !-----------------------------------------------------------------------
+    !! rtsc: .TRUE. when the GPU path of ep_coarse_compute applies: CUDA build, norm-conserving,
+    !! collinear, no spin polarisation, no DFT+U, and RTSC_EPW_COARSE is not '0'.
+    USE uspp,             ONLY : okvan
+    USE noncollin_module, ONLY : noncolin, npol
+    USE ldaU,             ONLY : lda_plus_u
+    USE input,            ONLY : lsda
+    CHARACTER(LEN = 16) :: envval
+    ep_coarse_gpu_ok = .FALSE.
+#if defined (__CUDA)
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_COARSE', envval)
+    ep_coarse_gpu_ok = (TRIM(envval) /= '0') .AND. (.NOT. okvan) .AND. (.NOT. noncolin) .AND. &
+                       (.NOT. lda_plus_u) .AND. (TRIM(lsda) == 'none') .AND. (npol == 1)
+#endif
+    END FUNCTION ep_coarse_gpu_ok
+    !
     !---------------------------------------------------------------------
     SUBROUTINE ep_coarse_compute(irr, npe, imode0, dvscfins, gmapsym, eigv, &
                                  isym, xq0, nqc, el_ph_mat, epmatq, timerev)
@@ -275,6 +294,13 @@
 #if defined (__ONEMKL)
     USE epw_onemkl
 #endif
+#if defined (__CUDA)
+    USE epw_gpu_coarse,   ONLY : egc_init, egc_set_v, egc_local
+#endif
+    USE ions_base,        ONLY : ityp, ntyp => nsp
+    USE uspp_param,       ONLY : nh, nhm
+    USE uspp,             ONLY : nkb
+    USE input,            ONLY : et_loc
     !
     IMPLICIT NONE
     !
@@ -379,6 +405,13 @@
     !! projector for S*atomic wavefunctions at k-point
     COMPLEX(KIND = DP), ALLOCATABLE :: swfcatomkpq_(:, :)
     !! projector for S*atomic wavefunctions at k+q-point
+    ! rtsc: GPU path (local part by Parseval on the GPU, nonlocal part by projections)
+    LOGICAL :: use_gpu
+    INTEGER :: nt, na, mu, ih, jh, ikb, jkb, ijkb0
+    INTEGER, ALLOCATABLE :: indk(:), indq(:)
+    REAL(KIND = DP) :: xq_bak(3)
+    REAL(KIND = DP), ALLOCATABLE :: deff(:, :, :)
+    COMPLEX(KIND = DP), ALLOCATABLE :: vtot(:, :), becq(:, :, :), auxv(:, :), ps1(:, :), ps2(:, :, :)
     !
     ALLOCATE(elphmat(nbndep, nbndep, npe), STAT = ierr)
     IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error allocating elphmat', 1)
@@ -444,6 +477,34 @@
       swfcatomkpq_(:, :) = czero
     ENDIF
     !
+    ! rtsc: decide on the GPU path (NC, collinear, no spin, no DFT+U); RTSC_EPW_COARSE=0 disables it
+    use_gpu = .FALSE.
+#if defined (__CUDA)
+    use_gpu = ep_coarse_gpu_ok()
+    IF (use_gpu) THEN
+      ! total local perturbing potential per perturbation: dvscf + dV_loc^bare (k-independent)
+      ALLOCATE(vtot(dffts%nnr, npe), deff(nhm, nhm, nat), becq(nkb, nbndep, 0:3), auxv(npwx, nkb), &
+               ps1(nkb, nbndep), ps2(nkb, nbndep, 3), indk(npwx), indq(npwx), STAT = ierr)
+      IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error allocating GPU-path arrays', 1)
+      xq_bak = xq
+      xq = xq0
+      DO ipert = 1, npe
+        mode = imode0 + ipert
+        IF (timerev) THEN
+          CALL compute_dvloc(CONJG(u(:, mode)), .FALSE., vtot(:, ipert))
+          vtot(:, ipert) = vtot(:, ipert) + CONJG(dvscfins(:, 1, ipert))
+        ELSE
+          CALL compute_dvloc(u(:, mode), .FALSE., vtot(:, ipert))
+          vtot(:, ipert) = vtot(:, ipert) + dvscfins(:, 1, ipert)
+        ENDIF
+      ENDDO
+      xq = xq_bak
+      CALL egc_init(dffts%nr1, dffts%nr2, dffts%nr3, dffts%nr1x, dffts%nr2x, dffts%nr3x, &
+                    dffts%nnr, nbndep, 3 * nat, npwx)
+      CALL egc_set_v(npe, vtot)
+    ENDIF
+#endif
+    !
     DO ik = 1, nk_loc
       !
       etq(:, :) = zero
@@ -469,6 +530,7 @@
       !
       ipooltmp = ipool
       !
+      CALL start_clock('ep_wfcread')
       CALL readwfc(ipooltmp, nkq, evc)
       !
       !
@@ -483,6 +545,8 @@
       ! in parallel ipooltmp is for k and ipool is for k+q
       !
       CALL readwfc(ipool, nkq, evq)
+      CALL stop_clock('ep_wfcread')
+      CALL start_clock('ep_prolog')
       !
       ! --------------------------------------------------
       !  Calculate SO(3) in cartesian from s_axis_to_cart
@@ -652,6 +716,12 @@
       !   Calculation of the matrix element
       ! --------------------------------------------------
       !
+      CALL stop_clock('ep_prolog')
+      IF (use_gpu) THEN
+        CALL start_clock('ep_gpu_k')
+        CALL ep_gpu_k()
+        CALL stop_clock('ep_gpu_k')
+      ELSE
       DO ipert = 1, npe
         !
         !  recalculate dvbare_q*psi_k
@@ -704,6 +774,7 @@
 #endif
         !
       ENDDO
+      ENDIF ! use_gpu
       !
       CALL mp_sum(elphmat, intra_pool_comm)
       !
@@ -795,6 +866,7 @@
       ENDIF
     ENDIF
     !
+    IF (use_gpu) DEALLOCATE(vtot, deff, becq, auxv, ps1, ps2, indk, indq)
     DEALLOCATE(elphmat, STAT = ierr)
     IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error deallocating elphmat', 1)
     DEALLOCATE(aux1, STAT = ierr)
@@ -823,6 +895,86 @@
       DEALLOCATE(dnsscf, STAT = ierr)
       IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error deallocating dnsscf', 1)
     ENDIF
+    !
+    CONTAINS
+      !
+      SUBROUTINE ep_gpu_k()
+      !! rtsc: elphmat(:, :, 1:npe) for the current k, all perturbations of this irrep at once.
+      !! Local part: (1/N) sum_r conj(psi_k+q(r)) V(r) psi_k(r) on the GPU (Parseval form of
+      !! dvqpsi_us3 + ZGEMM). Nonlocal part: vanilla dvqpsi_us_only3 builds
+      !! dvpsi_nl = vkb ps1 + sum_a [(k+q+G)_a vkb] ps2_a; projecting on aux4 gives
+      !! becq0^H ps1 + sum_a becq_a^H ps2_a with becq computed once per k (NC, no US terms).
+      INTEGER :: ipol_, ib
+#if defined (__CUDA)
+      DO ig = 1, npw
+        indk(ig) = dffts%nl(igk(ig))
+      ENDDO
+      DO ig = 1, npwq
+        indq(ig) = dffts%nl(igkq(ig))
+      ENDDO
+      CALL egc_local(npw, indk, aux5, npwq, indq, aux4, elphmat)
+#endif
+      IF (nkb == 0) RETURN
+      ! projections of psi_k+q on vkb(k+q) and on (k+q+G)_a vkb(k+q)
+      CALL ZGEMM('C', 'N', nkb, nbndep, npwq, cone, vkb, npwx, aux4, npwx, czero, becq(1, 1, 0), nkb)
+      DO ipol_ = 1, 3
+        DO ikb = 1, nkb
+          DO ig = 1, npwq
+            auxv(ig, ikb) = vkb(ig, ikb) * (xkqtmp(ipol_) + g(ipol_, igkq(ig)))
+          ENDDO
+        ENDDO
+        CALL ZGEMM('C', 'N', nkb, nbndep, npwq, cone, auxv, npwx, aux4, npwx, czero, &
+                   becq(1, 1, ipol_), nkb)
+      ENDDO
+      ! NC (no okvan): deff = deeq does not depend on the band energy, so compute it once per k
+      CALL compute_deff(deff, et_loc(ibndkept(1), ik))
+      DO ipert = 1, npe
+        mode = imode0 + ipert
+        ps1(:, :) = czero
+        ps2(:, :, :) = czero
+        DO ib = 1, nbndep
+          ijkb0 = 0
+          DO nt = 1, ntyp
+            DO na = 1, nat
+              IF (ityp(na) == nt) THEN
+                mu = 3 * (na - 1)
+                DO ih = 1, nh(nt)
+                  ikb = ijkb0 + ih
+                  DO jh = 1, nh(nt)
+                    jkb = ijkb0 + jh
+                    DO ipol_ = 1, 3
+                      IF (ABS(uu(mu + 1)) + ABS(uu(mu + 2)) + ABS(uu(mu + 3)) > 1.0d-12) THEN
+                        ps1(ikb, ib) = ps1(ikb, ib) + deff(ih, jh, na) * &
+                                       alphap(ipol_, ik)%k(jkb, ib) * uu(mu + ipol_)
+                        ps2(ikb, ib, ipol_) = ps2(ikb, ib, ipol_) + deff(ih, jh, na) * &
+                                       becp1(ik)%k(jkb, ib) * (0.d0, -1.d0) * uu(mu + ipol_) * tpiba
+                      ENDIF
+                    ENDDO
+                  ENDDO
+                ENDDO
+                ijkb0 = ijkb0 + nh(nt)
+              ENDIF
+            ENDDO
+          ENDDO
+        ENDDO
+        CALL ZGEMM('C', 'N', nbndep, nbndep, nkb, cone, becq(1, 1, 0), nkb, ps1, nkb, cone, &
+                   elphmat(1, 1, ipert), nbndep)
+        DO ipol_ = 1, 3
+          CALL ZGEMM('C', 'N', nbndep, nbndep, nkb, cone, becq(1, 1, ipol_), nkb, ps2(1, 1, ipol_), nkb, &
+                     cone, elphmat(1, 1, ipert), nbndep)
+        ENDDO
+      ENDDO
+      END SUBROUTINE ep_gpu_k
+      !
+      COMPLEX(KIND = DP) FUNCTION uu(i)
+      !! displacement pattern of the current mode, conjugated under time reversal (as vanilla)
+      INTEGER, INTENT(IN) :: i
+      IF (timerev) THEN
+        uu = CONJG(u(i, mode))
+      ELSE
+        uu = u(i, mode)
+      ENDIF
+      END FUNCTION uu
     !
     !------------------------------------------------------------
     END SUBROUTINE ep_coarse_compute
