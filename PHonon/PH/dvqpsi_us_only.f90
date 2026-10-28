@@ -360,4 +360,93 @@ SUBROUTINE dvqpsi_us_only (ik, uact, becp1, alphap)
 
    call stop_clock ('dvqpsi_us_on')
    RETURN
-END SUBROUTINE dvqpsi_us_only
+END SUBROUTINE dvqpsi_us_only!
+!----------------------------------------------------------------------
+SUBROUTINE dvqpsi_us_only_acc (ik, uact, becp1, alphap)
+  !----------------------------------------------------------------------
+  !! rtsc: dvqpsi_us_only for norm-conserving, collinear pseudopotentials (no okvan, no noncolin),
+  !! called by dvqpsi_us while dvpsi is present on the device. ps1 and ps2 are formed on the host
+  !! exactly as in dvqpsi_us_only; the two plane-wave updates
+  !!   dvpsi += vkb ps1   and   dvpsi += sum_ipol [ (k+q+G)_ipol vkb ] ps2(:,:,ipol)
+  !! are cuBLAS ZGEMMs instead of the host ZGEMM and the per-(ipol, beta, band) axpy loop.
+  !! Rows ikb of ps2(:,:,ipol) that vanilla skips (all |ps2| <= eps) are set to zero.
+  !
+  USE kinds,      ONLY : DP
+  USE cell_base,  ONLY : tpiba
+  USE gvect,      ONLY : g
+  USE klist,      ONLY : xk, ngk, igk_k
+  USE ions_base,  ONLY : nat, ityp
+  USE wvfct,      ONLY : nbnd, npwx, et
+  USE uspp,       ONLY : nkb, vkb, ofsbeta
+  USE uspp_param, ONLY : nh, nhm
+  USE qpoint,     ONLY : nksq, ikks, ikqs
+  USE becmod,     ONLY : bec_type
+  USE eqv,        ONLY : dvpsi
+  !
+  IMPLICIT NONE
+  !
+  INTEGER :: ik
+  COMPLEX(DP) :: uact(3*nat)
+  TYPE(bec_type) :: becp1(nksq), alphap(3,nksq)
+  !
+  REAL(DP), PARAMETER :: eps = 1.d-12
+  COMPLEX(DP), ALLOCATABLE :: ps1(:,:), ps2(:,:,:), auxv(:,:)
+  REAL(DP), ALLOCATABLE :: deff(:,:,:)
+  INTEGER :: ikk, ikq, npwq, ibnd, na, nt, mu, ih, jh, ikb, jkb, ipol, ig
+  REAL(DP) :: xkq
+  !
+  IF (nkb <= 0) RETURN
+  CALL start_clock ('dvqpsi_us_on')
+  ikk = ikks(ik)
+  ikq = ikqs(ik)
+  npwq = ngk(ikq)
+  ALLOCATE (ps1(nkb, nbnd), ps2(nkb, nbnd, 3), deff(nhm, nhm, nat))
+  ps1(:,:) = (0.d0, 0.d0)
+  ps2(:,:,:) = (0.d0, 0.d0)
+  DO ibnd = 1, nbnd
+     CALL compute_deff(deff, et(ibnd,ikk))
+     DO na = 1, nat
+        nt = ityp(na)
+        mu = 3 * (na - 1)
+        IF (ABS(uact(mu+1)) + ABS(uact(mu+2)) + ABS(uact(mu+3)) > eps) THEN
+           DO ih = 1, nh(nt)
+              ikb = ofsbeta(na) + ih
+              DO jh = 1, nh(nt)
+                 jkb = ofsbeta(na) + jh
+                 DO ipol = 1, 3
+                    ps1(ikb,ibnd) = ps1(ikb,ibnd) + deff(ih,jh,na) * alphap(ipol,ik)%k(jkb,ibnd) * uact(mu+ipol)
+                    ps2(ikb,ibnd,ipol) = ps2(ikb,ibnd,ipol) + deff(ih,jh,na) * becp1(ik)%k(jkb,ibnd) * &
+                                         (0.0_DP,-1.0_DP) * uact(mu+ipol) * tpiba
+                 ENDDO
+              ENDDO
+           ENDDO
+        ENDIF
+     ENDDO
+  ENDDO
+  DO ipol = 1, 3
+     DO ikb = 1, nkb
+        IF (.NOT. ANY(ABS(ps2(ikb,1:nbnd,ipol)) > eps)) ps2(ikb,1:nbnd,ipol) = (0.d0, 0.d0)
+     ENDDO
+  ENDDO
+  !
+  ALLOCATE (auxv(npwx, nkb))
+  !$acc data copyin(ps1, ps2) create(auxv) present(dvpsi, vkb, igk_k, g)
+  !$acc host_data use_device(vkb, ps1, dvpsi)
+  CALL MYZGEMM('N', 'N', npwq, nbnd, nkb, (1.d0,0.d0), vkb, npwx, ps1, nkb, (1.d0,0.d0), dvpsi, npwx)
+  !$acc end host_data
+  DO ipol = 1, 3
+     xkq = xk(ipol, ikq)
+     !$acc parallel loop collapse(2)
+     DO ikb = 1, nkb
+        DO ig = 1, npwq
+           auxv(ig, ikb) = vkb(ig, ikb) * (xkq + g(ipol, igk_k(ig, ikq)))
+        ENDDO
+     ENDDO
+     !$acc host_data use_device(auxv, ps2, dvpsi)
+     CALL MYZGEMM('N', 'N', npwq, nbnd, nkb, (1.d0,0.d0), auxv, npwx, ps2(1,1,ipol), nkb, (1.d0,0.d0), dvpsi, npwx)
+     !$acc end host_data
+  ENDDO
+  !$acc end data
+  DEALLOCATE (ps1, ps2, deff, auxv)
+  CALL stop_clock ('dvqpsi_us_on')
+END SUBROUTINE dvqpsi_us_only_acc

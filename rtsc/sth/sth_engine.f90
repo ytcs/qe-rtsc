@@ -40,7 +40,8 @@ MODULE sth_engine
   PUBLIC :: sth_engine_init, sth_engine_set_global, sth_engine_set_k, sth_engine_set_dvbare, &
             sth_engine_set_dpsi, sth_engine_setup, sth_engine_solve, sth_engine_get_dpsi, &
             sth_engine_get_hdiag, sth_engine_set_hdiag, sth_engine_reset_dpsi, sth_engine_free, sth_engine_shutdown, &
-            sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready
+            sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
+            sth_engine_becs
   !
   ! run statistics of the last solve (seconds; timers need sth_timing = .true.)
   LOGICAL, PUBLIC, SAVE :: sth_timing = .FALSE.
@@ -85,6 +86,24 @@ CONTAINS
   !=================================================================================================
   ! device kernels
   !=================================================================================================
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_kqg_scale(t, x, kqg, ipol, npwx, nslot, npert, nksq, ntot)
+    ! t(:, s) = x(:, s) * kqg(:, ipol, k(s)) for every slot s
+    INTEGER, VALUE :: ipol, npwx, nslot, npert, nksq
+    INTEGER(8), VALUE :: ntot
+    COMPLEX(dp) :: t(*), x(*)
+    REAL(dp) :: kqg(npwx, 3, nksq)
+    INTEGER(8) :: i
+    INTEGER :: ig, s, k
+    i = INT(blockIdx%x - 1, 8) * blockDim%x + threadIdx%x
+    DO WHILE (i <= ntot)
+      ig = INT(MOD(i - 1, INT(npwx, 8))) + 1
+      s = INT((i - 1) / npwx) + 1
+      k = (s - 1) / (nslot * npert) + 1
+      t(i) = x(i) * kqg(ig, ipol, k)
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_kqg_scale
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_zero(a, n)
     INTEGER(8), VALUE :: n
@@ -1161,6 +1180,52 @@ CONTAINS
       sth_t_total = sth_t_dpot + sth_t_ortho + sth_t_cg + sth_t_drho
     ENDIF
   END SUBROUTINE sth_engine_solve
+  !
+  SUBROUTINE sth_engine_becs(kqg, bec, alp)
+    !! For drhodv, after the last solve of the irrep: bec(:, n, p, k) = vkb_kq^H dpsi_(k,p,n) and
+    !! alp(:, n, ipol, p, k) = vkb_kq^H [ (k+q+G)_ipol dpsi_(k,p,n) ], as calbec in drhodv (before its
+    !! i tpiba scaling). Bands n > nocc_k are zero. kqg(npwx, 3, nksq): k+q+G (rows > npwq unused).
+    REAL(dp), INTENT(IN) :: kqg(npwx, 3, nksq)
+    COMPLEX(dp), INTENT(OUT) :: bec(nkb, nbnd, npert, nksq), alp(nkb, nbnd, 3, npert, nksq)
+    REAL(dp), DEVICE, ALLOCATABLE :: d_kqg(:,:,:)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: d_b(:,:,:)
+    COMPLEX(dp), ALLOCATABLE :: hb(:,:,:)
+    INTEGER :: istat, ipol, ik, ip, n, s
+    ALLOCATE(d_kqg(npwx, 3, nksq), d_b(nkb, nsl, 4), hb(nkb, nsl, 4))
+    d_kqg = kqg
+    istat = cudaDeviceSynchronize()
+    DO ipol = 0, 3
+      IF (ipol == 0) THEN
+        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkb, nslot * npert, npwx, &
+                (1.0_dp, 0.0_dp), d_W, npwx, INT(npwx, 8) * nproj, d_dpsi, npwx, INT(npwx, 8) * nslot * npert, &
+                (0.0_dp, 0.0_dp), d_b(1, 1, 1), nkb, INT(nkb, 8) * nslot * npert, nksq)
+      ELSE
+        CALL k_kqg_scale<<<4096, TPB, 0, strm>>>(d_t, d_dpsi, d_kqg, ipol, npwx, nslot, npert, nksq, &
+             INT(npwx, 8) * nsl)
+        CALL kerr('kqg_scale')
+        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkb, nslot * npert, npwx, &
+                (1.0_dp, 0.0_dp), d_W, npwx, INT(npwx, 8) * nproj, d_t, npwx, INT(npwx, 8) * nslot * npert, &
+                (0.0_dp, 0.0_dp), d_b(1, 1, 1 + ipol), nkb, INT(nkb, 8) * nslot * npert, nksq)
+      ENDIF
+      CALL chk(istat, 'cublasZgemmStridedBatched (becs)')
+    ENDDO
+    CALL tsync()
+    hb = d_b
+    bec = (0.0_dp, 0.0_dp)
+    alp = (0.0_dp, 0.0_dp)
+    DO ik = 1, nksq
+      DO ip = 1, npert
+        DO n = 1, h_nock(ik)
+          s = slot(n, ip, ik)
+          bec(:, n, ip, ik) = hb(:, s, 1)
+          DO ipol = 1, 3
+            alp(:, n, ipol, ip, ik) = hb(:, s, 1 + ipol)
+          ENDDO
+        ENDDO
+      ENDDO
+    ENDDO
+    DEALLOCATE(d_kqg, d_b, hb)
+  END SUBROUTINE sth_engine_becs
   !
   SUBROUTINE sth_engine_get_dpsi(ik, ipert, dpsi)
     !! dpsi of (k, pert) after the last solve, (npwx, nbnd): bands > nocc_k and rows > npwq are zero

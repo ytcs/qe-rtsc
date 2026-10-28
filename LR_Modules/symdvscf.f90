@@ -24,6 +24,9 @@ subroutine symdvscf (dvtosym, dfft)
   USE noncollin_module, ONLY : nspin_lsda, nspin_mag
   USE control_lr,   ONLY : lgamma
   USE lr_symm_base, ONLY : minus_q, irotmq, nsymq, gi, gimq, lr_npert, upert, upert_mq
+#if defined(__CUDA)
+  USE sth_tail,     ONLY : sth_tail_on, symdvscf_acc
+#endif
   !
   implicit none
   !
@@ -48,6 +51,13 @@ subroutine symdvscf (dvtosym, dfft)
   !
   ! If there is no symmetry other than identity, return.
   IF (nsymq == 1 .AND. (.NOT.minus_q) ) RETURN
+#if defined(__CUDA)
+  ! rtsc: GPU symmetrization when the fork's engine is on (RTSC_STH=1)
+  IF (sth_tail_on()) THEN
+     CALL symdvscf_acc(dvtosym, dfft)
+     RETURN
+  ENDIF
+#endif
   !
   CALL start_clock ('symdvscf')
   !

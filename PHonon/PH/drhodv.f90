@@ -56,6 +56,9 @@ subroutine drhodv (nu_i0, nper, drhos)
   USE uspp_init,        ONLY : init_us_2
   USE control_flags,    ONLY : offload_type
   USE control_ph,       ONLY : lmultipole
+  USE control_lr,       ONLY : lgamma
+  USE sth_tail,         ONLY : sth_tail_on
+  USE sth_batched,      ONLY : sth_batched_becs
 
   implicit none
 
@@ -77,6 +80,9 @@ subroutine drhodv (nu_i0, nper, drhos)
        wdyn (3 * nat, 3 * nat)
   complex(DP), allocatable ::  aux (:,:)
   ! work space
+  complex(DP), allocatable :: becq_all(:,:,:,:), alpq_all(:,:,:,:,:)
+  logical :: use_eng
+  ! rtsc: projections of dpsi from the batched engine (all k at once), RTSC_STH=1
 
 #if defined(__CUDA)
   TYPE (bec_type) :: bectmp
@@ -106,6 +112,14 @@ subroutine drhodv (nu_i0, nper, drhos)
   !
   nsolv=1
   IF (noncolin.AND.domag) nsolv=2
+  !
+  ! rtsc: the engine's dpsi lacks the q = Gamma Fermi shift (ef_shift_wfc_new acts on iudwf only)
+  use_eng = .FALSE.
+  IF (sth_tail_on() .AND. .NOT. (okvan .OR. noncolin .OR. lmultipole .OR. lgamma .OR. lsda)) THEN
+     ALLOCATE (becq_all(nkb, nbnd, nper, nksq), alpq_all(nkb, nbnd, 3, nper, nksq))
+     CALL sth_batched_becs(nper, becq_all, alpq_all, use_eng)
+     IF (.NOT. use_eng) DEALLOCATE (becq_all, alpq_all)
+  ENDIF
   !$acc data copyin(xk, dpsi) create(aux( 1:npwx*npol , 1:nbnd)) 
   do ik = 1, nksq
      ikk = ikks(ik)
@@ -113,6 +127,22 @@ subroutine drhodv (nu_i0, nper, drhos)
      npw = ngk(ikk)
      npwq= ngk(ikq)
      if (lsda) current_spin = isk (ikk)
+     IF (use_eng) THEN
+        DO mu = 1, nper
+           dbecq(mu)%k(:,:) = becq_all(:,:,mu,ik)
+           DO ipol = 1, 3
+              dalpq(ipol,mu)%k(:,:) = alpq_all(:,:,ipol,mu,ik)
+           ENDDO
+        ENDDO
+        fact = CMPLX(0.d0, tpiba,kind=DP)
+        DO ipert=1,nper
+           DO ipol=1,3
+              CALL becscal(fact,dalpq(ipol,ipert),nkb,nbnd)
+           ENDDO
+        ENDDO
+        call drhodvnl (ik, ikk, nper, nu_i0, dynwrk, becp1, alphap, dbecq, dalpq)
+        CYCLE
+     ENDIF
      call init_us_2 (npwq, igk_k(1,ikq), xk (1, ikq), vkb, .true.)
      DO isolv=1, nsolv
         do mu = 1, nper
@@ -197,6 +227,7 @@ subroutine drhodv (nu_i0, nper, drhos)
      ENDDO
   enddo
   !$acc end data
+  IF (use_eng) DEALLOCATE (becq_all, alpq_all)
   !
   !   put in the basis of the modes
   !

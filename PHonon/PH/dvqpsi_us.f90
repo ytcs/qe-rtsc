@@ -38,6 +38,11 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
   USE becmod,           ONLY : bec_type
   USE gvect,            ONLY : gg
   USE control_ph,       ONLY : lmultipole
+  USE uspp,             ONLY : okvan
+  USE noncollin_module, ONLY : noncolin
+#if defined(__CUDA)
+  USE sth_tail,         ONLY : sth_tail_on
+#endif
   !
   IMPLICIT NONE
   !
@@ -69,6 +74,8 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
   INTEGER :: ip, nnr, itmp
   !!
   complex(DP) , allocatable :: dvlocin (:), aux2 (:), aux3 (:)
+  LOGICAL :: nl_acc
+  !! rtsc: nonlocal term on the GPU (dvqpsi_us_only_acc), inside the dvpsi data region
   !
 #if defined(__CUDA)
   INTEGER, POINTER, DEVICE :: nl_d(:)
@@ -212,6 +219,13 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
      enddo
   enddo
   ENDIF
+  !
+  ! rtsc: norm-conserving collinear nonlocal term on the GPU while dvpsi is still on the device
+  nl_acc = .FALSE.
+#if defined(__CUDA)
+  nl_acc = sth_tail_on() .AND. .NOT. (okvan .OR. noncolin .OR. lmultipole)
+#endif
+  IF (nl_acc) CALL dvqpsi_us_only_acc (ik, uact, becp1, alphap)
   !$acc end data
   !
   deallocate (aux2)
@@ -221,7 +235,7 @@ subroutine dvqpsi_us (ik, uact, addnlcc, becp1, alphap)
   !   First a term similar to the KB case.
   !   Then a term due to the change of the D coefficients.
   !
-  IF (.NOT. lmultipole) call dvqpsi_us_only (ik, uact, becp1, alphap)
+  IF (.NOT. lmultipole .AND. .NOT. nl_acc) call dvqpsi_us_only (ik, uact, becp1, alphap)
   !
   ! DFPT+U: add the bare variation of the Hubbard potential
   !

@@ -19,10 +19,11 @@ MODULE sth_batched
   USE kinds, ONLY : DP
   IMPLICIT NONE
   PRIVATE
-  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush
+  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs
   !
   LOGICAL, SAVE :: have_state = .FALSE.
   LOGICAL, SAVE :: pending = .FALSE.        ! engine dpsi not yet written to iudwf
+  LOGICAL, SAVE :: eng_last = .FALSE.       ! the last sternheimer_kernel call ran on the engine
   INTEGER, SAVE :: st_npert = -1, st_iudvpsi = -1, st_nksq = -1
   COMPLEX(DP), SAVE :: st_key = (0.d0, 0.d0)
   REAL(DP), SAVE :: st_xq(3) = 1.d10        ! q of the per-q engine state
@@ -87,6 +88,7 @@ CONTAINS
 #endif
     !
     done = .FALSE.
+    eng_last = .FALSE.
 #if defined(__CUDA)
     IF (.NOT. sth_env_flag('RTSC_STH')) RETURN
     ! supported case (STH-ENGINE.md, v1)
@@ -142,6 +144,7 @@ CONTAINS
     CALL mp_sum(tot_cg_calls, inter_pool_comm)
     avg_iter = REAL(tot_num_iter, DP) / REAL(tot_cg_calls, DP)
     done = .TRUE.
+    eng_last = .TRUE.
 #endif
   END SUBROUTINE sth_batched_kernel
   !
@@ -170,6 +173,48 @@ CONTAINS
 #endif
     pending = .FALSE.
   END SUBROUTINE sth_batched_flush
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_becs(nper, becq, alpq, ok)
+    !--------------------------------------------------------------------------------------------
+    !! drhodv on the engine: the projections of the current irrep's dpsi for all k at once,
+    !! becq(:,:,mu,ik) = vkb^H dpsi and alpq(:,:,ipol,mu,ik) = vkb^H [(k+q+G)_ipol dpsi], from the
+    !! engine's device dpsi (identical to what the flush wrote to iudwf). ok = .FALSE.: the last
+    !! sternheimer_kernel call was not the engine's, or its state does not match; use the vanilla path.
+    USE klist,            ONLY : xk, ngk, igk_k
+    USE gvect,            ONLY : g
+    USE wvfct,            ONLY : nbnd, npwx
+    USE uspp,             ONLY : nkb
+    USE qpoint,           ONLY : nksq, ikqs
+#if defined(__CUDA)
+    USE sth_engine,       ONLY : sth_engine_becs, sth_engine_ready
+#endif
+    INTEGER, INTENT(IN) :: nper
+    COMPLEX(DP), INTENT(OUT) :: becq(nkb, nbnd, nper, nksq), alpq(nkb, nbnd, 3, nper, nksq)
+    LOGICAL, INTENT(OUT) :: ok
+#if defined(__CUDA)
+    REAL(DP), ALLOCATABLE :: kqg(:,:,:)
+    INTEGER :: ik, ikq, ig
+#endif
+    ok = .FALSE.
+#if defined(__CUDA)
+    IF (.NOT. (eng_last .AND. have_state .AND. sth_engine_ready())) RETURN
+    IF (nper /= st_npert .OR. nksq /= st_nksq) RETURN
+    CALL start_clock('sth_becs')
+    ALLOCATE(kqg(npwx, 3, nksq))
+    kqg = 0.d0
+    DO ik = 1, nksq
+      ikq = ikqs(ik)
+      DO ig = 1, ngk(ikq)
+        kqg(ig, :, ik) = xk(:, ikq) + g(:, igk_k(ig, ikq))
+      ENDDO
+    ENDDO
+    CALL sth_engine_becs(kqg, becq, alpq)
+    DEALLOCATE(kqg)
+    CALL stop_clock('sth_becs')
+    ok = .TRUE.
+#endif
+  END SUBROUTINE sth_batched_becs
   !
 #if defined(__CUDA)
   !--------------------------------------------------------------------------------------------

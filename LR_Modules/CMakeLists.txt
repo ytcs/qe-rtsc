@@ -75,6 +75,7 @@ set(sources
     ccgsolve_all.f90
     ch_psi_all_complex.f90
     sth_dump.f90
+    sth_tail.f90
     sth_batched.f90
     sth_nscf_start.f90
     response_kernels.f90
