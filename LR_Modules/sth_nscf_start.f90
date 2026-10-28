@@ -18,7 +18,9 @@ MODULE sth_nscf_start
   USE kinds, ONLY : DP
   IMPLICIT NONE
   PRIVATE
-  PUBLIC :: nscf_start_prepare, nscf_start_get, nscf_start_free
+  PUBLIC :: nscf_start_prepare, nscf_start_get, nscf_start_free, nscf_start_dir
+  !
+  CHARACTER(LEN=320), SAVE :: nscf_start_dir = ''   ! scf restart directory (set by ph.x run_nscf)
   !
   LOGICAL, SAVE :: active = .FALSE.
   INTEGER, SAVE :: nks0 = 0, nbnd0 = 0, ngwx0 = 0
@@ -40,7 +42,7 @@ CONTAINS
     USE control_flags,    ONLY : gamma_only
     USE mp_bands,         ONLY : nproc_bgrp
     USE lsda_mod,         ONLY : lsda
-    CHARACTER(LEN=320) :: fname
+    CHARACTER(LEN=320) :: fname, dir
     CHARACTER(LEN=16) :: s
     INTEGER :: ios, u, i, ik_, ispin, npol, ngw, igwx, nb, ib, pass
     LOGICAL :: gam, exst
@@ -52,12 +54,14 @@ CONTAINS
     IF (ios /= 0 .OR. TRIM(s) /= '1') RETURN
     IF (noncolin .OR. gamma_only .OR. lsda .OR. nproc_bgrp /= 1) RETURN
     CALL start_clock('nscf_rot')
+    dir = nscf_start_dir
+    IF (LEN_TRIM(dir) == 0) dir = restart_dir()
     !
     ! pass 1: count files and sizes; pass 2: read
     DO pass = 1, 2
       i = 0
       DO
-        WRITE(fname, '(A,"wfc",I0,".dat")') TRIM(restart_dir()), i + 1
+        WRITE(fname, '(A,"wfc",I0,".dat")') TRIM(dir), i + 1
         INQUIRE(FILE=TRIM(fname), EXIST=exst)
         IF (.NOT. exst) EXIT
         OPEN(NEWUNIT=u, FILE=TRIM(fname), FORM='unformatted', STATUS='old', ACTION='read', IOSTAT=ios)

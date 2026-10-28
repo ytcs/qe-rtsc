@@ -29,6 +29,9 @@ SUBROUTINE run_nscf(do_band, iq)
                               only_wfc
   USE io_global,       ONLY : stdout, ionode
   !USE save_ph,         ONLY : tmp_dir_save
+  USE save_ph,         ONLY : tmp_dir_save
+  USE io_files,        ONLY : postfix
+  USE sth_nscf_start,  ONLY : nscf_start_dir
   !
   USE grid_irr_iq,     ONLY : done_bands
   USE acfdtest,        ONLY : acfdt_is_active, acfdt_num_der, ir_point, delta_vrs
@@ -108,6 +111,8 @@ SUBROUTINE run_nscf(do_band, iq)
   CALL fft_type_allocate ( dffts, at, bg, gcutms, intra_bgrp_comm, nyfft=nyfft)
   !
   CALL setup_nscf ( newgrid, xq, elph_mat .OR. elph_ahc )
+  ! rtsc: the scf wavefunctions (RTSC_NSCF_ROT starting vectors) are in the original outdir
+  nscf_start_dir = TRIM(tmp_dir_save) // TRIM(prefix) // postfix
   !
   !
   if (twochem) occupations ='smearing' !this is needed to avoid init_twochem error check.
