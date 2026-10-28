@@ -19,9 +19,10 @@ MODULE sth_batched
   USE kinds, ONLY : DP
   IMPLICIT NONE
   PRIVATE
-  PUBLIC :: sth_batched_kernel, sth_env_flag
+  PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush
   !
   LOGICAL, SAVE :: have_state = .FALSE.
+  LOGICAL, SAVE :: pending = .FALSE.        ! engine dpsi not yet written to iudwf
   INTEGER, SAVE :: st_npert = -1, st_iudvpsi = -1, st_nksq = -1
   COMPLEX(DP), SAVE :: st_key = (0.d0, 0.d0)
   REAL(DP), SAVE :: st_xq(3) = 1.d10        ! q of the per-q engine state
@@ -103,6 +104,7 @@ CONTAINS
     reinit = first_iter .OR. .NOT. have_state .OR. .NOT. sth_engine_ready() .OR. npert /= st_npert &
              .OR. iudvpsi /= st_iudvpsi .OR. nksq /= st_nksq .OR. key /= st_key
     IF (reinit) THEN
+      CALL sth_batched_flush()
       have_state = .FALSE.
       ! per-q state (k, k+q data, vkb, h_diag, psi(r)) is kept across the irreps of one q
       IF (.NOT. sth_engine_qready() .OR. ANY(xq /= st_xq) .OR. nksq /= st_nksq) THEN
@@ -126,14 +128,9 @@ CONTAINS
     drhoout(:, 1, :) = dr(:, :)
     DEALLOCATE(dv, dr)
     !
-    ! dpsi back to iudwf (warm start of a vanilla call, drhodv, restart)
-    DO ik = 1, nksq
-      DO ipert = 1, npert
-        nrec = (ipert - 1) * nksq + ik
-        CALL sth_engine_get_dpsi(ik, ipert, dpsi)
-        CALL save_buffer(dpsi, lrdwf, iudwf, nrec)
-      ENDDO
-    ENDDO
+    ! dpsi goes back to iudwf once per irrep (sth_batched_flush, end of dfpt_kernel) or before the
+    ! engine state is replaced; nothing reads iudwf between the calls of one irrep on this path
+    pending = .TRUE.
     !
     all_conv = (nfail == 0)
     IF (.NOT. all_conv) WRITE(stdout, '(5x,"rtsc sth: ",I0," (k,pert) solves not converged, thresh ",ES10.3)') &
@@ -144,6 +141,32 @@ CONTAINS
     done = .TRUE.
 #endif
   END SUBROUTINE sth_batched_kernel
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE sth_batched_flush()
+    !--------------------------------------------------------------------------------------------
+    !! write the engine's dpsi of the current irrep to iudwf (drhodv, restart, vanilla warm start)
+    USE buffers,          ONLY : save_buffer
+    USE units_lr,         ONLY : lrdwf, iudwf
+    USE eqv,              ONLY : dpsi
+#if defined(__CUDA)
+    USE sth_engine,       ONLY : sth_engine_get_dpsi
+#endif
+    INTEGER :: ik, ipert, nrec
+    IF (.NOT. pending) RETURN
+#if defined(__CUDA)
+    CALL start_clock('sth_flush')
+    DO ik = 1, st_nksq
+      DO ipert = 1, st_npert
+        nrec = (ipert - 1) * st_nksq + ik
+        CALL sth_engine_get_dpsi(ik, ipert, dpsi)
+        CALL save_buffer(dpsi, lrdwf, iudwf, nrec)
+      ENDDO
+    ENDDO
+    CALL stop_clock('sth_flush')
+#endif
+    pending = .FALSE.
+  END SUBROUTINE sth_batched_flush
   !
 #if defined(__CUDA)
   !--------------------------------------------------------------------------------------------
