@@ -5,7 +5,7 @@
 # Cache hit: restore source + build-gpu (NVTX on) + pseudo + shim, git pull, incremental rebuild.
 # Cache miss: full setup + build, then save to the cache.
 set -euo pipefail
-CACHE=${CACHE:-/cache}; ARC=$CACHE/rtsc-dev.tar.zst; J=${J:-28}; CC=${CC:-80}
+CACHE=${CACHE:-/cache}; J=${J:-28}; CC=${CC:-80}; ARC=$CACHE/rtsc-dev-sm$CC.tar.zst
 NV=/opt/nvidia/hpc_sdk/Linux_x86_64/26.5
 apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd curl git libfftw3-dev pkg-config cmake ninja-build python3 python3-numpy >/dev/null
 mkdir -p /root/rtsc && cd /root/rtsc
@@ -27,5 +27,5 @@ else
 fi
 source env.sh
 NVTX=1 CPU=0 J=$J qe-rtsc/rtsc/pod/build-gpu.sh qe-rtsc $CC
-[ -f "$ARC" ] || qe-rtsc/rtsc/pod/save.sh
+[ -f "$ARC" ] || CC=$CC qe-rtsc/rtsc/pod/save.sh
 echo WARM_OK
