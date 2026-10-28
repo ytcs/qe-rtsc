@@ -25,7 +25,7 @@ if [ "${NVTX:-0}" = 1 ]; then
 fi
 cmake -S "$SRC" -B "$SRC/build-gpu" "${common[@]}" "${gpuflags[@]}" -DQE_GPU_ARCHS=sm_$CC -DQE_GPU="openacc;cuda" \
       -DQE_ENABLE_MPI_GPU_AWARE=ON
-cmake --build "$SRC/build-gpu" -j "$J" --target pw.x ph.x epw.x q2r.x matdyn.x
+cmake --build "$SRC/build-gpu" -j "$J" --target pw.x ph.x epw.x q2r.x matdyn.x dvscf_q2r.x
 [ "${CPU:-1}" = 1 ] || exit 0   # CPU=0: GPU build only (dev pod)
 cmake -S "$SRC" -B "$SRC/build-cpu" "${common[@]}"
-cmake --build "$SRC/build-cpu" -j "$J" --target pw.x ph.x epw.x q2r.x matdyn.x
+cmake --build "$SRC/build-cpu" -j "$J" --target pw.x ph.x epw.x q2r.x matdyn.x dvscf_q2r.x

@@ -1,0 +1,42 @@
+&inputepw
+  prefix = 'MgB2'
+  amass(1) = 24.305
+  amass(2) = 10.811
+  outdir = './'
+  ep_coupling = .true.
+  elph = .true.
+  epbwrite = .true.
+  epwwrite = .true.
+  etf_mem = 1
+  nbndsub = 5
+  bands_skipped = 'exclude_bands = 1-4'
+  wannierize = .true.
+  num_iter = 500
+  dis_froz_max = 11.0
+  proj(1) = 'B:pz'
+  proj(2) = 'f=0.5,1.0,0.5:s'
+  proj(3) = 'f=0.0,0.5,0.5:s'
+  proj(4) = 'f=0.5,0.5,0.5:s'
+  eps_acoustic = 2.0
+  ephwrite = .true.
+  fsthick = 0.4
+  degaussw = 0.10
+  degaussq = 0.5
+  nqstep = 500
+  eliashberg = .true.
+  laniso = .true.
+  limag = .true.
+  lpade = .true.
+  conv_thr_iaxis = 1.0d-6
+  wscut = 1.0
+  temps = 10 20
+  nstemp = 3
+  nsiter = 500
+  muc = 0.16
+  dvscf_dir = './save'
+  nk1 = 6, nk2 = 6, nk3 = 6
+  nq1 = 6, nq2 = 6, nq3 = 6
+  mp_mesh_k = .true.
+  nkf1 = 24, nkf2 = 24, nkf3 = 24
+  nqf1 = 12, nqf2 = 12, nqf3 = 12
+/

@@ -1,0 +1,45 @@
+&inputepw
+  prefix = 'Mg2IrH6'
+  amass(1) = 24.305
+  amass(2) = 192.217
+  amass(3) = 1.008
+  outdir = './'
+  ep_coupling = .true.
+  elph = .true.
+  epbwrite = .true.
+  epwwrite = .true.
+  etf_mem = 1
+  nbndsub = 20
+  bands_skipped = 'exclude_bands = 1-12'
+  wannierize = .true.
+  num_iter = 500
+  dis_froz_max = 14.5
+  proj(1) = 'Ir:s'
+  proj(2) = 'Ir:d'
+  proj(3) = 'H:s'
+  proj(4) = 'Mg:s'
+  proj(5) = 'Mg:p'
+  wdata(1) = 'dis_num_iter = 2000'
+  eps_acoustic = 2.0
+  ephwrite = .true.
+  fsthick = 0.4
+  degaussw = 0.10
+  degaussq = 0.5
+  nqstep = 500
+  eliashberg = .true.
+  laniso = .true.
+  limag = .true.
+  lpade = .true.
+  conv_thr_iaxis = 1.0d-6
+  wscut = 2.0
+  temps = 10 25
+  nstemp = 4
+  nsiter = 500
+  muc = 0.16
+  dvscf_dir = './save'
+  nk1 = 4, nk2 = 4, nk3 = 4
+  nq1 = 4, nq2 = 4, nq3 = 4
+  mp_mesh_k = .true.
+  nkf1 = 8, nkf2 = 8, nkf3 = 8
+  nqf1 = 4, nqf2 = 4, nqf3 = 4
+/

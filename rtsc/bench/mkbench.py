@@ -2,6 +2,7 @@
 
     python mkbench.py B1 frozen   -> B1/frozen/
     python mkbench.py B1 smoke    -> B1/smoke/   (reduced grids, local profiling only)
+    python mkbench.py B1 dq       -> B1/dq/      (frozen q-grid, smoke k-grid: dvscf interpolation test)
 
 The frozen parameter sets must not change after a result has been recorded.
 """
@@ -26,6 +27,9 @@ SYSTEMS = {
         grids=dict(
             frozen=dict(kscf=18, kq=6, kf=48, qf=24, temps=(10, 20), nstemp=3),
             smoke=dict(kscf=12, kq=3, kf=12, qf=6, temps=(20, 50), nstemp=2),
+            # dvscf-interpolation test (DQ-LOG): frozen q-grid and temperatures, smoke k-grid;
+            # run-dq.sh does the 3^3 subgrid DFPT, dvscf_q2r, then the one-shot pass on 6^3
+            dq=dict(kscf=12, kq=6, kf=24, qf=12, temps=(10, 20), nstemp=3),
         ),
     ),
     "B2": dict(
@@ -51,6 +55,8 @@ SYSTEMS = {
         grids=dict(
             frozen=dict(kscf=12, kq=4, kw=8, kf=32, qf=16, temps=(10, 25), nstemp=4),
             smoke=dict(kscf=6, kq=2, kw=4, kf=8, qf=4, temps=(10, 20), nstemp=2),
+            # dvscf-interpolation test: frozen q-grid and temperatures, smoke k/fine grids (2^3 subgrid)
+            dq=dict(kscf=6, kq=4, kw=4, kf=8, qf=4, temps=(10, 25), nstemp=4),
         ),
     ),
 }
