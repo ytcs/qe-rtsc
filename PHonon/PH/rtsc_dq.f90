@@ -120,7 +120,7 @@ CONTAINS
     USE units_lr,          ONLY : iudwf, lrdwf
     USE eqv,               ONLY : dpsi
     USE qpoint,            ONLY : nksq, xq
-    USE control_lr,        ONLY : convt, lnoloc, alpha_mix, nmix_ph, tr2_ph, flmixdpot
+    USE control_lr,        ONLY : convt, lnoloc, alpha_mix, nmix_ph, tr2_ph
     USE dv_of_drho_lr,     ONLY : dv_of_drho
     USE apply_dpot_mod,    ONLY : apply_dpot_allocate, apply_dpot_deallocate
     USE dfpt_type,         ONLY : dfpt_data_type, dfpt_dvscfp_to_dvscfs
@@ -132,7 +132,7 @@ CONTAINS
     TYPE(dfpt_data_type), INTENT(INOUT) :: dfpt_data
     !
     COMPLEX(DP), ALLOCATABLE :: vin(:,:,:), vout(:,:,:), vmix(:,:,:)
-    REAL(DP) :: thresh, averlt, nin, nres, dr2m
+    REAL(DP) :: thresh, averlt, nin, nres, nout, dr2m
     LOGICAL :: conv
     REAL(DP), EXTERNAL :: get_clock
     LOGICAL :: all_conv
@@ -201,8 +201,11 @@ CONTAINS
         CALL mp_sum(nin, intra_bgrp_comm)
         CALL mp_sum(nres, intra_bgrp_comm)
         dr2 = dr2 + nres
-        WRITE(stdout, '(5x,"rtsc dq: pass ",I0," mode ",I4,"  |dV_out - dV_in| / |dV_in| = ",ES10.3)') &
-             it, imode0 + jpert, SQRT(nres / MAX(nin, 1.d-300))
+        nout = REAL(DOT_PRODUCT(vout(:, 1, jpert), vout(:, 1, jpert)), DP)
+        CALL mp_sum(nout, intra_bgrp_comm)
+        WRITE(stdout, '(5x,"rtsc dq: pass ",I0," mode ",I4,"  |dV_out - dV_in| / |dV_in| = ",ES10.3, &
+             &"  |dV_out| / |dV_in| = ",F8.4)') it, imode0 + jpert, SQRT(nres / MAX(nin, 1.d-300)), &
+             SQRT(nout / MAX(nin, 1.d-300))
       ENDDO
       dr2 = dr2 / (2.d0 * dfftp%nr1 * dfftp%nr2 * dfftp%nr3 * npe)**2 / npe
       WRITE(stdout, '(/,5x," iter # ",i3," total cpu time :",f8.1," secs   av.it.: ",f5.1)') it, &
@@ -212,7 +215,7 @@ CONTAINS
       IF (it == nit) EXIT
       vmix = vout
       CALL mix_potential(2 * dfftp%nnr * nspin_mag * npe, vmix, dfpt_data%dvscfp, alpha_mix(it), dr2m, &
-                         npe * tr2_ph, it, nmix_ph, flmixdpot, conv)
+                         npe * tr2_ph, it, nmix_ph, 'dqmix', conv)
       CALL dfpt_dvscfp_to_dvscfs(dfpt_data)
     ENDDO
     !
