@@ -403,8 +403,11 @@ CONTAINS
       IF (wsn(iw) /= iw - 1) uniform = .FALSE.
     ENDDO
     uniform = uniform .AND. (n2 == 2 * nsiw)
-    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_K4', envval)
-    IF (TRIM(envval) == '0') uniform = .FALSE.   ! force the reference kernel k_fsr
+    ! Default kernel: k_fsr. On the B1 proxy k_fsr4/k_fsr5 were not faster at 10 K (the sum is
+    ! FP64-issue bound) and k_fsr5's reassociation moved the near-zero pi-gap peak of B1 smoke
+    ! out of the gate. RTSC_EPW_ELIASH_KERNEL=4 or 5 selects them.
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_KERNEL', envval)
+    IF (TRIM(envval) /= '4' .AND. TRIM(envval) /= '5') uniform = .FALSE.
     IF (uniform) THEN
       ! kernel factor table for this temperature
       IF (pit /= ftab_pit .OR. n2 /= ftab_n2) THEN
@@ -416,8 +419,7 @@ CONTAINS
         ftab_pit = pit; ftab_n2 = n2
       ENDIF
       n2p = n2 + 8   ! padding: the register windows prefetch up to 4 entries past n2
-      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_ELIASH_K5', envval)
-      IF (nsiw <= 512 .AND. TRIM(envval) /= '0') THEN
+      IF (nsiw <= 512 .AND. TRIM(envval) == '5') THEN
         IF (ALLOCATED(d_ez)) THEN
           IF (SIZE(d_ez) /= nsiw * nb * nkfs) DEALLOCATE(d_ez, d_ed)
         ENDIF
