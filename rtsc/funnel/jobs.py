@@ -14,6 +14,15 @@ import sys
 from pathlib import Path
 
 
+def sym(d):
+    """Symmetrise to the spglib standard primitive cell (ph.x group theory needs exact symmetry:
+    an MLIP-relaxed hexagonal cell gave 'Wrong classes for D_6h')."""
+    from pymatgen.core import Structure
+    from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+    s = Structure.from_dict(d)
+    return SpacegroupAnalyzer(s, symprec=0.01).get_primitive_standard_structure().as_dict()
+
+
 def ms(p):
     return {json.loads(l)["id"]: json.loads(l) for l in Path(p).read_text().splitlines() if l.strip()}
 
@@ -24,7 +33,7 @@ def t3a_controls(ctrl, t1, out):
     jobs = {}
     for k in ("Al", "Cu", "Pb", "Nb", "MgB2", "CaC6", "MgB3C3", "Mg2IrH6", "H3S"):
         st = c[k]["structure"] if k == "H3S" or "structure" not in r.get(k, {}) else r[k]["structure"]
-        jobs[k] = dict(structure=st, Ttarget=c[k]["Ttarget"], role=c[k]["role"], expect=c[k]["expect"])
+        jobs[k] = dict(structure=sym(st), Ttarget=c[k]["Ttarget"], role=c[k]["role"], expect=c[k]["expect"])
         if "press_kbar" in c[k]:
             jobs[k]["press_kbar"] = c[k]["press_kbar"]
     Path(out).write_text(json.dumps(jobs))
@@ -42,10 +51,10 @@ def t3a_db(subset, t1, t2db, out):
     rng.shuffle(pos); rng.shuffle(neg)
     jobs = {}
     for k in pos[:int(os.environ.get("NPOS", 10))]:
-        jobs[k] = dict(structure=r[k]["structure"], Ttarget=s[k]["Tc"], role="db-pos", Tc_jarvis=s[k]["Tc"],
+        jobs[k] = dict(structure=sym(r[k]["structure"]), Ttarget=s[k]["Tc"], role="db-pos", Tc_jarvis=s[k]["Tc"],
                        lamb_jarvis=s[k]["lamb"])
     for k in neg[:int(os.environ.get("NNEG", 5))]:
-        jobs[k] = dict(structure=r[k]["structure"], Ttarget=1.0, role="db-neg", Tc_jarvis=s[k]["Tc"],
+        jobs[k] = dict(structure=sym(r[k]["structure"]), Ttarget=1.0, role="db-neg", Tc_jarvis=s[k]["Tc"],
                        lamb_jarvis=s[k]["lamb"])
     Path(out).write_text(json.dumps(jobs))
     print(f"survivors <= 6 atoms: pos {len(pos)}, neg {len(neg)}; drawn {len(jobs)}")
