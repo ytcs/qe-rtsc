@@ -59,6 +59,29 @@ def main(jobs, jid, root, nt="8", ne="8"):
     g = qe.t3a_grids(st0)
     res["grids"] = dict(g, ecut=ecut)
     prefix = "x"
+    done = {}
+    if Path("timings.tsv").exists():
+        for ln in Path("timings.tsv").read_text().splitlines():
+            n, dt, rc = ln.split("\t")
+            if rc == "0":
+                done[n] = float(dt)
+    if all(k in done for k in ("relax", "scf", "ph", "nscf")) and "JOB DONE" in Path("nscf.out").read_text():
+        # resume at EPW (driver crash after nscf): stage times from the first run
+        res["stages"].update({k: done[k] for k in ("relax", "scf", "ph", "nscf")})
+        res["resumed_at"] = "epw"
+        xn = qe.read_xml(f"{prefix}.save/data-file-schema.xml")
+        st = xn["structure"]
+        res["relaxed"] = st
+        g = qe.t3a_grids(st)
+        res["grids"] = dict(g, ecut=ecut)
+        import re
+        ef = float(re.findall(r"the Fermi energy is\s+(-?[\d.]+) ev", Path("scf.out").read_text())[-1])
+        xs = dict(xn, ef=ef)
+        res["ef_scf"] = ef
+        freqs = [float(c) for _, c in re.findall(r"freq \(\s*\d+\) =\s*(-?[\d.]+) \[THz\] =\s*(-?[\d.]+) \[cm-1\]",
+                                                   Path("ph.out").read_text())]
+        res["omega_min_cm"] = min(freqs) if freqs else None
+        return epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job)
     # 1. relax (fixed-symmetry vc-relax at the target pressure)
     Path("relax.in").write_text(qe.pw_input(st0, "vc-relax", prefix, g["k"], ecut, pseudo=PSEUDO,
                                             press=job.get("press_kbar"), conv="1.0d-8"))
@@ -116,13 +139,20 @@ def main(jobs, jid, root, nt="8", ne="8"):
     if stage("nscf", mpi + [f"{BIN}/pw.x", "-in", "nscf.in"], "nscf.out", omp) != 0:
         return finish("fail:nscf")
     xn = qe.read_xml(f"{prefix}.save/data-file-schema.xml")
-    xn["ef"] = xs["ef"]
+    return epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job)
+
+
+def epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job):
+    nsemi = qe.n_semicore(xs if xs.get("eig") else xn)
+    nw = qe.n_wann(st["species"])
+    res.setdefault("wannier", {}).update(nsemi=nsemi, nw=nw)
+    xn = dict(xn, ef=xs["ef"])
     froz = qe.frozen_window(xn, nsemi, nw)
     res["wannier"]["froz"] = froz
     # 6. EPW, atomic projections then SCDM
     epw_cmd = (f"nvidia-cuda-mps-control -d 2>/dev/null; OMP_NUM_THREADS=1 mpirun --bind-to none -np {ne} "
                f"-x OMP_NUM_THREADS {BIN}/epw.x -npool {ne} -in epw.in")
-    for attempt, scdm in (("epw", False), ("epw_scdm", True)):
+    for attempt, scdm in (("epw_atomic", False), ("epw_scdm", True)):
         if not scdm and froz is None:
             res["wannier"]["note"] = "no frozen window with <= nWF bands"
             continue
