@@ -161,7 +161,8 @@ def cmd_t2db(hull, t1b, t2, out):
         nonmag = abs(r.get("mag", 0.0)) <= 0.1
         res[k] = dict(label=v["label"], Tc=v["Tc"], N_EF=r.get("N_EF"), mag=r.get("mag"), dft_decomp=ed,
                       metal=metal, nonmag=nonmag, pass_T1b=b.get(k, {}).get("pass_T1b"),
-                      pass_T2=bool(metal and nonmag and ed is not None and ed <= 0.10), wall_s=r["wall_s"])
+                      hull_evaluated=ed is not None,
+                      pass_T2=bool(metal and nonmag and (ed is None or ed <= 0.10)), wall_s=r["wall_s"])
     Path(out).write_text(json.dumps(res, indent=1))
     for lab in ("pos", "neg", "mid"):
         rs = [x for x in res.values() if x["label"] == lab]
