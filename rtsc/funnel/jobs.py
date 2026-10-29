@@ -8,6 +8,7 @@ T3a starts from the T1 MatterSim geometry (the funnel's hand-off), except H3S (2
 MLIP's domain), which starts from its literature cell.
 """
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -40,10 +41,10 @@ def t3a_db(subset, t1, t2db, out):
     neg = sorted(k for k in surv if s[k]["label"] == "neg")
     rng.shuffle(pos); rng.shuffle(neg)
     jobs = {}
-    for k in pos[:10]:
+    for k in pos[:int(os.environ.get("NPOS", 10))]:
         jobs[k] = dict(structure=r[k]["structure"], Ttarget=s[k]["Tc"], role="db-pos", Tc_jarvis=s[k]["Tc"],
                        lamb_jarvis=s[k]["lamb"])
-    for k in neg[:5]:
+    for k in neg[:int(os.environ.get("NNEG", 5))]:
         jobs[k] = dict(structure=r[k]["structure"], Ttarget=1.0, role="db-neg", Tc_jarvis=s[k]["Tc"],
                        lamb_jarvis=s[k]["lamb"])
     Path(out).write_text(json.dumps(jobs))
