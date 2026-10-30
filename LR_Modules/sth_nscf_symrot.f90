@@ -45,6 +45,15 @@ MODULE sth_nscf_symrot
   REAL(DP), SAVE :: rmax_rot = 0, rmax_dav = 0
   INTEGER, ALLOCATABLE, SAVE :: pos(:)
   INTEGER, SAVE :: npos = 0
+  ! hash tables of orbit images (k mod G on a 720720-grid): tc for the cache, tl for this list's reps
+  INTEGER(8), PARAMETER :: MGRID = 720720_8
+  TYPE htab
+    INTEGER(8), ALLOCATABLE :: key(:)
+    INTEGER, ALLOCATABLE :: val(:,:)    ! (id, isym, tr)
+    INTEGER :: n = 0, cap = 0
+  END TYPE htab
+  TYPE(htab), SAVE :: tc, tl
+  REAL(DP), SAVE :: t_plan = 0, t_after = 0
   !
 CONTAINS
   !
@@ -188,6 +197,112 @@ CONTAINS
     ENDDO
   END SUBROUTINE rotate
   !
+  LOGICAL FUNCTION hkey(x, key)
+    REAL(DP), INTENT(IN) :: x(3)
+    INTEGER(8), INTENT(OUT) :: key
+    INTEGER(8) :: i(3)
+    INTEGER :: j
+    REAL(DP) :: y
+    hkey = .FALSE.
+    DO j = 1, 3
+      y = x(j) * REAL(MGRID, DP)
+      IF (ABS(y - ANINT(y)) > 1.d-3) RETURN
+      i(j) = MODULO(NINT(y, KIND=8), MGRID)
+    ENDDO
+    key = (i(1) * MGRID + i(2)) * MGRID + i(3)
+    hkey = .TRUE.
+  END FUNCTION hkey
+  !
+  SUBROUTINE h_reset(t)
+    TYPE(htab), INTENT(INOUT) :: t
+    IF (ALLOCATED(t%key)) DEALLOCATE(t%key, t%val)
+    t%cap = 1024; t%n = 0
+    ALLOCATE(t%key(t%cap), t%val(3, t%cap))
+    t%key = -1
+  END SUBROUTINE h_reset
+  !
+  INTEGER FUNCTION h_slot(t, key)
+    TYPE(htab), INTENT(IN) :: t
+    INTEGER(8), INTENT(IN) :: key
+    INTEGER(8) :: h
+    h = IEOR(key, ISHFT(key, -29)) * 2654435761_8
+    h_slot = INT(MODULO(IEOR(h, ISHFT(h, -32)), INT(t%cap, 8))) + 1
+    DO WHILE (t%key(h_slot) /= -1 .AND. t%key(h_slot) /= key)
+      h_slot = MODULO(h_slot, t%cap) + 1
+    ENDDO
+  END FUNCTION h_slot
+  !
+  RECURSIVE SUBROUTINE h_put(t, key, id, isym, tr)
+    TYPE(htab), INTENT(INOUT) :: t
+    INTEGER(8), INTENT(IN) :: key
+    INTEGER, INTENT(IN) :: id, isym, tr
+    INTEGER(8), ALLOCATABLE :: k0(:)
+    INTEGER, ALLOCATABLE :: v0(:,:)
+    INTEGER :: i, c0
+    IF (t%cap == 0) CALL h_reset(t)
+    IF (2 * (t%n + 1) > t%cap) THEN
+      CALL MOVE_ALLOC(t%key, k0); CALL MOVE_ALLOC(t%val, v0)
+      c0 = t%cap; t%cap = 2 * c0; t%n = 0
+      ALLOCATE(t%key(t%cap), t%val(3, t%cap))
+      t%key = -1
+      DO i = 1, c0
+        IF (k0(i) /= -1) CALL h_put(t, k0(i), v0(1, i), v0(2, i), v0(3, i))
+      ENDDO
+      DEALLOCATE(k0, v0)
+    ENDIF
+    i = h_slot(t, key)
+    IF (t%key(i) == key) RETURN     ! keep the first source of this image
+    t%key(i) = key; t%val(:, i) = (/id, isym, tr/); t%n = t%n + 1
+  END SUBROUTINE h_put
+  !
+  LOGICAL FUNCTION h_get(t, key, id, isym, tr)
+    TYPE(htab), INTENT(IN) :: t
+    INTEGER(8), INTENT(IN) :: key
+    INTEGER, INTENT(OUT) :: id, isym, tr
+    INTEGER :: i
+    h_get = .FALSE.
+    IF (t%cap == 0) RETURN
+    i = h_slot(t, key)
+    IF (t%key(i) /= key) RETURN
+    id = t%val(1, i); isym = t%val(2, i); tr = t%val(3, i)
+    h_get = .TRUE.
+  END FUNCTION h_get
+  !
+  SUBROUTINE h_images(t, xs, id)
+    !! insert every image tr S xs of source id
+    USE symm_base, ONLY : s, nsym, time_reversal
+    TYPE(htab), INTENT(INOUT) :: t
+    REAL(DP), INTENT(IN) :: xs(3)
+    INTEGER, INTENT(IN) :: id
+    INTEGER :: is, itr, tr, j
+    INTEGER(8) :: key
+    REAL(DP) :: kr(3)
+    DO itr = 1, 2
+      tr = 3 - 2 * itr
+      IF (tr == -1 .AND. .NOT. time_reversal) EXIT
+      DO is = 1, nsym
+        DO j = 1, 3
+          kr(j) = tr * (s(j, 1, is) * xs(1) + s(j, 2, is) * xs(2) + s(j, 3, is) * xs(3))
+        ENDDO
+        IF (hkey(kr, key)) CALL h_put(t, key, id, is, tr)
+      ENDDO
+    ENDDO
+  END SUBROUTINE h_images
+  !
+  LOGICAL FUNCTION g0_of(xs, xt, isym, tr, g0)
+    USE symm_base, ONLY : s
+    REAL(DP), INTENT(IN) :: xs(3), xt(3)
+    INTEGER, INTENT(IN) :: isym, tr
+    INTEGER, INTENT(OUT) :: g0(3)
+    REAL(DP) :: d(3)
+    INTEGER :: j
+    DO j = 1, 3
+      d(j) = xt(j) - tr * (s(j, 1, isym) * xs(1) + s(j, 2, isym) * xs(2) + s(j, 3, isym) * xs(3))
+    ENDDO
+    g0 = NINT(d)
+    g0_of = ALL(ABS(d - g0) < 1.d-6)
+  END FUNCTION g0_of
+  !
   !------------------------------------------------------------------------------------------
   SUBROUTINE symrot_plan(kdone, kskip)
     !------------------------------------------------------------------------------------------
@@ -204,12 +319,16 @@ CONTAINS
     USE gvect,     ONLY : mill
     USE klist,     ONLY : igk_k
     LOGICAL, INTENT(INOUT) :: kdone(nks), kskip(nks)
-    INTEGER :: ik, i0, isym, tr, g0(3), jk
+    INTEGER :: ik, i0, isym, tr, g0(3), jk, i1, j1
     REAL(DP) :: xt(3), xs(3)
     INTEGER, ALLOCATABLE :: mrep(:,:)
-    LOGICAL :: found
+    LOGICAL :: found, keyed, hit
+    INTEGER(8) :: key, c0, c1, cr
     !
     CALL start_clock('nscf_symrot')
+    CALL SYSTEM_CLOCK(c0, cr)
+    CALL h_reset(tl)
+    IF (tc%cap == 0) CALL h_reset(tc)
     IF (npos /= dfftp%nr1 * dfftp%nr2 * dfftp%nr3) THEN
       IF (ALLOCATED(pos)) DEALLOCATE(pos)
       npos = dfftp%nr1 * dfftp%nr2 * dfftp%nr3
@@ -227,10 +346,23 @@ CONTAINS
       CALL kcryst(ik, xt)
       CALL pos_set(ik, 1)
       found = .FALSE.
-      ! 1) the cache
-      DO i0 = 1, nc
-        IF (.NOT. find_op(cxk(:, i0), xt, isym, tr, g0)) CYCLE
-        IF (.NOT. map_ok(cngw(i0), cmill(:, :, i0), ik, isym, tr, g0)) CYCLE
+      ! 1) the cache (hashed image lookup; linear scan if k is off the hash grid or the hashed map fails)
+      keyed = hkey(xt, key)
+      hit = .FALSE.
+      IF (keyed) THEN
+        IF (h_get(tc, key, i0, isym, tr)) THEN
+          IF (g0_of(cxk(:, i0), xt, isym, tr, g0)) hit = map_ok(cngw(i0), cmill(:, :, i0), ik, isym, tr, g0)
+        ENDIF
+      ENDIF
+      DO i1 = 1, nc
+        IF (hit) THEN
+          IF (i1 > 1) EXIT
+        ELSE
+          IF (keyed) EXIT     ! hashed: every image of every cached k is in tc
+          i0 = i1
+          IF (.NOT. find_op(cxk(:, i0), xt, isym, tr, g0)) CYCLE
+          IF (.NOT. map_ok(cngw(i0), cmill(:, :, i0), ik, isym, tr, g0)) CYCLE
+        ENDIF
         CALL rotate(cngw(i0), cmill(:, 1:cngw(i0), i0), cxk(:, i0), cwfc(:, :, i0), ik, isym, tr, g0, evc)
         et(1:nbnd, ik) = ce(1:nbnd, i0)
         IF (io_level > -1) CALL save_buffer(evc, nwordwfc, iunwfc, ik)
@@ -242,12 +374,28 @@ CONTAINS
       ENDDO
       ! 2) a rep earlier in this list
       IF (.NOT. found) THEN
-        DO jk = 1, ik - 1
-          IF (kind_(jk) /= 2) CYCLE
-          CALL kcryst(jk, xs)
-          IF (.NOT. find_op(xs, xt, isym, tr, g0)) CYCLE
-          mrep(:, 1:ngk(jk)) = mill(:, igk_k(1:ngk(jk), jk))
-          IF (.NOT. map_ok(ngk(jk), mrep, ik, isym, tr, g0)) CYCLE
+        hit = .FALSE.
+        IF (keyed) THEN
+          IF (h_get(tl, key, jk, isym, tr)) THEN
+            CALL kcryst(jk, xs)
+            IF (g0_of(xs, xt, isym, tr, g0)) THEN
+              mrep(:, 1:ngk(jk)) = mill(:, igk_k(1:ngk(jk), jk))
+              hit = map_ok(ngk(jk), mrep, ik, isym, tr, g0)
+            ENDIF
+          ENDIF
+        ENDIF
+        DO j1 = 1, ik - 1
+          IF (hit) THEN
+            IF (j1 > 1) EXIT
+          ELSE
+            IF (keyed) EXIT
+            jk = j1
+            IF (kind_(jk) /= 2) CYCLE
+            CALL kcryst(jk, xs)
+            IF (.NOT. find_op(xs, xt, isym, tr, g0)) CYCLE
+            mrep(:, 1:ngk(jk)) = mill(:, igk_k(1:ngk(jk), jk))
+            IF (.NOT. map_ok(ngk(jk), mrep, ik, isym, tr, g0)) CYCLE
+          ENDIF
           kind_(ik) = 3; ksrc(ik) = jk; ksym(ik) = isym; ktr(ik) = tr; kg0(:, ik) = g0
           kskip(ik) = .TRUE.
           nrot_l = nrot_l + 1
@@ -258,11 +406,14 @@ CONTAINS
       IF (.NOT. found) THEN
         kind_(ik) = 2
         nrep = nrep + 1
+        CALL h_images(tl, xt, ik)
       ENDIF
       CALL pos_set(ik, 0)
     ENDDO
     DEALLOCATE(mrep)
     !$acc update device(et)
+    CALL SYSTEM_CLOCK(c1)
+    t_plan = t_plan + REAL(c1 - c0, DP) / REAL(cr, DP)
     CALL stop_clock('nscf_symrot')
   END SUBROUTINE symrot_plan
   !
@@ -283,7 +434,9 @@ CONTAINS
     INTEGER, ALLOCATABLE :: slot(:)
     REAL(DP) :: xs(3)
     !
+    INTEGER(8) :: c0, c1, cr
     CALL start_clock('nscf_symrot')
+    CALL SYSTEM_CLOCK(c0, cr)
     IF (io_level <= -1) CALL errore('symrot_after_solve', 'RTSC_NSCF_SYMROT needs the wfc buffer (io_level > -1)', 1)
     ALLOCATE(slot(nks))
     slot = 0
@@ -301,6 +454,7 @@ CONTAINS
       cwfc(1:ngk(ik), 1:nbnd, nc) = evc(1:ngk(ik), 1:nbnd)
       ce(1:nbnd, nc) = et(1:nbnd, ik)
       slot(ik) = nc
+      CALL h_images(tc, cxk(:, nc), nc)
     ENDDO
     ! rotate the waiting k-points
     DO ik = 1, nks
@@ -325,8 +479,11 @@ CONTAINS
     !$acc update device(et)
     tot_rot = tot_rot + nrot_c + nrot_l - nfb
     tot_dav = tot_dav + nrep + nfb
+    CALL SYSTEM_CLOCK(c1)
+    t_after = t_after + REAL(c1 - c0, DP) / REAL(cr, DP)
     WRITE(stdout, '(5x,"rtsc nscf symrot: ",I0," k rotated from the cache, ",I0," from reps of this list, ",I0, &
-         &" reps diagonalized, ",I0," fallbacks; cache ",I0," k")') nrot_c, nrot_l - nfb, nrep, nfb, nc
+         &" reps diagonalized, ",I0," fallbacks; cache ",I0," k; time plan+rotate ",F8.3," s, cache+rotate ",F8.3, &
+         &" s (cumulative)")') nrot_c, nrot_l - nfb, nrep, nfb, nc, t_plan, t_after
     CALL stop_clock('nscf_symrot')
   END SUBROUTINE symrot_after_solve
   !
