@@ -26,6 +26,7 @@ MODULE sth_engine
   USE cudafor
   USE cufft
   USE cublas_v2
+  USE sth_pfft, ONLY : pfft_setup, pfft_free, pfft_local, pfft_ok, pfft_info
   IMPLICIT NONE
   PRIVATE
   !
@@ -67,6 +68,11 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_debug_slot = 0      ! >0: print the CG history of this slot
   INTEGER, PUBLIC, SAVE :: sth_opvar = 0           ! testing: 1 = (g2 - e) x + Vx (same operator, other rounding)
   INTEGER, PUBLIC, SAVE :: sth_rb = 128            ! threads per column reduction (power of 2, <= 256)
+  ! pruned fused local operator (rtsc/sth/sth_pfft.f90; KERNEL-LOG lever 1), set before setup (per q).
+  ! sth_pfft_check: at the first operator application of each q, run the cuFFT path too and print the
+  ! difference of the local part (diagnostic; costs one extra application).
+  LOGICAL, PUBLIC, SAVE :: sth_pfft_req = .FALSE., sth_pfft_check = .FALSE.
+  LOGICAL, SAVE :: pfft_checked = .FALSE.
   !
   LOGICAL, SAVE :: ready = .FALSE., staged = .FALSE., qready = .FALSE.
   INTEGER, SAVE :: nksq, npwx, nbnd, nkb, npert, nslot, nproj, nsl, ngrp, nnr, nvalid, nbox
@@ -1373,31 +1379,70 @@ CONTAINS
     INTEGER, INTENT(IN) :: nl
     INTEGER :: s0, nb, ip, np
     REAL(dp) :: scale
+    LOGICAL :: use_p
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     CALL gemm_proj(x, d_cf)
     CALL k_coef_h<<<nsl, 32 * ((nproj + 31) / 32), 0, strm>>>(d_cf2, d_cf, d_dmat, nproj, nkb, nslot, &
          npert, nksq, d_nockq, alpha_pv)
     CALL kerr('coef_h')
-    s0 = 0
-    DO WHILE (s0 < nl)
-      nb = MIN(sth_bmax, nl - s0)
-      ip = plan_for(nb)
-      nb = 2**ip
-      np = 2**ip
-      CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, x, list, s0, nnr, npwx, &
-           nslot, npert, nksq, d_inv)
-      CALL kerr('scatter')
-      CALL fft_exec(ip, d_box, CUFFT_INVERSE)
-      CALL k_vmul<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_vrs, nnr)
-      CALL kerr('vmul')
-      CALL fft_exec(ip, d_box, CUFFT_FORWARD)
-      CALL k_gather_h<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(y, x, d_box, list, s0, nnr, npwx, &
-           nslot, npert, nksq, nbnd, d_npwq, d_idxkq, d_g2, d_etk, scale, sth_opvar)
-      CALL kerr('gather_h')
-      s0 = s0 + nb
-    ENDDO
+    use_p = pfft_ok() .AND. sth_opvar == 0
+    IF (.NOT. use_p .OR. (sth_pfft_check .AND. .NOT. pfft_checked)) THEN
+      s0 = 0
+      DO WHILE (s0 < nl)
+        nb = MIN(sth_bmax, nl - s0)
+        ip = plan_for(nb)
+        nb = 2**ip
+        np = 2**ip
+        CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, x, list, s0, nnr, npwx, &
+             nslot, npert, nksq, d_inv)
+        CALL kerr('scatter')
+        CALL fft_exec(ip, d_box, CUFFT_INVERSE)
+        CALL k_vmul<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_vrs, nnr)
+        CALL kerr('vmul')
+        CALL fft_exec(ip, d_box, CUFFT_FORWARD)
+        CALL k_gather_h<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(y, x, d_box, list, s0, nnr, npwx, &
+             nslot, npert, nksq, nbnd, d_npwq, d_idxkq, d_g2, d_etk, scale, sth_opvar)
+        CALL kerr('gather_h')
+        s0 = s0 + nb
+      ENDDO
+    ENDIF
+    IF (use_p) THEN
+      IF (sth_pfft_check .AND. .NOT. pfft_checked) CALL pfft_compare(x, y, list, nl, scale)
+      CALL pfft_local(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+    ENDIF
     CALL gemm_back(d_cf2, y, (1.0_dp, 0.0_dp))
   END SUBROUTINE apply_op
+  !
+  SUBROUTINE pfft_compare(x, y, list, nl, scale)
+    ! diagnostic (RTSC_STH_PFFT_CHECK=1): y holds the cuFFT local part on list(1:nl); compute the
+    ! pruned one into a scratch array and print the difference over those columns
+    COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
+    INTEGER, DEVICE :: list(*)
+    INTEGER, INTENT(IN) :: nl
+    REAL(dp), INTENT(IN) :: scale
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: yp(:,:)
+    COMPLEX(dp), ALLOCATABLE :: a(:,:), b(:,:)
+    INTEGER, ALLOCATABLE :: hl(:)
+    INTEGER :: i, c
+    REAL(dp) :: dmax, ymax, d2, y2
+    ALLOCATE(yp(npwx, nsl), a(npwx, nsl), b(npwx, nsl), hl(nl))
+    CALL tsync()
+    CALL pfft_local(x, yp, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+    CALL tsync()
+    a = y(:, 1:nsl)
+    b = yp
+    hl = list(1:nl)
+    dmax = 0; ymax = 0; d2 = 0; y2 = 0
+    DO i = 1, nl
+      c = hl(i)
+      dmax = MAX(dmax, MAXVAL(ABS(a(:, c) - b(:, c)))); ymax = MAX(ymax, MAXVAL(ABS(a(:, c))))
+      d2 = d2 + SUM(ABS(a(:, c) - b(:, c))**2); y2 = y2 + SUM(ABS(a(:, c))**2)
+    ENDDO
+    WRITE(*, '(A,I8,A,ES10.3,A,ES10.3)') '     rtsc pfft check: columns', nl, ', max|dy|/max|y| ', dmax / ymax, &
+         ', rel L2 ', SQRT(d2 / MAX(y2, TINY(1.0_dp)))
+    DEALLOCATE(yp, a, b, hl)
+    pfft_checked = .TRUE.
+  END SUBROUTINE pfft_compare
   !
   !=================================================================================================
   ! public API
@@ -1646,6 +1691,20 @@ CONTAINS
       DEALLOCATE(d_evc)
     ENDIF
     DEALLOCATE(h_evc, h_W)
+    pfft_checked = .FALSE.
+    IF (sth_pfft_req) THEN
+      BLOCK
+        INTEGER :: ier, ns_, nx_, pc_
+        CALL pfft_setup(nr, nrx, nksq, npwx, h_npwq, h_idxkq, 1024, ier)
+        IF (ier == 0) THEN
+          CALL pfft_info(ns_, nx_, pc_)
+          WRITE(*, '(A,I6,A,F6.3,A,I4,A,I5)') '     rtsc pfft: on, sticks', ns_, ' (', &
+               REAL(ns_) / REAL(nr(1) * nr(2)), ' of the z-columns), occupied x-columns', nx_, ', chunk', pc_
+        ELSE
+          WRITE(*, '(A,I3,A)') '     rtsc pfft: unsupported grid/box (', ier, '), cuFFT path kept'
+        ENDIF
+      END BLOCK
+    ENDIF
     istat = cudaDeviceSynchronize()
     CALL chk(istat, 'setup')
     qready = .TRUE.
@@ -2033,6 +2092,7 @@ CONTAINS
     IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
     IF (ALLOCATED(s_W)) DEALLOCATE(s_W, s_hd, s_g2, s_vrs, s_dmat, s_box)
     mp_q = .FALSE.
+    CALL pfft_free()
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
   !

@@ -383,7 +383,7 @@ CONTAINS
     USE eqv,              ONLY : dpsi, dvpsi, evq
     USE sth_engine,       ONLY : sth_engine_init, sth_engine_set_global, sth_engine_set_k, &
                                  sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup, &
-                                 sth_mp, sth_mp_eta, sth_mp_safe
+                                 sth_mp, sth_mp_eta, sth_mp_safe, sth_pfft_req, sth_pfft_check
     !
     LOGICAL, INTENT(IN) :: first_iter
     INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
@@ -399,6 +399,8 @@ CONTAINS
     CALL start_clock('sth_init')
     ! mixed precision (per q; the FP32 copies are built by sth_engine_setup)
     sth_mp = sth_env_flag('RTSC_STH_MP')
+    sth_pfft_req = sth_env_flag('RTSC_STH_PFFT')
+    sth_pfft_check = sth_env_flag('RTSC_STH_PFFT_CHECK')
     CALL env_real('RTSC_MP_ETA', sth_mp_eta)
     CALL env_real('RTSC_MP_SAFE', sth_mp_safe)
     nslot = 0
