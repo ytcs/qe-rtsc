@@ -1534,6 +1534,60 @@ CONTAINS
     mem_hw = 0
   END SUBROUTINE sth_mem_take_hw
   !
+  SUBROUTINE sth_mem_log(tag)
+    !! rtsc b2 (RTSC_STH_MEMLOG=1; read-only): the engine's device arrays by component (GiB, from their
+    !! allocated sizes), the driver's in-use total and the high-water so far. Used for the CBSR-B2 memory desk.
+    CHARACTER(LEN=*), INTENT(IN) :: tag
+    INTEGER(8) :: freeb, totb, bw, bev, bps, bbx, bhd, bix, binv, bkq, bg2, bnl, bcol, bcf, bpsx, bdv, bxp, bsp, bcb, bsum
+    INTEGER :: istat, ios
+    CHARACTER(LEN=8) :: sv
+    LOGICAL, SAVE :: first = .TRUE., on = .FALSE.
+    REAL(dp), PARAMETER :: g = 1024.0_dp**3
+    IF (first) THEN
+      CALL get_environment_variable('RTSC_STH_MEMLOG', sv, STATUS=ios)
+      on = ios == 0 .AND. TRIM(sv) == '1'
+      first = .FALSE.
+    ENDIF
+    IF (.NOT. on) RETURN
+    istat = cudaMemGetInfo(freeb, totb)
+    bw = 0; bev = 0; bps = 0; bbx = 0; bhd = 0; bix = 0; binv = 0; bkq = 0; bg2 = 0; bnl = 0
+    bcol = 0; bcf = 0; bpsx = 0; bdv = 0; bxp = 0; bsp = 0; bcb = 0
+    IF (ALLOCATED(d_W)) bw = 16_8 * SIZE(d_W, KIND=8)
+    IF (ALLOCATED(d_evc)) bev = 16_8 * SIZE(d_evc, KIND=8)
+    IF (ALLOCATED(d_psir)) bps = 16_8 * SIZE(d_psir, KIND=8)
+    IF (ALLOCATED(d_box)) bbx = bbx + 16_8 * SIZE(d_box, KIND=8)
+    IF (ALLOCATED(d_box2)) bbx = bbx + 16_8 * SIZE(d_box2, KIND=8)
+    IF (ALLOCATED(d_hd)) bhd = 8_8 * SIZE(d_hd, KIND=8)
+    IF (ALLOCATED(d_wwg)) bhd = bhd + 8_8 * SIZE(d_wwg, KIND=8)
+    IF (ALLOCATED(d_idxk)) bix = 4_8 * (SIZE(d_idxk, KIND=8) + SIZE(d_idxkq, KIND=8))
+    IF (ALLOCATED(d_inv)) binv = 4_8 * SIZE(d_inv, KIND=8)
+    IF (ALLOCATED(d_kqgq)) bkq = 8_8 * SIZE(d_kqgq, KIND=8)
+    IF (ALLOCATED(d_g2)) bg2 = 8_8 * SIZE(d_g2, KIND=8)
+    IF (ALLOCATED(d_db)) bnl = 16_8 * (SIZE(d_db, KIND=8) + SIZE(d_da, KIND=8))
+    IF (ALLOCATED(d_dvb)) bcol = 16_8 * (SIZE(d_dvb, KIND=8) + SIZE(d_d0, KIND=8) + SIZE(d_dpsi, KIND=8) &
+                                         + SIZE(d_g, KIND=8) + SIZE(d_h, KIND=8) + SIZE(d_t, KIND=8))
+    IF (ALLOCATED(d_cf)) bcf = 16_8 * (SIZE(d_cf, KIND=8) + SIZE(d_cf2, KIND=8))
+    IF (ALLOCATED(d_ps)) bpsx = 16_8 * SIZE(d_ps, KIND=8)
+    IF (ALLOCATED(d_dv)) bdv = 16_8 * (SIZE(d_dv, KIND=8) + SIZE(d_drho, KIND=8))
+    IF (ALLOCATED(d_xp)) bxp = 16_8 * SIZE(d_xp, KIND=8)
+    IF (ALLOCATED(s_W)) bsp = 8_8 * (SIZE(s_W, KIND=8) + SIZE(s_box, KIND=8)) + 4_8 * (SIZE(s_hd, KIND=8) + SIZE(s_g2, KIND=8))
+    IF (ALLOCATED(s_e)) bsp = bsp + 8_8 * (SIZE(s_e, KIND=8) + SIZE(s_g, KIND=8) + SIZE(s_h, KIND=8) + SIZE(s_t, KIND=8) &
+                                           + SIZE(s_cf, KIND=8) + SIZE(s_cf2, KIND=8))
+    IF (ALLOCATED(d_cu)) bcb = 16_8 * SIZE(d_cu, KIND=8)
+    IF (ALLOCATED(d_cc)) bcb = bcb + 16_8 * SIZE(d_cc, KIND=8)
+    IF (ALLOCATED(d_clam)) bcb = bcb + 8_8 * SIZE(d_clam, KIND=8)
+    bsum = bw + bev + bps + bbx + bhd + bix + binv + bkq + bg2 + bnl + bcol + bcf + bpsx + bdv + bxp + bsp + bcb
+    WRITE(*, '(A,A,A,8I8)') '     rtsc memlog ', tag, ' dims npwx nslot npert nksq nnr nproj nbnd bmax:', &
+         npwx, nslot, npert, nksq, nnr, nproj, nbnd, sth_bmax
+    WRITE(*, '(A,A,A,3F8.3)') '     rtsc memlog ', tag, ' GiB used hw engine_sum:', &
+         REAL(totb - freeb, dp) / g, REAL(MAX(mem_hw, totb - freeb), dp) / g, REAL(bsum, dp) / g
+    WRITE(*, '(A,A,A,17F8.3)') '     rtsc memlog ', tag, &
+         ' GiB W evc psir box hd+wwg idx inv kqg g2 db+da cols6 cf+cf2 ps dv+drho xp fp32 cbsr:', &
+         REAL(bw, dp) / g, REAL(bev, dp) / g, REAL(bps, dp) / g, REAL(bbx, dp) / g, REAL(bhd, dp) / g, REAL(bix, dp) / g, &
+         REAL(binv, dp) / g, REAL(bkq, dp) / g, REAL(bg2, dp) / g, REAL(bnl, dp) / g, REAL(bcol, dp) / g, REAL(bcf, dp) / g, &
+         REAL(bpsx, dp) / g, REAL(bdv, dp) / g, REAL(bxp, dp) / g, REAL(bsp, dp) / g, REAL(bcb, dp) / g
+  END SUBROUTINE sth_mem_log
+  !
   REAL(dp) FUNCTION wtime()
     INTEGER(8) :: c, r
     CALL SYSTEM_CLOCK(c, r)
@@ -3561,6 +3615,7 @@ CONTAINS
     ax_valid = .FALSE.
     CALL tsync()
     CALL sth_mem_sample()
+    CALL sth_mem_log('commit')
     IF (sth_timing) sth_t_commit(4) = wtime() - t0
     ready = .TRUE.
   END SUBROUTINE sth_engine_irrep_commit
