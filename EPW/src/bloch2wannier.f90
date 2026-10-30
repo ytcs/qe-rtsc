@@ -1566,7 +1566,7 @@
     USE kinds,         ONLY : DP
     USE cell_base,     ONLY : at, bg, alat
     USE global_var,    ONLY : epmatwp, irg_start, irg_stop, irn_start, irn_stop
-    USE ep_constants,  ONLY : bohr2ang, twopi, ci, czero
+    USE ep_constants,  ONLY : bohr2ang, twopi, ci, czero, cone
     USE io_var,        ONLY : iuwanep, iuwane
     USE mp,            ONLY : mp_max
     USE mp_pools,      ONLY : inter_pool_comm
@@ -1627,6 +1627,12 @@
     INTEGER :: irn
     !! Global counter on the combined WS*mode index
 
+    INTEGER :: irg_lo, irg_hi
+    !! rtsc epw3: R_p range of one mode in this pool (RTSC_EPW_B2W)
+    INTEGER :: ld
+    !! rtsc epw3: leading dimension of epmatwe / epmatwp per mode slab
+    COMPLEX(KIND = DP), ALLOCATABLE :: cf(:, :)
+    !! rtsc epw3: e^{-i q R_p} / nq
     INTEGER :: imode
     !! Phonon mode index
     CHARACTER(LEN = 256) :: fnm
@@ -1645,6 +1651,28 @@
     !
     epmatwp = czero
     !
+    ! rtsc epw3 (RTSC_EPW_B2W=1): for each mode, the pool's R_p range in one ZGEMM over q,
+    ! epmatwp(:, :, :, imode, irg_lo:irg_hi) = epmatwe(:, :, :, imode, :) x cf(:, irg_lo:irg_hi)
+    IF (b2w_gemm()) THEN
+      ALLOCATE(cf(nq, irg_start:irg_stop))
+      DO irg = irg_start, irg_stop
+        DO iq = 1, nq
+          rdotk = twopi * DOT_PRODUCT(xk(:, iq), DBLE(irvec_g(:, irg)))
+          cf(iq, irg) = EXP(-ci * rdotk) / DBLE(nq)
+        ENDDO
+      ENDDO
+      ld = nbnd * nbnd * nrr_k * nmodes
+      DO imode = 1, nmodes
+        ! irg with (irg - 1) * nmodes + imode in [irn_start, irn_stop]
+        IF (irn_stop < imode) CYCLE
+        irg_lo = (irn_start - imode + nmodes - 1) / nmodes + 1
+        irg_hi = (irn_stop - imode) / nmodes + 1
+        IF (irg_hi < irg_lo) CYCLE
+        CALL ZGEMM('n', 'n', nbnd * nbnd * nrr_k, irg_hi - irg_lo + 1, nq, cone, epmatwe(1, 1, 1, imode, 1), ld, &
+                   cf(1, irg_lo), nq, czero, epmatwp(1, 1, 1, imode, irg_lo - irg_start + 1), ld)
+      ENDDO
+      DEALLOCATE(cf)
+    ELSE
     DO irn = irn_start, irn_stop
       !
       irg = (irn - 1) / nmodes + 1
@@ -1660,6 +1688,7 @@
         !
       ENDDO
     ENDDO
+    ENDIF ! rtsc epw3
     !
     tmp = 0.0_DP
     !

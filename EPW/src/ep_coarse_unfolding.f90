@@ -76,7 +76,7 @@
   USE kfold,         ONLY : createkmap_pw2, createkmap
   USE low_lvl,       ONLY : set_ndnmbr, eqvect_strict, copy_sym_epw, fix_sym
   USE ph_restart,    ONLY : read_disp_pattern_only
-  USE io,            ONLY : read_ifc_epw, readgmap, dynmat_asr, loadumat, readdnsbare
+  USE io,            ONLY : read_ifc_epw, readgmap, dynmat_asr, loadumat, readdnsbare, rtsc_nowrite
   USE parallelism,   ONLY : poolgather
   USE symmetry,      ONLY : rotate_epmat, rotate_eigenm, star_q2, gmap_sym, &
                             setup_rotate_wavefunction, write_qmap,          &
@@ -1339,7 +1339,8 @@
         WRITE(stdout, '(/5x, "The .epb files have been correctly read"/)')
       ENDIF
       !
-      IF (epbwrite) THEN
+      ! rtsc epw3: RTSC_EPW_NOWRITE=1 skips the .epb restart files (never read in this run)
+      IF (epbwrite .AND. .NOT. rtsc_nowrite()) THEN
         OPEN(iuepb, FILE = tempfile, FORM = 'unformatted')
         WRITE(stdout, '(/5x, "Writing epmatq on .epb files"/)')
         WRITE(iuepb) nqc, xqc, et_loc, dynq, epmatq, zstar, epsi
