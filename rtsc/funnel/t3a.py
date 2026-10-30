@@ -44,7 +44,7 @@ def main(jobs, jid, root, nt="8", ne="8"):
     W = Path(root) / jid
     W.mkdir(parents=True, exist_ok=True)
     os.chdir(W)
-    st0 = qe.canonical(qe.from_pmg(job["structure"]))   # G4(a): wrapped into [0,1), sites sorted by Z
+    st0 = qe.canonical(job["st"] if "st" in job else qe.from_pmg(job["structure"]))   # G4(a): wrapped into [0,1), sites sorted by Z
     res = dict(id=jid, Ttarget=job.get("Ttarget"), stages={}, nat=len(st0["species"]), generator="G1G2")
     tsv = open("timings.tsv", "a")
 
@@ -64,8 +64,9 @@ def main(jobs, jid, root, nt="8", ne="8"):
     mpi = ["mpirun", "--bind-to", "none", "-np", "1", "-x", "OMP_NUM_THREADS", "-x", "RTSC_STH", "-x", "RTSC_STRICT",
            "-x", "RTSC_STH_MP"]
     omp = {"OMP_NUM_THREADS": nt, "RTSC_STH": "0", "RTSC_STRICT": "0", "RTSC_STH_MP": "0"}
-    ecut = qe.ecut_rule(st0["species"])
-    g = qe.t3a_grids(st0)
+    ecut = job.get("ecut") or qe.ecut_rule(st0["species"])
+    nq_over = job.get("nq")          # study override (task 4: q 3^3); the generator rule is qe.t3a_grids
+    g = qe.t3a_grids(st0, nq=nq_over)
     res["grids"] = dict(g, ecut=ecut)
     prefix = "x"
     done = {}
@@ -81,7 +82,7 @@ def main(jobs, jid, root, nt="8", ne="8"):
         xn = qe.read_xml(f"{prefix}.save/data-file-schema.xml")
         st = xn["structure"]
         res["relaxed"] = st
-        g = qe.t3a_grids(st)
+        g = qe.t3a_grids(st, nq=nq_over)
         res["grids"] = dict(g, ecut=ecut)
         import re
         ef = float(re.findall(r"the Fermi energy is\s+(-?[\d.]+) ev", Path("scf.out").read_text())[-1])
@@ -91,6 +92,8 @@ def main(jobs, jid, root, nt="8", ne="8"):
                                                    Path("ph.out").read_text())]
         res["omega_min_cm"] = min(freqs) if freqs else None
         return epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job)
+    if job.get("no_relax"):          # study override: the structure is already the T3a-relaxed cell
+        return after_relax(res, st0, ecut, nq_over, prefix, ne, stage, finish, job, mpi, omp)
     # 1. relax (fixed-symmetry vc-relax at the target pressure)
     Path("relax.in").write_text(qe.pw_input(st0, "vc-relax", prefix, g["k"], ecut, pseudo=PSEUDO,
                                             press=job.get("press_kbar"), conv="1.0d-8"))
@@ -102,11 +105,15 @@ def main(jobs, jid, root, nt="8", ne="8"):
     if rc != 0 and "bfgs converged" not in Path("relax.out").read_text():
         res["relax_note"] = "not converged; continuing from last geometry"
     st = qe.canonical(x["structure"])   # G4(a): the relax does not wrap; re-canonicalise before scf/ph/nscf
+    return after_relax(res, st, ecut, nq_over, prefix, ne, stage, finish, job, mpi, omp)
+
+
+def after_relax(res, st, ecut, nq_over, prefix, ne, stage, finish, job, mpi, omp):
     res["relaxed"] = st
     shutil.rmtree(f"{prefix}.save", ignore_errors=True)
     for f in Path(".").glob(f"{prefix}.wfc*"):
         f.unlink()
-    g = qe.t3a_grids(st)      # grids from the relaxed cell
+    g = qe.t3a_grids(st, nq=nq_over)      # grids from the relaxed cell
     res["grids"] = dict(g, ecut=ecut)
     # 2. scf
     Path("scf.in").write_text(qe.pw_input(st, "scf", prefix, g["k"], ecut, pseudo=PSEUDO))
@@ -235,7 +242,7 @@ def epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job):
         cwd = os.getcwd()
         os.chdir(k3)
         nb = len(xn["eig"][0])
-        Path("nscf.in").write_text(qe.pw_input(st, "nscf", prefix, None, qe.ecut_rule(st["species"]), pseudo=PSEUDO,
+        Path("nscf.in").write_text(qe.pw_input(st, "nscf", prefix, None, res["grids"]["ecut"], pseudo=PSEUDO,
                                                nbnd=nb, kblock=qe.kfull(nk3)))
         mpi = ["mpirun", "--bind-to", "none", "-np", "1", "-x", "OMP_NUM_THREADS"]
         rc = stage("nscf_k3", mpi + [f"{BIN}/pw.x", "-in", "nscf.in"], "nscf.out",

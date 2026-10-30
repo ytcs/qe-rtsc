@@ -309,10 +309,10 @@ def epw_input(prefix, species, nk, nq, nkf, nqf, nsemi, nw, froz, ef, scdm=False
     return "&inputepw\n" + "".join(f"  {x}\n" for x in lines) + "/\n"
 
 
-def t3a_grids(st):
+def t3a_grids(st, nq=None):
     nat = len(st["species"])
     k = kgrid(st["lattice"], 0.20 if nat <= 4 else 0.27)
-    nq = 4 if nat == 1 else (3 if nat <= 4 else 2)
+    nq = nq or (4 if nat == 1 else (3 if nat <= 4 else 2))
     nk = 2 * nq   # G2 (FUNNEL.md section 7): Wannier/EPW coarse k = 2 q for every cell size (F0: k = q for 3-4 atoms).
     # G4(e) (W1) refines to 3 q inside t3a.epw_stage when the two Wannier setups disagree; W1 found 2 q unconverged for
     # sigma-band MgB2 (lambda 1.34 / 0.85 at 2q / 3q) and for H3S under use_ws (2.09 / 2.94).
