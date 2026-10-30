@@ -353,12 +353,19 @@ def wannier_eigs(rundir, kcrys):
 
 def band_check(rundir, x_nscf, nk, nsemi, ef, win=0.3):
     """G4(c) on-grid band check (no extra DFT): Wannier bands at the coarse nscf k (full nk^3 grid, as written by
-    kfull) against the nscf eigenvalues, within E_F +- win eV; two-sided nearest-level distance. Returns max meV."""
+    kfull) against the nscf eigenvalues, within E_F +- win eV; two-sided nearest-level distance. Returns max meV.
+    If no level falls in the window at any coarse k (small Fermi surface on a coarse grid), the window widens to
+    +- 1 eV; if still empty, returns inf (gate fails). W1: a vacuous 0 meV let plain-SCDM failures pass at nk 3-4.
+    Inside the frozen window the error is zero by construction: this is a SUBSPACE check (dropped Fermi-level states),
+    not an interpolation-quality check; interpolation error is handled by the two-setup S_W and k refinement."""
     pts = [(i / nk, j / nk, l / nk) for i in range(nk) for j in range(nk) for l in range(nk)]
     ew = wannier_eigs(rundir, pts)
     ed = np.array(x_nscf["eig"])[:, nsemi:]
-    dev = [0.0]
-    for i in range(len(pts)):
-        dev += [float(np.min(np.abs(ew[i] - d))) for d in ed[i][np.abs(ed[i] - ef) <= win]]
-        dev += [float(np.min(np.abs(ed[i] - e))) for e in ew[i][np.abs(ew[i] - ef) <= win]]
-    return 1000 * max(dev)
+    for w in (win, 1.0):
+        dev = []
+        for i in range(len(pts)):
+            dev += [float(np.min(np.abs(ew[i] - d))) for d in ed[i][np.abs(ed[i] - ef) <= w]]
+            dev += [float(np.min(np.abs(ed[i] - e))) for e in ew[i][np.abs(ew[i] - ef) <= w]]
+        if dev:
+            return 1000 * max(dev)
+    return float("inf")
