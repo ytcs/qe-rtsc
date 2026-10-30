@@ -46,7 +46,8 @@ MODULE sth_engine
             sth_engine_get_hdiag, sth_engine_set_hdiag, sth_engine_reset_dpsi, sth_engine_free, sth_engine_shutdown, &
             sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
             sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set, &
-            sth_engine_set_nlk, sth_engine_build_dvb, sth_engine_dvb_check
+            sth_engine_set_nlk, sth_engine_build_dvb, sth_engine_dvb_check, &
+            sth_engine_kqg_ready, sth_engine_set_kqg, sth_engine_set_wdev, sth_engine_wdev
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -184,6 +185,20 @@ MODULE sth_engine
   COMPLEX(dp), ALLOCATABLE, SAVE :: h_bp(:,:,:), h_al(:,:,:,:)
   COMPLEX(dp), DEVICE, ALLOCATABLE :: d_db(:,:,:), d_da(:,:,:,:)
   !
+  ! rtsc setup (groups/compute/SETUP-LOG.md; RTSC_STH_QCACHE=1, set before init, per q). Same values, less setup work:
+  ! - host stages h_dvb / h_dpsi0 allocated only when written (DVB on and a first iteration write neither: the device
+  !   arrays are zeroed instead of uploading zeros);
+  ! - the irrep work arrays kept across the irreps of one q when their shape (npert) is unchanged;
+  ! - the k+q+G table (npwx, 3, nksq) cached on the device per q (dvb_build, becs), if it fits (else per call);
+  ! - W (vkb at k+q, from the device; evq) and evc written straight into d_W / d_evc per k (no host h_W / h_evc),
+  !   and d_inv built on the device.
+  ! All of it is per-q state, freed by sth_engine_free at the q boundary.
+  LOGICAL, PUBLIC, SAVE :: sth_qcache = .FALSE.
+  LOGICAL, SAVE :: qc_q = .FALSE., kqg_q = .FALSE., wdev_q = .FALSE.
+  REAL(dp), DEVICE, ALLOCATABLE :: d_kqgq(:,:,:)
+  ! setup clocks (sth_timing): commit = free+trim+check, alloc, uploads, valid list + zeroing; dvb = local, nonlocal
+  REAL(dp), PUBLIC, SAVE :: sth_t_commit(4) = 0, sth_t_dvb(2) = 0
+  !
   LOGICAL, SAVE :: ready = .FALSE., staged = .FALSE., qready = .FALSE.
   INTEGER, SAVE :: nksq, npwx, nbnd, nkb, npert, nslot, nproj, nsl, ngrp, nnr, nvalid, nbox
   INTEGER, SAVE :: nr(3), nrx(3)
@@ -313,6 +328,27 @@ CONTAINS
       i = i + INT(blockDim%x, 8) * gridDim%x
     ENDDO
   END SUBROUTINE k_axpyc
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_izero(a, n)
+    INTEGER(8), VALUE :: n
+    INTEGER :: a(n)
+    INTEGER(8) :: i
+    i = (blockIdx%x - 1) * INT(blockDim%x, 8) + threadIdx%x
+    DO WHILE (i <= n)
+      a(i) = 0
+      i = i + INT(gridDim%x, 8) * blockDim%x
+    ENDDO
+  END SUBROUTINE k_izero
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_inv(inv, idxkq, npwq, nnr, npwx)
+    !! inv(idxkq(ig, k), k) = ig for ig <= npwq(k); one block row per k (blockIdx%y)
+    INTEGER, VALUE :: nnr, npwx
+    INTEGER :: inv(nnr, *), idxkq(npwx, *), npwq(*)
+    INTEGER :: ig, ik
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    ik = blockIdx%y
+    IF (ig <= npwq(ik)) inv(idxkq(ig, ik), ik) = ig
+  END SUBROUTINE k_inv
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_icopy(a, b, n)
     INTEGER, VALUE :: n
@@ -2041,10 +2077,31 @@ CONTAINS
     ALLOCATE(h_npw(nksq), h_npwq(nksq), h_nock(nksq), h_nockq(nksq), h_wk(nksq))
     ALLOCATE(h_idxk(npwx, nksq), h_idxkq(npwx, nksq), h_g2(npwx, nksq), h_etk(nbnd, nksq), h_etkq(nbnd, nksq))
     ALLOCATE(h_wwg(nbnd, nslot, nksq), h_wg1(nslot, nksq))
-    ALLOCATE(h_W(npwx, nproj, nksq), h_evc(npwx, nbox))
+    qc_q = sth_qcache
+    wdev_q = .FALSE.
+    IF (qc_q) THEN
+      ! W and evc straight into device memory (zeroed: rows > npw(q) and bands > nocc stay zero, as h_W / h_evc)
+      BLOCK
+        INTEGER(8) :: freeb, totb, pre
+        INTEGER :: istat
+        pre = 16_8 * npwx * nproj * nksq + 16_8 * npwx * nbox
+        CALL sth_mem_trim()
+        istat = cudaMemGetInfo(freeb, totb)
+        IF (pre <= freeb - 2_8 * 1024_8**3) THEN
+          ALLOCATE(d_W(npwx, nproj, nksq), d_evc(npwx, nbox))
+          CALL zero_c(d_W, INT(npwx, 8) * nproj * nksq)
+          CALL zero_c(d_evc, INT(npwx, 8) * nbox)
+          istat = cudaDeviceSynchronize()
+          wdev_q = .TRUE.
+        ENDIF
+      END BLOCK
+    ENDIF
+    IF (.NOT. wdev_q) THEN
+      ALLOCATE(h_W(npwx, nproj, nksq), h_evc(npwx, nbox))
+      h_W = (0.0_dp, 0.0_dp); h_evc = (0.0_dp, 0.0_dp)
+    ENDIF
     h_npw = 0; h_npwq = 0; h_nock = 0; h_nockq = 0; h_wk = 0
     h_idxk = 1; h_idxkq = 1; h_g2 = 0; h_etk = 0; h_wwg = 0; h_wg1 = 0; h_etkq = 0
-    h_W = (0.0_dp, 0.0_dp); h_evc = (0.0_dp, 0.0_dp)
     CALL irrep_stage(npert_)
     staged = .TRUE.
   END SUBROUTINE sth_engine_init
@@ -2079,12 +2136,36 @@ CONTAINS
     h_etk(:, ik) = et_k(:)
     h_wwg(:, 1:nock, ik) = wwg(:, 1:nock)
     h_wg1(1:nock, ik) = wg1(1:nock)
+    IF (wdev_q) THEN
+      ! QCACHE: vkb comes from the device (sth_engine_set_wdev); evq and evc are uploaded here
+      d_W(1:npwq, nkb + 1:nkb + nbnd, ik) = evq(1:npwq, 1:nbnd)
+      IF (nock > 0) d_evc(1:npw, nslot * (ik - 1) + 1:nslot * (ik - 1) + nock) = evc(1:npw, 1:nock)
+      RETURN
+    ENDIF
     h_W(1:npwq, 1:nkb, ik) = vkb(1:npwq, 1:nkb)
     h_W(1:npwq, nkb + 1:nkb + nbnd, ik) = evq(1:npwq, 1:nbnd)
     DO n = 1, nock
       h_evc(1:npw, n + nslot * (ik - 1)) = evc(1:npw, n)
     ENDDO
   END SUBROUTINE sth_engine_set_k
+  !
+  LOGICAL FUNCTION sth_engine_wdev()
+    !! QCACHE: does set_k expect vkb from the device (sth_engine_set_wdev) for this q?
+    sth_engine_wdev = wdev_q
+  END FUNCTION sth_engine_wdev
+  !
+  SUBROUTINE sth_engine_set_wdev(ik, npwq, vkb)
+    !! QCACHE: vkb at k+q (npwx, nkb), already on the device (init_us_2), copied into d_W device-to-device
+    INTEGER, INTENT(IN) :: ik, npwq
+    COMPLEX(dp), DEVICE, INTENT(IN) :: vkb(npwx, *)
+    INTEGER :: istat
+    IF (nkb < 1) RETURN
+    ! init_us_2 ran on an OpenACC queue; the next one overwrites vkb: synchronise on both sides
+    istat = cudaDeviceSynchronize()
+    istat = cudaMemcpy2D(d_W(1, 1, ik), npwx, vkb(1, 1), npwx, npwq, nkb, cudaMemcpyDeviceToDevice)
+    CALL chk(istat, 'cudaMemcpy2D (vkb -> W)')
+    istat = cudaDeviceSynchronize()
+  END SUBROUTINE sth_engine_set_wdev
   !
   INTEGER FUNCTION slot(n, ipert, ik)
     INTEGER, INTENT(IN) :: n, ipert, ik
@@ -2096,6 +2177,10 @@ CONTAINS
     INTEGER, INTENT(IN) :: ik, ipert
     COMPLEX(dp), INTENT(IN) :: dvbare(npwx, nbnd)
     INTEGER :: n, nq
+    IF (.NOT. ALLOCATED(h_dvb)) THEN
+      ALLOCATE(h_dvb(npwx, nsl))     ! QCACHE: staged on first use (always allocated by irrep_stage otherwise)
+      h_dvb = (0.0_dp, 0.0_dp)
+    ENDIF
     nq = h_npwq(ik)
     DO n = 1, h_nock(ik)
       h_dvb(1:nq, slot(n, ipert, ik)) = dvbare(1:nq, n)
@@ -2107,6 +2192,10 @@ CONTAINS
     INTEGER, INTENT(IN) :: ik, ipert
     COMPLEX(dp), INTENT(IN) :: dpsi(npwx, nbnd)
     INTEGER :: n, nq
+    IF (.NOT. ALLOCATED(h_dpsi0)) THEN
+      ALLOCATE(h_dpsi0(npwx, nsl))   ! QCACHE: staged on first use
+      h_dpsi0 = (0.0_dp, 0.0_dp)
+    ENDIF
     nq = h_npwq(ik)
     DO n = 1, h_nock(ik)
       h_dpsi0(1:nq, slot(n, ipert, ik)) = dpsi(1:nq, n)
@@ -2158,12 +2247,13 @@ CONTAINS
     !! kbat(nkb): atom of each projector; kqg(npwx, 3, nksq): k+q+G.
     INTEGER, INTENT(IN) :: nat3, kbat(nkb)
     COMPLEX(dp), INTENT(IN) :: dvl(nnr, npert), uq(nat3, npert)
-    REAL(dp), INTENT(IN) :: tpiba, kqg(npwx, 3, nksq)
+    REAL(dp), INTENT(IN) :: tpiba, kqg(npwx, 3, *)        ! (npwx, 3, nksq); not read when the per-q table is cached
     COMPLEX(dp), DEVICE, ALLOCATABLE :: d_u(:,:)
     INTEGER, DEVICE, ALLOCATABLE :: d_at(:)
     REAL(dp), DEVICE, ALLOCATABLE :: d_kqg(:,:,:)
     INTEGER :: istat, s0, nb, ip, a
-    REAL(dp) :: scale
+    REAL(dp) :: scale, t0
+    t0 = wtime()
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     IF (.NOT. dvb_q) CALL kerr('build_dvb without the per-q NL state (sth_dvb_req not set before init)')
     CALL zero_c(d_dvb, INT(npwx, 8) * nsl)
@@ -2195,11 +2285,17 @@ CONTAINS
       s0 = s0 + nb
     ENDDO
     IF (dp_on .AND. sth_fdxdp_check) CALL dp_compare(d_dvb, d_dvb, .TRUE., scale, 'dvb local')
+    IF (sth_timing) THEN
+      CALL tsync(); sth_t_dvb(1) = wtime() - t0; t0 = wtime()
+    ENDIF
     IF (nkb > 0) THEN
-      ALLOCATE(d_u(nat3, npert), d_at(nkb), d_kqg(npwx, 3, nksq))
+      ALLOCATE(d_u(nat3, npert), d_at(nkb))
       d_u = uq
       d_at = kbat
-      d_kqg = kqg
+      IF (.NOT. kqg_q) THEN
+        ALLOCATE(d_kqg(npwx, 3, nksq))
+        d_kqg = kqg(:, :, 1:nksq)
+      ENDIF
       istat = cudaDeviceSynchronize()
       ! dvb += vkb_kq ps1   (ps in d_cf, leading dimension nproj)
       CALL k_ps<<<nsl, 32 * ((nkb + 31) / 32), 0, strm>>>(d_cf, d_da, d_db, d_u, d_at, 0, nkb, nproj, nslot, &
@@ -2218,17 +2314,51 @@ CONTAINS
                 (1.0_dp, 0.0_dp), d_W, npwx, INT(npwx, 8) * nproj, d_cf, nproj, INT(nproj, 8) * nslot * npert, &
                 (0.0_dp, 0.0_dp), d_t, npwx, INT(npwx, 8) * nslot * npert, nksq)
         CALL chk(istat, 'cublasZgemmStridedBatched (dvb ps2)')
-        CALL k_kqg_axpy<<<4096, TPB, 0, strm>>>(d_dvb, d_t, d_kqg, a, npwx, nslot, npert, nksq, INT(npwx, 8) * nsl)
+        IF (kqg_q) THEN
+          CALL k_kqg_axpy<<<4096, TPB, 0, strm>>>(d_dvb, d_t, d_kqgq, a, npwx, nslot, npert, nksq, INT(npwx, 8) * nsl)
+        ELSE
+          CALL k_kqg_axpy<<<4096, TPB, 0, strm>>>(d_dvb, d_t, d_kqg, a, npwx, nslot, npert, nksq, INT(npwx, 8) * nsl)
+        ENDIF
         CALL kerr('kqg_axpy')
       ENDDO
       CALL tsync()
-      DEALLOCATE(d_u, d_at, d_kqg)
+      DEALLOCATE(d_u, d_at)
+      IF (ALLOCATED(d_kqg)) DEALLOCATE(d_kqg)
       ! the CG temporaries used here start from zero in the solve
       CALL zero_c(d_t, INT(npwx, 8) * nsl)
       CALL zero_c(d_cf, INT(nproj, 8) * nsl)
     ENDIF
     CALL tsync()
+    IF (sth_timing) sth_t_dvb(2) = wtime() - t0
   END SUBROUTINE sth_engine_build_dvb
+  !
+  LOGICAL FUNCTION sth_engine_kqg_ready()
+    !! QCACHE: is the per-q k+q+G table on the device?
+    sth_engine_kqg_ready = kqg_q
+  END FUNCTION sth_engine_kqg_ready
+  !
+  SUBROUTINE sth_engine_set_kqg(kqg)
+    !! QCACHE: keep the k+q+G table (npwx, 3, nksq) on the device for this q, if it fits with 1 GiB to spare
+    !! (RTSC_STH_QCACHE_NOKQG=1 forces the per-call path, to test the fallback)
+    REAL(dp), INTENT(IN) :: kqg(npwx, 3, nksq)
+    INTEGER(8) :: freeb, totb, need
+    INTEGER :: istat, ios
+    CHARACTER(LEN=8) :: sv
+    IF (.NOT. qc_q .OR. kqg_q) RETURN
+    CALL get_environment_variable('RTSC_STH_QCACHE_NOKQG', sv, STATUS=ios)
+    need = 8_8 * npwx * 3 * nksq
+    istat = cudaMemGetInfo(freeb, totb)
+    IF ((ios == 0 .AND. TRIM(sv) == '1') .OR. need > freeb - 1024_8**3) THEN
+      WRITE(*, '(A,F8.3,A,F8.2,A)') '     rtsc qcache: k+q+G table (', REAL(need) / 1024.0**3, &
+           ' GiB) not cached (free ', REAL(freeb) / 1024.0**3, ' GiB): built per call'
+      RETURN
+    ENDIF
+    ALLOCATE(d_kqgq(npwx, 3, nksq))
+    d_kqgq = kqg
+    istat = cudaDeviceSynchronize()
+    CALL sth_mem_sample()
+    kqg_q = .TRUE.
+  END SUBROUTINE sth_engine_set_kqg
   !
   SUBROUTINE sth_engine_dvb_check(ik, ipert, dvpsi, dmax, ymax)
     !! diagnostic: compare the device dV_bare psi of (k, pert) with vanilla's (npwx, nbnd); accumulates
@@ -2237,7 +2367,10 @@ CONTAINS
     COMPLEX(dp), INTENT(IN) :: dvpsi(npwx, *)
     REAL(dp), INTENT(INOUT) :: dmax, ymax
     INTEGER :: n, nq, s
-    IF (ik == 1 .AND. ipert == 1) h_dvb = d_dvb
+    IF (ik == 1 .AND. ipert == 1) THEN
+      IF (.NOT. ALLOCATED(h_dvb)) ALLOCATE(h_dvb(npwx, nsl))
+      h_dvb = d_dvb
+    ENDIF
     nq = h_npwq(ik)
     DO n = 1, h_nock(ik)
       s = slot(n, ipert, ik)
@@ -2280,6 +2413,9 @@ CONTAINS
     ! sth_mp: FP32 W, h_diag, g2kin, box (+ C2C plan work areas) and the irrep's FP32 column arrays
     IF (sth_mp) need = need + 8_8 * npwx * nproj * nksq + 4_8 * npwx * (nslot + 1) * nksq + 8_8 * nnr * sth_bmax * 3 &
                             + (8_8 * npwx * 4 + 16_8 * nproj + 12_8) * nsl
+    ! QCACHE: W and evc are already on the device (allocated at init): free memory is lower by exactly that, so
+    ! take it off the need too and every decision below is the same as with the host stage
+    IF (wdev_q) need = need - 16_8 * npwx * nproj * nksq - 16_8 * npwx * nbox
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
     BLOCK
@@ -2305,26 +2441,33 @@ CONTAINS
     IF (need > freeb - 1024_8**3) THEN
       WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
            REAL(freeb) / 1024.0**3, ' GiB'
+      IF (wdev_q) THEN
+        DEALLOCATE(d_W, d_evc)
+        wdev_q = .FALSE.
+      ENDIF
       ierr = 2
       RETURN
     ENDIF
     !
     ALLOCATE(d_npw(nksq), d_npwq(nksq), d_nock(nksq), d_nockq(nksq), d_idxk(npwx, nksq), d_idxkq(npwx, nksq))
     ALLOCATE(d_g2(npwx, nksq), d_etk(nbnd, nksq), d_hd(npwx, nslot, nksq), d_wwg(nbnd, nslot, nksq))
-    ALLOCATE(d_wg1(nslot, nksq), d_wgt(nksq), d_W(npwx, nproj, nksq))
+    ALLOCATE(d_wg1(nslot, nksq), d_wgt(nksq))
+    IF (.NOT. wdev_q) ALLOCATE(d_W(npwx, nproj, nksq))
     d_npw = h_npw; d_npwq = h_npwq; d_nock = h_nock; d_nockq = h_nockq
     d_idxk = h_idxk; d_idxkq = h_idxkq; d_g2 = h_g2; d_etk = h_etk; d_wwg = h_wwg; d_wg1 = h_wg1
     IF (ALLOCATED(d_etkq)) DEALLOCATE(d_etkq)
     ALLOCATE(d_etkq(nbnd, nksq))
     d_etkq = h_etkq
     d_wgt = 2.0_dp * h_wk / omega
-    d_W = h_W
+    IF (.NOT. wdev_q) d_W = h_W
     IF (sth_timing) THEN
       CALL tsync(); tq(1) = wtime()
     ENDIF
     ! rtsc amdahl: under RTSC_STH_FDXDP the FFT-index -> k+q map d_inv is used only by the box path (checks), so it
     ! is built after the fftdx decision, and only when that path can run (sth_fdxdp_req unset: unchanged order)
-    IF (.NOT. sth_fdxdp_req) THEN
+    IF (.NOT. sth_fdxdp_req .AND. qc_q) THEN
+      CALL inv_build()
+    ELSE IF (.NOT. sth_fdxdp_req) THEN
     BLOCK
       INTEGER, ALLOCATABLE :: hinv(:,:)
       INTEGER :: ig
@@ -2382,8 +2525,10 @@ CONTAINS
       CALL tsync(); tq(3) = wtime()
     ENDIF
     ! psi_k(r) for n <= nocc_k: scatter evc at k+G, inverse FFT in place (no cache: keep evc only)
-    ALLOCATE(d_evc(npwx, nbox))
-    d_evc = h_evc
+    IF (.NOT. wdev_q) THEN
+      ALLOCATE(d_evc(npwx, nbox))
+      d_evc = h_evc
+    ENDIF
     IF (psir_cached) THEN
       CALL zero_c(d_psir, INT(nnr, 8) * nbox)
       CALL k_scatter_evc<<<dim3(nblk(npwx, TPB), nbox, 1), TPB, 0, strm>>>(d_psir, d_evc, nnr, npwx, &
@@ -2403,7 +2548,8 @@ CONTAINS
       CALL tsync()
       DEALLOCATE(d_evc)
     ENDIF
-    DEALLOCATE(h_evc, h_W)
+    IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
+    IF (ALLOCATED(h_W)) DEALLOCATE(h_W)
     IF (sth_timing) THEN
       CALL tsync(); tq(4) = wtime()
     ENDIF
@@ -2432,7 +2578,9 @@ CONTAINS
     dp_on = fdx_on .AND. sth_fdxdp_req .AND. nnr == nr(1) * nr(2) * nr(3)
     IF (sth_fdxdp_req) THEN
       IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
-      IF (.NOT. dp_on .OR. sth_fdxdp_check .OR. sth_fftdx_check .OR. sth_pfft_check) THEN
+      IF ((.NOT. dp_on .OR. sth_fdxdp_check .OR. sth_fftdx_check .OR. sth_pfft_check) .AND. qc_q) THEN
+        CALL inv_build()
+      ELSE IF (.NOT. dp_on .OR. sth_fdxdp_check .OR. sth_fftdx_check .OR. sth_pfft_check) THEN
         BLOCK
           INTEGER, ALLOCATABLE :: hinv(:,:)
           INTEGER :: ig
@@ -2480,9 +2628,20 @@ CONTAINS
          tq(1) - tq(0), tq(2) - tq(1), tq(3) - tq(2), tq(4) - tq(3), tq(5) - tq(4), wtime() - tq(5), sth_t_setup
   END SUBROUTINE sth_engine_setup
   !
+  SUBROUTINE inv_build()
+    !! QCACHE: d_inv(idx_kq(ig, k), k) = ig on the device (the host loop of the default path, same integers)
+    IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+    ALLOCATE(d_inv(nnr, nksq))
+    CALL k_izero<<<4096, TPB, 0, strm>>>(d_inv, INT(nnr, 8) * nksq)
+    CALL kerr('izero (inv)')
+    CALL k_inv<<<dim3(nblk(npwx, TPB), nksq, 1), TPB, 0, strm>>>(d_inv, d_idxkq, d_npwq, nnr, npwx)
+    CALL kerr('inv')
+    CALL tsync()
+  END SUBROUTINE inv_build
+  !
   SUBROUTINE irrep_free()
     IF (ALLOCATED(d_xp)) DEALLOCATE(d_xp)
-    IF (ALLOCATED(h_dvb)) DEALLOCATE(h_dvb, h_dpsi0)
+    CALL irrep_free_stage()
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
@@ -2490,6 +2649,11 @@ CONTAINS
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
     CALL irrep_free_mp()
   END SUBROUTINE irrep_free
+  !
+  SUBROUTINE irrep_free_stage()
+    IF (ALLOCATED(h_dvb)) DEALLOCATE(h_dvb)
+    IF (ALLOCATED(h_dpsi0)) DEALLOCATE(h_dpsi0)
+  END SUBROUTINE irrep_free_stage
   !
   SUBROUTINE irrep_free_mp()
     IF (ALLOCATED(s_e)) DEALLOCATE(s_e, s_g, s_h, s_t, s_cf, s_cf2, d_tol, d_iconv, d_oact)
@@ -2501,15 +2665,19 @@ CONTAINS
     npert = npert_
     nsl = nslot * npert * nksq
     ngrp = npert * nksq
-    ALLOCATE(h_dvb(npwx, nsl), h_dpsi0(npwx, nsl))
-    h_dvb = (0.0_dp, 0.0_dp)
-    h_dpsi0 = (0.0_dp, 0.0_dp)
+    ! QCACHE: h_dvb / h_dpsi0 are allocated (zeroed) by their first set_* call; never, with DVB on a first iteration
+    IF (.NOT. qc_q) THEN
+      ALLOCATE(h_dvb(npwx, nsl), h_dpsi0(npwx, nsl))
+      h_dvb = (0.0_dp, 0.0_dp)
+      h_dpsi0 = (0.0_dp, 0.0_dp)
+    ENDIF
     have_dpsi0 = .FALSE.
   END SUBROUTINE irrep_stage
   !
   SUBROUTINE sth_engine_irrep(npert_, ierr)
     !! Start a new irrep on the per-q state already set up: keeps k/k+q data, W, h_diag, psi(r) and
     !! the plans; then set_dvbare (and set_dpsi for a warm start) and sth_engine_irrep_commit.
+    !! QCACHE: the irrep's device work arrays are kept here; the commit reuses them if npert is unchanged.
     INTEGER, INTENT(IN) :: npert_
     INTEGER, INTENT(OUT) :: ierr
     ierr = 0
@@ -2522,7 +2690,11 @@ CONTAINS
       ierr = 3
       RETURN
     ENDIF
-    CALL irrep_free()
+    IF (qc_q) THEN
+      CALL irrep_free_stage()
+    ELSE
+      CALL irrep_free()
+    ENDIF
     CALL irrep_stage(npert_)
   END SUBROUTINE sth_engine_irrep
   !
@@ -2531,7 +2703,17 @@ CONTAINS
     INTEGER, INTENT(OUT) :: ierr
     INTEGER :: istat, ik, n, ip
     INTEGER(8) :: need, freeb, totb
+    LOGICAL :: reuse
+    REAL(dp) :: t0, t1
+    t0 = wtime()
     ierr = 0
+    ! QCACHE: same shape as the previous irrep of this q -> keep its device arrays (no free / trim / cudaMalloc)
+    reuse = .FALSE.
+    IF (qc_q .AND. ALLOCATED(d_dvb) .AND. ALLOCATED(d_valid) .AND. ALLOCATED(h_dpsi)) THEN
+      reuse = SIZE(d_dvb, 2) == nsl .AND. SIZE(d_dv, 2) == npert .AND. (ALLOCATED(d_xp) .EQV. (sth_xp_m > 0)) &
+              .AND. (ALLOCATED(s_e) .EQV. mp_q)
+    ENDIF
+    IF (.NOT. reuse) THEN
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
                                      d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0, d_nst)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
@@ -2549,23 +2731,47 @@ CONTAINS
       ierr = 2
       RETURN
     ENDIF
+    IF (sth_timing) THEN
+      t1 = wtime(); sth_t_commit(1) = t1 - t0; t0 = t1
+    ENDIF
     ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
     ALLOCATE(d_t(npwx, nsl), d_cf(nproj, nsl), d_cf2(nproj, nsl), d_ps(nbnd, nsl))
     ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl), d_r0(nsl), d_nst(nsl))
     ALLOCATE(d_dv(nnr, npert), d_drho(nnr, npert))
     ALLOCATE(h_dpsi(npwx, nsl))
+    ELSE
+      IF (sth_timing) THEN
+        t1 = wtime(); sth_t_commit(1) = t1 - t0; t0 = t1
+      ENDIF
+    ENDIF
     h_dpsi_valid = .FALSE.
     xp_nc = 0
     xp_rec = 0
-    IF (sth_xp_m > 0) THEN
+    IF (sth_xp_m > 0 .AND. .NOT. reuse) THEN
       ALLOCATE(d_xp(npwx, nsl))
       IF (ALLOCATED(h_xh)) THEN
         IF (SIZE(h_xh, 1) /= npwx .OR. SIZE(h_xh, 2) /= nsl .OR. SIZE(h_xh, 3) /= sth_xp_m) DEALLOCATE(h_xh)
       ENDIF
       IF (.NOT. ALLOCATED(h_xh)) ALLOCATE(h_xh(npwx, nsl, sth_xp_m))
     ENDIF
-    d_dvb = h_dvb
-    d_dpsi = h_dpsi0
+    IF (sth_timing) THEN
+      istat = cudaDeviceSynchronize(); t1 = wtime(); sth_t_commit(2) = t1 - t0; t0 = t1
+    ENDIF
+    ! QCACHE: an unstaged array is all zeros: zero it on the device instead of uploading zeros (same values)
+    IF (ALLOCATED(h_dvb)) THEN
+      d_dvb = h_dvb
+    ELSE
+      CALL zero_c(d_dvb, INT(npwx, 8) * nsl)
+    ENDIF
+    IF (ALLOCATED(h_dpsi0)) THEN
+      d_dpsi = h_dpsi0
+    ELSE
+      CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
+    ENDIF
+    IF (sth_timing) THEN
+      istat = cudaDeviceSynchronize(); t1 = wtime(); sth_t_commit(3) = t1 - t0; t0 = t1
+    ENDIF
+    IF (.NOT. reuse) THEN
     ! valid slot list (k-major, then pert, then band)
     nvalid = 0
     DO ik = 1, nksq
@@ -2582,6 +2788,7 @@ CONTAINS
       ENDDO
     ENDDO
     d_valid = h_valid
+    ENDIF
     istat = cudaDeviceSynchronize()
     ! zero the work arrays (invalid slots must stay zero; stale values must be finite)
     CALL zero_c(d_d0, INT(npwx, 8) * nsl)
@@ -2591,8 +2798,10 @@ CONTAINS
     CALL zero_c(d_cf, INT(nproj, 8) * nsl)
     CALL zero_c(d_cf2, INT(nproj, 8) * nsl)
     IF (mp_q) THEN
-      ALLOCATE(s_e(npwx, nsl), s_g(npwx, nsl), s_h(npwx, nsl), s_t(npwx, nsl), s_cf(nproj, nsl), s_cf2(nproj, nsl))
-      ALLOCATE(d_tol(nsl), d_iconv(nsl), d_oact(nsl))
+      IF (.NOT. reuse) THEN
+        ALLOCATE(s_e(npwx, nsl), s_g(npwx, nsl), s_h(npwx, nsl), s_t(npwx, nsl), s_cf(nproj, nsl), s_cf2(nproj, nsl))
+        ALLOCATE(d_tol(nsl), d_iconv(nsl), d_oact(nsl))
+      ENDIF
       CALL zero_s(s_e, INT(npwx, 8) * nsl)
       CALL zero_s(s_g, INT(npwx, 8) * nsl)
       CALL zero_s(s_h, INT(npwx, 8) * nsl)
@@ -2605,12 +2814,17 @@ CONTAINS
     ax_valid = .FALSE.
     CALL tsync()
     CALL sth_mem_sample()
+    IF (sth_timing) sth_t_commit(4) = wtime() - t0
     ready = .TRUE.
   END SUBROUTINE sth_engine_irrep_commit
   !
   SUBROUTINE sth_engine_reset_dpsi()
     !! restore the staged warm start (for repeated timing runs of the same call)
-    d_dpsi = h_dpsi0
+    IF (ALLOCATED(h_dpsi0)) THEN
+      d_dpsi = h_dpsi0
+    ELSE
+      CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
+    ENDIF
     h_dpsi_valid = .FALSE.
     ax_valid = .FALSE.
   END SUBROUTINE sth_engine_reset_dpsi
@@ -2841,15 +3055,19 @@ CONTAINS
     !! For drhodv, after the last solve of the irrep: bec(:, n, p, k) = vkb_kq^H dpsi_(k,p,n) and
     !! alp(:, n, ipol, p, k) = vkb_kq^H [ (k+q+G)_ipol dpsi_(k,p,n) ], as calbec in drhodv (before its
     !! i tpiba scaling). Bands n > nocc_k are zero. kqg(npwx, 3, nksq): k+q+G (rows > npwq unused).
-    REAL(dp), INTENT(IN) :: kqg(npwx, 3, nksq)
+    REAL(dp), INTENT(IN) :: kqg(npwx, 3, *)      ! (npwx, 3, nksq); not read when the per-q table is cached
     COMPLEX(dp), INTENT(OUT) :: bec(nkb, nbnd, npert, nksq), alp(nkb, nbnd, 3, npert, nksq)
     REAL(dp), DEVICE, ALLOCATABLE :: d_kqg(:,:,:)
     COMPLEX(dp), DEVICE, ALLOCATABLE :: d_b(:,:,:)
     COMPLEX(dp), ALLOCATABLE :: hb(:,:,:)
     INTEGER :: istat, ipol, ik, ip, n, s
-    ALLOCATE(d_kqg(npwx, 3, nksq), d_b(nkb, nsl, 4), hb(nkb, nsl, 4))
+    IF (kqg_q) THEN
+      ALLOCATE(d_b(nkb, nsl, 4), hb(nkb, nsl, 4))
+    ELSE
+      ALLOCATE(d_kqg(npwx, 3, nksq), d_b(nkb, nsl, 4), hb(nkb, nsl, 4))
+    ENDIF
     CALL sth_mem_sample()
-    d_kqg = kqg
+    IF (.NOT. kqg_q) d_kqg = kqg(:, :, 1:nksq)
     istat = cudaDeviceSynchronize()
     DO ipol = 0, 3
       IF (ipol == 0) THEN
@@ -2857,8 +3075,13 @@ CONTAINS
                 (1.0_dp, 0.0_dp), d_W, npwx, INT(npwx, 8) * nproj, d_dpsi, npwx, INT(npwx, 8) * nslot * npert, &
                 (0.0_dp, 0.0_dp), d_b(1, 1, 1), nkb, INT(nkb, 8) * nslot * npert, nksq)
       ELSE
-        CALL k_kqg_scale<<<4096, TPB, 0, strm>>>(d_t, d_dpsi, d_kqg, ipol, npwx, nslot, npert, nksq, &
-             INT(npwx, 8) * nsl)
+        IF (kqg_q) THEN
+          CALL k_kqg_scale<<<4096, TPB, 0, strm>>>(d_t, d_dpsi, d_kqgq, ipol, npwx, nslot, npert, nksq, &
+               INT(npwx, 8) * nsl)
+        ELSE
+          CALL k_kqg_scale<<<4096, TPB, 0, strm>>>(d_t, d_dpsi, d_kqg, ipol, npwx, nslot, npert, nksq, &
+               INT(npwx, 8) * nsl)
+        ENDIF
         CALL kerr('kqg_scale')
         istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkb, nslot * npert, npwx, &
                 (1.0_dp, 0.0_dp), d_W, npwx, INT(npwx, 8) * nproj, d_t, npwx, INT(npwx, 8) * nslot * npert, &
@@ -2881,7 +3104,8 @@ CONTAINS
         ENDDO
       ENDDO
     ENDDO
-    DEALLOCATE(d_kqg, d_b, hb)
+    DEALLOCATE(d_b, hb)
+    IF (ALLOCATED(d_kqg)) DEALLOCATE(d_kqg)
   END SUBROUTINE sth_engine_becs
   !
   SUBROUTINE sth_engine_get_dpsi(ik, ipert, dpsi)
@@ -2929,7 +3153,11 @@ CONTAINS
     IF (ALLOCATED(h_W)) DEALLOCATE(h_W)
     IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
     IF (ALLOCATED(d_npw)) DEALLOCATE(d_npw, d_npwq, d_nock, d_nockq, d_idxk, d_idxkq, d_g2, d_etk, &
-                                     d_hd, d_wwg, d_wg1, d_wgt, d_W)
+                                     d_hd, d_wwg, d_wg1, d_wgt)
+    IF (ALLOCATED(d_W)) DEALLOCATE(d_W)
+    IF (ALLOCATED(d_kqgq)) DEALLOCATE(d_kqgq)
+    kqg_q = .FALSE.
+    wdev_q = .FALSE.
     IF (ALLOCATED(d_box)) DEALLOCATE(d_box)
     IF (ALLOCATED(d_psir)) DEALLOCATE(d_psir)
     IF (ALLOCATED(d_box2)) DEALLOCATE(d_box2)

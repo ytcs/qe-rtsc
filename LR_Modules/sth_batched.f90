@@ -22,6 +22,11 @@
 ! tolerance max(safe*thresh, eta*|r|) (defaults 1e-4, 0.5). With RTSC_STH_TIME=1 each call also
 ! prints its rounds and FP64 / FP32 column applications.
 !
+! RTSC_STH_QCACHE=1 (groups/compute/SETUP-LOG.md): less setup work for the same values. Per irrep: no host stage
+! of dV_bare psi / dpsi when nothing is staged, the device work arrays kept across irreps of one shape, the k+q+G
+! table built once per q on the device (dvb_build, becs). Per q: vkb at k+q copied device-to-device into the
+! engine (no update host), evq/evc uploaded per k (no host W stage), d_inv built on the device.
+!
 ! sth_batched_end_q (do_phonon, after each q) releases the per-q engine state and the device blocks
 ! the NVHPC runtime keeps after DEALLOCATE, and prints one line with the q's device-memory high-water.
 !
@@ -64,6 +69,7 @@ MODULE sth_batched
   INTEGER, SAVE :: xp_ncprint = 0
   ! relative stopping factor for the next call (set by dfpt_kernel: RTSC_STH_ETA on non-final iterations)
   REAL(DP), SAVE :: sth_call_eta = 0.d0
+  REAL(DP), SAVE :: t_kqg = 0.d0                     ! RTSC_STH_TIME: host k+q+G table of the last dvb_build
   !
 CONTAINS
   !
@@ -528,14 +534,7 @@ CONTAINS
     IF (.NOT. (eng_last .AND. have_state .AND. sth_engine_ready())) RETURN
     IF (nper /= st_npert .OR. nksq /= st_nksq) RETURN
     CALL start_clock('sth_becs')
-    ALLOCATE(kqg(npwx, 3, nksq))
-    kqg = 0.d0
-    DO ik = 1, nksq
-      ikq = ikqs(ik)
-      DO ig = 1, ngk(ikq)
-        kqg(ig, :, ik) = xk(:, ikq) + g(:, igk_k(ig, ikq))
-      ENDDO
-    ENDDO
+    CALL kqg_table(kqg)
     CALL sth_engine_becs(kqg, becq, alpq)
     DEALLOCATE(kqg)
     CALL stop_clock('sth_becs')
@@ -555,15 +554,19 @@ CONTAINS
     USE control_lr,       ONLY : nbnd_occ
     USE qpoint,           ONLY : nksq, ikks, ikqs
     USE eqv,              ONLY : dpsi, dvpsi
+    USE io_global,        ONLY : stdout
     USE sth_engine,       ONLY : sth_engine_irrep, sth_engine_set_dvbare, sth_engine_set_dpsi, &
-                                 sth_engine_irrep_commit
+                                 sth_engine_irrep_commit, sth_timing, sth_t_commit, sth_t_dvb
     LOGICAL, INTENT(IN) :: first_iter
     INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
     INTEGER, INTENT(OUT) :: ierr
     INTEGER :: ik, ipert, nrec, npwq, nock
+    INTEGER(8) :: c0, c1, c2, c3, crate
     CALL start_clock('sth_irrep')
+    CALL SYSTEM_CLOCK(c0, crate)
     CALL sth_engine_irrep(npert, ierr)
     IF (ierr /= 0) RETURN
+    CALL SYSTEM_CLOCK(c1)
     DO ik = 1, nksq
       npwq = ngk(ikqs(ik)); nock = nbnd_occ(ikks(ik))
       DO ipert = 1, npert
@@ -584,14 +587,27 @@ CONTAINS
         ENDIF
       ENDDO
     ENDDO
+    CALL SYSTEM_CLOCK(c2)
     CALL sth_engine_irrep_commit(ierr)
+    CALL SYSTEM_CLOCK(c3)
     IF (ierr == 0 .AND. dvb_on) CALL dvb_build(npert, lrdvpsi, iudvpsi)
+    IF (sth_timing) THEN
+      BLOCK
+        INTEGER(8) :: c4
+        CALL SYSTEM_CLOCK(c4)
+        WRITE(stdout, '(5x,"rtsc irrep t: engine_irrep ",F7.3," k-loop ",F7.3," commit ",F7.3," (free/check ",F6.3, &
+             &" alloc ",F6.3," upload ",F6.3," valid+zero ",F6.3,") dvb ",F7.3," (kqg ",F6.3," local ",F6.3," nl ",F6.3, &
+             &") total ",F7.3)') REAL(c1 - c0, DP) / crate, REAL(c2 - c1, DP) / crate, REAL(c3 - c2, DP) / crate, &
+             sth_t_commit, REAL(c4 - c3, DP) / crate, t_kqg, sth_t_dvb, REAL(c4 - c0, DP) / crate
+      END BLOCK
+    ENDIF
     CALL stop_clock('sth_irrep')
   END SUBROUTINE sth_batched_irrep
   !
   !--------------------------------------------------------------------------------------------
   SUBROUTINE sth_batched_init(first_iter, npert, lrdvpsi, iudvpsi, ierr)
     !--------------------------------------------------------------------------------------------
+    USE io_global,        ONLY : stdout
     USE fft_base,         ONLY : dffts
     USE ions_base,        ONLY : nat, ityp
     USE klist,            ONLY : xk, wk, ngk, igk_k, degauss, ngauss
@@ -613,7 +629,7 @@ CONTAINS
                                  sth_mp, sth_mp_eta, sth_mp_safe, sth_pfft_req, sth_pfft_check, sth_dvb_req, &
                                  sth_fftdx_req, sth_fftdx_check, &
                                  sth_fdxdp_req, sth_fdxdp_check, sth_obatch, sth_timing, &
-                                 sth_engine_set_nlk
+                                 sth_engine_set_nlk, sth_qcache, sth_engine_wdev, sth_engine_set_wdev
     USE lrus,             ONLY : becp1
     !
     LOGICAL, INTENT(IN) :: first_iter
@@ -626,10 +642,13 @@ CONTAINS
     COMPLEX(DP), ALLOCATABLE :: dmat(:,:)
     REAL(DP) :: w0g, wgp, deltae, theta
     REAL(DP), EXTERNAL :: wgauss, w0gauss
-    INTEGER(8) :: c0, c1, c2, crate
+    INTEGER(8) :: c0, c1, c2, crate, ca, cb
+    REAL(DP) :: tk(6)      ! RTSC_STH_TIME: per-k loop split (get_buffer, init_us_2, g2kin+weights, set_k, dvbare/dpsi, set_wdev)
+    LOGICAL :: wdev
     !
     CALL start_clock('sth_init')
-    CALL SYSTEM_CLOCK(c0)
+    CALL SYSTEM_CLOCK(c0, crate)
+    tk = 0.d0
     ! mixed precision (per q; the FP32 copies are built by sth_engine_setup)
     sth_mp = sth_env_flag('RTSC_STH_MP')
     sth_pfft_req = sth_env_flag('RTSC_STH_PFFT')
@@ -640,6 +659,7 @@ CONTAINS
     sth_fdxdp_check = sth_env_flag('RTSC_STH_FDXDP_CHECK')
     sth_obatch = sth_env_flag('RTSC_STH_OBATCH')
     sth_timing = sth_env_flag('RTSC_STH_TIME')
+    sth_qcache = sth_env_flag('RTSC_STH_QCACHE')            ! rtsc setup (groups/compute/SETUP-LOG.md)
     sth_dvb_req = dvb_on
     CALL env_real('RTSC_MP_ETA', sth_mp_eta)
     CALL env_real('RTSC_MP_SAFE', sth_mp_safe)
@@ -663,9 +683,16 @@ CONTAINS
     ENDDO
     CALL sth_engine_set_global(vrs(:, 1), dmat)
     DEALLOCATE(dmat)
+    wdev = sth_engine_wdev()     ! QCACHE: vkb goes device-to-device into the engine's W
+    IF (sth_timing) THEN
+      CALL SYSTEM_CLOCK(c1)
+      WRITE(stdout, '(5x,"rtsc sth_init: engine_init + D ",F8.3," s, vkb on device: ",L1)') &
+           REAL(c1 - c0, DP) / REAL(crate, DP), wdev
+    ENDIF
     !
     ALLOCATE(idxk(npwx), idxkq(npwx), wwg(nbnd, nbnd), wg1(nbnd))
     DO ik = 1, nksq
+      IF (sth_timing) CALL SYSTEM_CLOCK(ca)
       ikk = ikks(ik); ikq = ikqs(ik)
       npw = ngk(ikk); npwq = ngk(ikq)
       nock = nbnd_occ(ikk); nockq = nbnd_occ(ikq)
@@ -673,8 +700,24 @@ CONTAINS
       idxkq(1:npwq) = dffts%nl(igk_k(1:npwq, ikq))
       CALL get_buffer(evc, lrwfc, iuwfc, ikk)
       IF (.NOT. lgamma) CALL get_buffer(evq, lrwfc, iuwfc, ikq)   ! lgamma: evq => evc, ikq = ikk
+      IF (sth_timing) THEN
+        CALL SYSTEM_CLOCK(cb); tk(1) = tk(1) + REAL(cb - ca, DP) / crate; ca = cb
+      ENDIF
       CALL init_us_2(npwq, igk_k(1, ikq), xk(1, ikq), vkb, .true.)
-      !$acc update host(vkb)
+      IF (wdev) THEN
+        !$acc host_data use_device(vkb)
+        CALL sth_engine_set_wdev(ik, npwq, vkb)
+        !$acc end host_data
+        ! the host copy is left as the default path leaves it (vkb of the last k+q)
+        IF (ik == nksq) THEN
+          !$acc update host(vkb)
+        ENDIF
+      ELSE
+        !$acc update host(vkb)
+      ENDIF
+      IF (sth_timing) THEN
+        CALL SYSTEM_CLOCK(cb); tk(2) = tk(2) + REAL(cb - ca, DP) / crate; ca = cb
+      ENDIF
       CALL g2_kin(ikq)
       !
       ! orthogonalize.f90, lgauss branch (twochem excluded)
@@ -696,9 +739,15 @@ CONTAINS
         ENDDO
       ENDDO
       !
+      IF (sth_timing) THEN
+        CALL SYSTEM_CLOCK(cb); tk(3) = tk(3) + REAL(cb - ca, DP) / crate; ca = cb
+      ENDIF
       CALL sth_engine_set_k(ik, npw, npwq, nock, nockq, wk(ikk), idxk(1:npw), idxkq(1:npwq), evc, evq, &
                             et(:, ikk), g2kin, vkb, wwg(:, 1:nock), wg1(1:nock), et_kq=et(:, ikq))
       IF (dvb_on) CALL sth_engine_set_nlk(ik, becp1(ik)%k, dvb_al(1, ik)%k, dvb_al(2, ik)%k, dvb_al(3, ik)%k)
+      IF (sth_timing) THEN
+        CALL SYSTEM_CLOCK(cb); tk(4) = tk(4) + REAL(cb - ca, DP) / crate; ca = cb
+      ENDIF
       DO ipert = 1, npert
         nrec = (ipert - 1) * nksq + ik
         IF (dvb_on) THEN
@@ -724,6 +773,9 @@ CONTAINS
           CALL sth_engine_set_dpsi(ik, ipert, dpsi)
         ENDIF
       ENDDO
+      IF (sth_timing) THEN
+        CALL SYSTEM_CLOCK(cb); tk(5) = tk(5) + REAL(cb - ca, DP) / crate
+      ENDIF
     ENDDO
     DEALLOCATE(idxk, idxkq, wwg, wg1)
     IF (lgamma) THEN
@@ -734,6 +786,8 @@ CONTAINS
     IF (sth_timing) THEN
       CALL SYSTEM_CLOCK(c1, crate)
       WRITE(*, '(A,F8.3,A)') '     rtsc sth_init: host per-k loop ', REAL(c1 - c0, DP) / REAL(crate, DP), ' s'
+      WRITE(stdout, '(5x,"rtsc sth_init k-loop: get_buffer ",F7.3," init_us_2+vkb ",F7.3," g2kin+weights ",F7.3, &
+           &" set_k ",F7.3," dvbare/dpsi ",F7.3)') tk(1:5)
     ENDIF
     CALL sth_engine_setup(ierr)
     IF (ierr == 0 .AND. dvb_on) CALL dvb_build(npert, lrdvpsi, iudvpsi)
@@ -743,6 +797,35 @@ CONTAINS
     ENDIF
     CALL stop_clock('sth_init')
   END SUBROUTINE sth_batched_init
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE kqg_table(kqg)
+    !--------------------------------------------------------------------------------------------
+    !! kqg(npwx, 3, nksq) = k+q+G for the engine (dvb_build, becs). RTSC_STH_QCACHE: built once per q and kept on
+    !! the device by the engine; then kqg is returned with a dummy size (the engine does not read it).
+    USE gvect,            ONLY : g
+    USE klist,            ONLY : xk, ngk, igk_k
+    USE wvfct,            ONLY : npwx
+    USE qpoint,           ONLY : nksq, ikqs
+    USE sth_engine,       ONLY : sth_engine_kqg_ready, sth_engine_set_kqg
+    REAL(DP), ALLOCATABLE, INTENT(OUT) :: kqg(:,:,:)
+    INTEGER :: ik, ikq, ig, a
+    IF (sth_engine_kqg_ready()) THEN
+      ALLOCATE(kqg(npwx, 3, 1))
+      RETURN
+    ENDIF
+    ALLOCATE(kqg(npwx, 3, nksq))
+    kqg = 0.d0
+    DO ik = 1, nksq
+      ikq = ikqs(ik)
+      DO a = 1, 3
+        DO ig = 1, ngk(ikq)
+          kqg(ig, a, ik) = xk(a, ikq) + g(a, igk_k(ig, ikq))
+        ENDDO
+      ENDDO
+    ENDDO
+    CALL sth_engine_set_kqg(kqg)      ! no-op unless RTSC_STH_QCACHE (and it fits)
+  END SUBROUTINE kqg_table
   !
   !--------------------------------------------------------------------------------------------
   SUBROUTINE dvb_build(npert, lrdvpsi, iudvpsi)
@@ -759,28 +842,24 @@ CONTAINS
     USE buffers,          ONLY : get_buffer
     USE eqv,              ONLY : dvpsi
     USE io_global,        ONLY : stdout
-    USE sth_engine,       ONLY : sth_engine_build_dvb, sth_engine_dvb_check
+    USE sth_engine,       ONLY : sth_engine_build_dvb, sth_engine_dvb_check, sth_engine_kqg_ready
     INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
     INTEGER, ALLOCATABLE :: kbat(:)
     REAL(DP), ALLOCATABLE :: kqg(:,:,:)
     INTEGER :: na, ih, ik, ikq, ig, a, ipert, nrec
     REAL(DP) :: dmax, ymax
+    INTEGER(8) :: c0, c1, crate
     CALL start_clock('sth_dvb')
-    ALLOCATE(kbat(MAX(nkb, 1)), kqg(npwx, 3, nksq))
+    CALL SYSTEM_CLOCK(c0, crate)
+    ALLOCATE(kbat(MAX(nkb, 1)))
     DO na = 1, nat
       DO ih = 1, nh(ityp(na))
         kbat(ofsbeta(na) + ih) = na
       ENDDO
     ENDDO
-    kqg = 0.d0
-    DO ik = 1, nksq
-      ikq = ikqs(ik)
-      DO a = 1, 3
-        DO ig = 1, ngk(ikq)
-          kqg(ig, a, ik) = xk(a, ikq) + g(a, igk_k(ig, ikq))
-        ENDDO
-      ENDDO
-    ENDDO
+    CALL kqg_table(kqg)
+    CALL SYSTEM_CLOCK(c1)
+    t_kqg = REAL(c1 - c0, DP) / REAL(crate, DP)
     CALL sth_engine_build_dvb(dvb_vl, dvb_u, 3 * nat, kbat, tpiba, kqg)
     DEALLOCATE(kbat, kqg)
     IF (sth_env_flag('RTSC_STH_DVB_CHECK')) THEN
