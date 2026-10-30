@@ -1759,6 +1759,7 @@
     CALL print_clock('ep_wfcread')
     CALL print_clock('ep_prolog')
     CALL print_clock('ep_gpu_k')
+    CALL print_clock('ep_star')
     WRITE(stdout, '(5x)')
     CALL print_clock('ELPHWAN')
     WRITE(stdout, '(5x, a)') 'INITIALIZATION: '
