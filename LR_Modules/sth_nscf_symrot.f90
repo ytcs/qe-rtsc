@@ -54,6 +54,8 @@ MODULE sth_nscf_symrot
   END TYPE htab
   TYPE(htab), SAVE :: tc, tl
   REAL(DP), SAVE :: t_plan = 0, t_after = 0
+  LOGICAL, SAVE :: prefer_ft = .FALSE.
+  INTEGER, SAVE :: nft = 0     ! rotations that used an op with a fractional translation (cumulative)
   !
 CONTAINS
   !
@@ -176,6 +178,7 @@ CONTAINS
     COMPLEX(DP) :: ph
     LOGICAL :: hasft
     hasft = ANY(ABS(ft(:, isym)) > 1.d-12)
+    IF (hasft) nft = nft + 1
     evc = (0.d0, 0.d0)
     DO ig = 1, ngs
       DO j = 1, 3
@@ -270,22 +273,33 @@ CONTAINS
   !
   SUBROUTINE h_images(t, xs, id)
     !! insert every image tr S xs of source id
-    USE symm_base, ONLY : s, nsym, time_reversal
+    USE symm_base, ONLY : s, nsym, time_reversal, ft
     TYPE(htab), INTENT(INOUT) :: t
     REAL(DP), INTENT(IN) :: xs(3)
     INTEGER, INTENT(IN) :: id
-    INTEGER :: is, itr, tr, j
+    INTEGER :: is, itr, tr, j, ipass
     INTEGER(8) :: key
     REAL(DP) :: kr(3)
+    LOGICAL :: hasft
+    ! RTSC_NSCF_SYMROT_PREFER_FT=1 (diagnostic): ops with a fractional translation are inserted first, so they are
+    ! the ones used wherever they reach the image (exercises the phase factor)
+    DO ipass = 1, 2
     DO itr = 1, 2
       tr = 3 - 2 * itr
       IF (tr == -1 .AND. .NOT. time_reversal) EXIT
       DO is = 1, nsym
+        hasft = ANY(ABS(ft(:, is)) > 1.d-12)
+        IF (prefer_ft) THEN
+          IF ((ipass == 1) .NEQV. hasft) CYCLE
+        ELSE
+          IF (ipass == 2) CYCLE
+        ENDIF
         DO j = 1, 3
           kr(j) = tr * (s(j, 1, is) * xs(1) + s(j, 2, is) * xs(2) + s(j, 3, is) * xs(3))
         ENDDO
         IF (hkey(kr, key)) CALL h_put(t, key, id, is, tr)
       ENDDO
+    ENDDO
     ENDDO
   END SUBROUTINE h_images
   !
@@ -324,11 +338,17 @@ CONTAINS
     INTEGER, ALLOCATABLE :: mrep(:,:)
     LOGICAL :: found, keyed, hit
     INTEGER(8) :: key, c0, c1, cr
+    CHARACTER(LEN=16) :: sv
+    INTEGER :: ios
     !
     CALL start_clock('nscf_symrot')
     CALL SYSTEM_CLOCK(c0, cr)
     CALL h_reset(tl)
-    IF (tc%cap == 0) CALL h_reset(tc)
+    IF (tc%cap == 0) THEN
+      CALL h_reset(tc)
+      CALL get_environment_variable('RTSC_NSCF_SYMROT_PREFER_FT', sv, STATUS=ios)
+      prefer_ft = (ios == 0 .AND. TRIM(sv) == '1')
+    ENDIF
     IF (npos /= dfftp%nr1 * dfftp%nr2 * dfftp%nr3) THEN
       IF (ALLOCATED(pos)) DEALLOCATE(pos)
       npos = dfftp%nr1 * dfftp%nr2 * dfftp%nr3
@@ -483,7 +503,8 @@ CONTAINS
     t_after = t_after + REAL(c1 - c0, DP) / REAL(cr, DP)
     WRITE(stdout, '(5x,"rtsc nscf symrot: ",I0," k rotated from the cache, ",I0," from reps of this list, ",I0, &
          &" reps diagonalized, ",I0," fallbacks; cache ",I0," k; time plan+rotate ",F8.3," s, cache+rotate ",F8.3, &
-         &" s (cumulative)")') nrot_c, nrot_l - nfb, nrep, nfb, nc, t_plan, t_after
+         &" s (cumulative); ",I0," rotations with a fractional translation (cumulative)")') &
+         nrot_c, nrot_l - nfb, nrep, nfb, nc, t_plan, t_after, nft
     CALL stop_clock('nscf_symrot')
   END SUBROUTINE symrot_after_solve
   !
