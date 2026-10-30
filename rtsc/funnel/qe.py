@@ -37,6 +37,25 @@ def from_pmg(d):
     return dict(lattice=lat, species=sp, frac=fr)
 
 
+ZORDER = ("H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y "
+          "Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os "
+          "Ir Pt Au Hg Tl Pb Bi").split()
+
+
+def canonical(st, tol=1e-6):
+    """G4(a) (WANNIER-LOG.md W1): wrap fractional coordinates into [0, 1) (values within tol of 1 -> 0) and order
+    the sites by atomic number, then by position. Hydrogenic projections are centred on the listed positions; a
+    site listed one cell away (F0b Mg2IrH6: Ir at frac (1, 1, 0)) gives a k-dependent initial phase that sent one WF
+    to a delocalised minimum (34.8 A^2) and moved lambda 1.67 -> 0.99. The result is the same cell, deterministic for any
+    input order or image."""
+    fr = []
+    for f in st["frac"]:
+        g = [x - math.floor(x) for x in f]
+        fr.append([0.0 if (x < tol or x > 1 - tol) else x for x in g])
+    idx = sorted(range(len(fr)), key=lambda i: (ZORDER.index(st["species"][i]), [round(x, 6) for x in fr[i]]))
+    return dict(st, species=[st["species"][i] for i in idx], frac=[fr[i] for i in idx])
+
+
 def recip_norms(lat):
     a = np.array(lat, float)
     b = 2 * np.pi * np.linalg.inv(a).T
@@ -257,10 +276,13 @@ def ph_input(prefix, species, nq):
             f"  fildvscf = 'dvscf'\n  nq1 = {nq}, nq2 = {nq}, nq3 = {nq}\n  tr2_ph = 1.0d-14\n  reduce_io = .true.\n/\n")
 
 
-def epw_input(prefix, species, nk, nq, nkf, nqf, nsemi, nw, froz, ef, scdm=False, muc=0.10):
+def epw_input(prefix, species, nk, nq, nkf, nqf, nsemi, nw, froz, ef, scdm=False, muc=0.10, use_ws=True, epbread=False):
+    """G4 (WANNIER-LOG.md W1): use_ws on; SCDM always WITH the frozen window (SCDM erfc without it dropped Fermi-level
+    states from the subspace on every W1 control: on-grid band errors ~ 1-2 eV, Cu lambda 0.04 -> 0.17-0.73)."""
     sp = species_order(dict(species=species))
     lines = [f"prefix = '{prefix}'"] + [f"amass({i + 1}) = {MASS[e]}" for i, e in enumerate(sp)]
-    lines += ["outdir = './'", "ep_coupling = .true.", "elph = .true.", "epbwrite = .true.", "epwwrite = .true.",
+    lines += ["outdir = './'", "ep_coupling = .true.", "elph = .true.",
+              "epbread = .true." if epbread else "epbwrite = .true.", "epwwrite = .true.",
               "etf_mem = 1", f"nbndsub = {nw}"]
     if nsemi:
         lines.append(f"bands_skipped = 'exclude_bands = 1-{nsemi}'")
@@ -268,6 +290,8 @@ def epw_input(prefix, species, nk, nq, nkf, nqf, nsemi, nw, froz, ef, scdm=False
     if scdm:
         lines += ["auto_projections = .true.", "scdm_proj = .true.", "scdm_entanglement = 'erfc'",
                   f"scdm_mu = {ef:.4f}", "scdm_sigma = 2.0"]
+        if froz is not None:
+            lines.append(f"dis_froz_max = {ef + froz:.4f}")
     else:
         lines.append(f"dis_froz_max = {ef + froz:.4f}")
         i = 0
@@ -275,6 +299,8 @@ def epw_input(prefix, species, nk, nq, nkf, nqf, nsemi, nw, froz, ef, scdm=False
             i += 1
             lines.append(f"proj({i}) = '{e}:{';'.join(orb)}'")
         lines.append("wdata(1) = 'dis_num_iter = 1000'")
+    if use_ws:   # G4(b): Wigner-Seitz sets built from the WF centres and atom positions (EPW default .false.)
+        lines.append("use_ws = .true.")
     lines += ["eps_acoustic = 2.0", "ephwrite = .true.", "fsthick = 0.4", "degaussw = 0.10", "degaussq = 0.5",
               "nqstep = 500", "eliashberg = .true.", "wscut = 1.0", "temps = 1.0", "nstemp = 1",
               f"muc = {muc}", "dvscf_dir = './save'", f"nk1 = {nk}, nk2 = {nk}, nk3 = {nk}",
@@ -287,7 +313,52 @@ def t3a_grids(st):
     nat = len(st["species"])
     k = kgrid(st["lattice"], 0.20 if nat <= 4 else 0.27)
     nq = 4 if nat == 1 else (3 if nat <= 4 else 2)
-    nk = 2 * nq   # G2 (FUNNEL.md section 7): Wannier/EPW coarse k = 2 q for every cell size (F0: k = q for 3-4 atoms)
+    nk = 2 * nq   # G2 (FUNNEL.md section 7): Wannier/EPW coarse k = 2 q for every cell size (F0: k = q for 3-4 atoms).
+    # G4(e) (W1) refines to 3 q inside t3a.epw_stage when the two Wannier setups disagree; W1 found 2 q unconverged for
+    # sigma-band MgB2 (lambda 1.34 / 0.85 at 2q / 3q) and for H3S under use_ws (2.09 / 2.94).
     nkf = max(kgrid(st["lattice"], 0.2))
     nkf += nkf % 2
     return dict(k=k, nq=nq, nk=nk, nkf=nkf, nqf=nkf // 2)
+
+
+def wannier_ham(rundir):
+    """H(R) (eV), R vectors and WS degeneracies from EPW's epwdata.fmt + wigner.fmt."""
+    t = open(f"{rundir}/epwdata.fmt").read().split("\n")
+    nb, nr = [int(x) for x in t[1].split()[:2]]
+    body = "\n".join(t[2:])
+    vals = re.findall(r"\(\s*([-+0-9.EeDd]+)\s*,\s*([-+0-9.EeDd]+)\s*\)", body[body.index("("):])[:nb * nb * nr]
+    chw = np.array([complex(float(a.replace("D", "E")), float(b.replace("D", "E"))) for a, b in vals]).reshape(nb, nb, nr)
+    w = open(f"{rundir}/wigner.fmt").read().split("\n")
+    nrk, _, _, dims, _ = [int(x) for x in w[0].split()]
+    irv, deg, i = [], [], 1
+    for _ in range(nrk):
+        irv.append([int(x) for x in w[i].split()[:3]])
+        deg.append([[int(x) for x in w[i + 1 + j].split()] for j in range(dims)])
+        i += 1 + dims
+    return chw * RY, np.array(irv), np.array(deg)
+
+
+def wannier_eigs(rundir, kcrys):
+    chw, irv, deg = wannier_ham(rundir)
+    out = []
+    for k in kcrys:
+        ph = np.exp(2j * np.pi * irv @ np.asarray(k))
+        if deg.shape[1] == 1:
+            H = np.tensordot(chw, ph / deg[:, 0, 0], axes=([2], [0]))
+        else:
+            H = np.einsum("ijr,rij->ij", chw, np.where(deg > 0, ph[:, None, None] / np.maximum(deg, 1), 0))
+        out.append(np.linalg.eigvalsh((H + H.conj().T) / 2))
+    return np.array(out)
+
+
+def band_check(rundir, x_nscf, nk, nsemi, ef, win=0.3):
+    """G4(c) on-grid band check (no extra DFT): Wannier bands at the coarse nscf k (full nk^3 grid, as written by
+    kfull) against the nscf eigenvalues, within E_F +- win eV; two-sided nearest-level distance. Returns max meV."""
+    pts = [(i / nk, j / nk, l / nk) for i in range(nk) for j in range(nk) for l in range(nk)]
+    ew = wannier_eigs(rundir, pts)
+    ed = np.array(x_nscf["eig"])[:, nsemi:]
+    dev = [0.0]
+    for i in range(len(pts)):
+        dev += [float(np.min(np.abs(ew[i] - d))) for d in ed[i][np.abs(ed[i] - ef) <= win]]
+        dev += [float(np.min(np.abs(ed[i] - e))) for e in ew[i][np.abs(ew[i] - ef) <= win]]
+    return 1000 * max(dev)

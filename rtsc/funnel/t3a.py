@@ -2,20 +2,27 @@
 
     python3 t3a.py <jobs.json> <id> <workroot> [NT omp threads, default 8] [NE epw ranks, default 8]
 
-jobs.json: {id: {structure: pymatgen dict, Ttarget: K, press_kbar?: float}}.
+jobs.json: {id: {structure: pymatgen dict, Ttarget: K, press_kbar?: float, g4_refine?: bool}}.
 Writes <workroot>/<id>/result.json (status ok | fail:<stage>), timings.tsv; restart-safe per stage marker.
 Environment: BIN (QE bin dir), PSEUDO_DIR. RTSC_STH=1, RTSC_STRICT=1, RTSC_STH_MP=1 are set for ph.x.
-EPW computes alpha^2F only (eliashberg, no liso/laniso); one retry with SCDM projections on a Wannier failure.
-Generator G1G2 (FUNNEL.md section 7, pre-registered before F0b): band exclusion by qe.n_semicore (shells not
-covered by the projection set, gap-checked; fail:semicore otherwise) and Wannier coarse k = 2 q (qe.t3a_grids).
+EPW computes alpha^2F only (eliashberg, no liso/laniso).
+Generator G1G2 (FUNNEL.md section 7): band exclusion by qe.n_semicore and Wannier coarse k = 2 q (qe.t3a_grids).
+Generator G4 (proposed in WANNIER-LOG.md, study W1; not yet registered): (a) canonical cell (qe.canonical: fractional
+coordinates wrapped into [0,1), sites sorted by Z); (b) EPW use_ws = .true.; (c) per-setup gate = G3 spread rule + on-grid
+band check; (d) two setups, generic atomic projections and SCDM erfc (mu E_F, sigma 2 eV) WITH the frozen window; (e) if
+they disagree (S_W > 0.15) or only one passes, Wannier k is refined to 3 q and both rerun; (f) still S_W > 0.15 ->
+flag_wannier (E1 s x 2; pass rule uses the larger Tc); no setup passes -> fail:wannier (FUNNEL.md section 8 routing).
 """
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 import qe  # noqa: E402
@@ -37,7 +44,7 @@ def main(jobs, jid, root, nt="8", ne="8"):
     W = Path(root) / jid
     W.mkdir(parents=True, exist_ok=True)
     os.chdir(W)
-    st0 = qe.from_pmg(job["structure"])
+    st0 = qe.canonical(qe.from_pmg(job["structure"]))   # G4(a): wrapped into [0,1), sites sorted by Z
     res = dict(id=jid, Ttarget=job.get("Ttarget"), stages={}, nat=len(st0["species"]), generator="G1G2")
     tsv = open("timings.tsv", "a")
 
@@ -94,7 +101,7 @@ def main(jobs, jid, root, nt="8", ne="8"):
         return finish("fail:relax")
     if rc != 0 and "bfgs converged" not in Path("relax.out").read_text():
         res["relax_note"] = "not converged; continuing from last geometry"
-    st = x["structure"]
+    st = qe.canonical(x["structure"])   # G4(a): the relax does not wrap; re-canonicalise before scf/ph/nscf
     res["relaxed"] = st
     shutil.rmtree(f"{prefix}.save", ignore_errors=True)
     for f in Path(".").glob(f"{prefix}.wfc*"):
@@ -148,7 +155,58 @@ def main(jobs, jid, root, nt="8", ne="8"):
     return epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job)
 
 
+def run_setups(st, g, nk, xs, xn, nsemi, nw, froz, prefix, ne, stage, tag=""):
+    """G4(d): setup A = generic atomic projections, setup B = SCDM (erfc, mu = E_F, sigma = 2 eV) WITH the same frozen
+    window, both with use_ws on the canonical cell; B reuses A's .epb files. Gate per setup (G4(c)): G3 spread rule and
+    the on-grid band check (Wannier vs nscf eigenvalues at the coarse k, E_F +- 0.3 eV, <= 50 meV). Runs in the cwd."""
+    epw_cmd = (f"nvidia-cuda-mps-control -d 2>/dev/null; OMP_NUM_THREADS=1 mpirun --bind-to none -np {ne} "
+               f"-x OMP_NUM_THREADS {BIN}/epw.x -npool {ne} -in epw.in")
+    setups = {}
+    for attempt, scdm in (("epw_atomic", False), ("epw_scdmf", True)):
+        if froz is None and not scdm:
+            continue
+        # EPW resumes from restart.fmt ("All q-points are done, no need to restart") and would silently reuse the
+        # previous setup's interpolated e-ph data (found in W1: the second setup returned a stale lambda). Clear it.
+        for pat in (f"{prefix}.a2f*", "restart.fmt", "selecq.fmt", f"{prefix}.ephmat", f"{prefix}.epmatwp", "epwdata.fmt",
+                    "wigner.fmt", f"{prefix}.ukk", f"{prefix}.chk", f"{prefix}.wout"):
+            for f in Path(".").glob(pat):
+                shutil.rmtree(f) if f.is_dir() else f.unlink()
+        epb = scdm and any(Path(".").glob(f"{prefix}.epb*"))
+        Path("epw.in").write_text(qe.epw_input(prefix, st["species"], nk, g["nq"], g["nkf"], g["nqf"], nsemi, nw,
+                                               froz, xs["ef"], scdm=scdm, epbread=epb))
+        shutil.copy("epw.in", f"{attempt}.in")
+        stage(attempt + tag, epw_cmd, f"{attempt}.out", timeout=3 * 3600)
+        if not Path(f"{prefix}.a2f_proj").exists():
+            setups[attempt] = dict(status="fail:epw")
+            continue
+        s = dict(status="ok", metrics=qe.a2f_metrics(f"{prefix}.a2f_proj", muc=0.10))
+        wout = Path(f"{prefix}.wout")
+        sp = [float(l.split()[-1]) for l in wout.read_text().splitlines() if "WF centre and spread" in l][-nw:] \
+            if wout.exists() else []
+        s["max_spread_A2"] = max(sp) if sp else None
+        s["median_spread_A2"] = float(np.median(sp)) if sp else None
+        s["g3_ok"] = bool(sp) and max(sp) <= 10.0 and max(sp) <= 5 * float(np.median(sp))
+        try:
+            s["band_err_meV"] = qe.band_check(".", xn, nk, nsemi, xs["ef"])
+        except Exception as ex:  # noqa: BLE001
+            s["band_err_meV"], s["band_err_note"] = None, str(ex)[:80]
+        s["band_ok"] = s["band_err_meV"] is not None and s["band_err_meV"] <= 50.0
+        s["gate_ok"] = s["g3_ok"] and s["band_ok"]
+        shutil.copy(f"{prefix}.a2f_proj", f"{attempt}.a2f_proj")
+        setups[attempt] = s
+    good = [k for k in ("epw_atomic", "epw_scdmf") if setups.get(k, {}).get("gate_ok")]
+    sw = None
+    if len(good) == 2:
+        la, lb = (setups[k]["metrics"]["lam"] for k in good)
+        sw = abs(math.log(la / lb)) if la > 0 and lb > 0 else None
+    return dict(nk=nk, setups=setups, good=good, S_W=sw, agree=(sw is not None and sw <= 0.15))
+
+
 def epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job):
+    """G4 (WANNIER-LOG.md W1). (d) two setups at the G2 Wannier grid nk = 2q; (e) if they disagree (S_W > 0.15) or
+    only one passes its gate, refine the Wannier grid to nk = 3q (new nscf in ./k3, same scf density and DFPT) and
+    rerun both setups there; the refined result replaces the 2q one. (f) still S_W > 0.15 -> flag_wannier (E1: s x 2;
+    the pass rule uses the larger Tc, never rejects on that basis); no setup passing its gate -> fail:wannier."""
     try:
         nsemi, sinfo = qe.n_semicore(xs if xs.get("eig") else xn, st["species"], PSEUDO)
     except ValueError as ex:
@@ -159,33 +217,50 @@ def epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job):
     xn = dict(xn, ef=xs["ef"])
     froz = qe.frozen_window(xn, nsemi, nw)
     res["wannier"]["froz"] = froz
-    # 6. EPW, atomic projections then SCDM
-    epw_cmd = (f"nvidia-cuda-mps-control -d 2>/dev/null; OMP_NUM_THREADS=1 mpirun --bind-to none -np {ne} "
-               f"-x OMP_NUM_THREADS {BIN}/epw.x -npool {ne} -in epw.in")
-    for attempt, scdm in (("epw_atomic", False), ("epw_scdm", True)):
-        if not scdm and froz is None:
-            res["wannier"]["note"] = "no frozen window with <= nWF bands"
-            continue
-        for f in Path(".").glob(f"{prefix}.a2f*"):
-            f.unlink()
-        Path("epw.in").write_text(qe.epw_input(prefix, st["species"], g["nk"], g["nq"], g["nkf"], g["nqf"], nsemi, nw,
-                                               froz or 0.0, xs["ef"], scdm=scdm))
-        shutil.copy("epw.in", f"{attempt}.in")
-        stage(attempt, epw_cmd, f"{attempt}.out", timeout=3 * 3600)
-        if Path(f"{prefix}.a2f_proj").exists():
-            res["wannier"]["method"] = "scdm" if scdm else "atomic"
-            wout = Path(f"{prefix}.wout")
-            if wout.exists():
-                sp = [float(l.split()[-1]) for l in wout.read_text().splitlines() if "WF centre and spread" in l]
-                res["wannier"]["max_spread_A2"] = max(sp[-nw:]) if sp else None
-            m = qe.a2f_metrics(f"{prefix}.a2f_proj", muc=0.10)
-            res["metrics"] = m
-            T = job.get("Ttarget") or 1.0
-            res["line_K"] = 0.3 * T
-            res["pass_T3a"] = bool(m["tc_ad"] >= 0.3 * T)
-            # keep only small outputs
-            return finish("ok")
-    return finish("fail:wannier")
+    T = job.get("Ttarget") or 1.0
+    res["line_K"] = 0.3 * T
+    if froz is None:
+        res["wannier"]["note"] = "no frozen window with <= nWF bands"
+    r = run_setups(st, g, g["nk"], xs, xn, nsemi, nw, froz, prefix, ne, stage)
+    res["wannier"]["k2q"] = r
+    if not r["agree"] and job.get("g4_refine", True):
+        nk3 = 3 * g["nq"]
+        k3 = Path("k3")
+        (k3 / f"{prefix}.save").mkdir(parents=True, exist_ok=True)
+        for f in Path(f"{prefix}.save").iterdir():
+            if not f.name.startswith("wfc"):
+                shutil.copy(f, k3 / f"{prefix}.save" / f.name)
+        if not (k3 / "save").exists():
+            (k3 / "save").symlink_to(Path("save").resolve())
+        cwd = os.getcwd()
+        os.chdir(k3)
+        nb = len(xn["eig"][0])
+        Path("nscf.in").write_text(qe.pw_input(st, "nscf", prefix, None, qe.ecut_rule(st["species"]), pseudo=PSEUDO,
+                                               nbnd=nb, kblock=qe.kfull(nk3)))
+        mpi = ["mpirun", "--bind-to", "none", "-np", "1", "-x", "OMP_NUM_THREADS"]
+        rc = stage("nscf_k3", mpi + [f"{BIN}/pw.x", "-in", "nscf.in"], "nscf.out",
+                   {"OMP_NUM_THREADS": "8", "RTSC_STH": "0", "RTSC_STRICT": "0", "RTSC_STH_MP": "0"})
+        if rc == 0:
+            xn3 = dict(qe.read_xml(f"{prefix}.save/data-file-schema.xml"), ef=xs["ef"])
+            froz3 = qe.frozen_window(xn3, nsemi, nw)
+            r3 = run_setups(st, g, nk3, xs, xn3, nsemi, nw, froz3, prefix, ne, stage, tag="_k3")
+            r3["froz"] = froz3
+            res["wannier"]["k3q"] = r3
+            if r3["good"]:
+                r = r3
+        os.chdir(cwd)
+    res["wannier"]["final_nk"] = r["nk"]
+    if not r["good"]:
+        return finish("fail:wannier")
+    prim = r["setups"][r["good"][0]]
+    res["wannier"]["method"] = r["good"][0]
+    res["metrics"] = prim["metrics"]
+    res["S_W"] = r["S_W"]
+    res["flag_wannier"] = not r["agree"]
+    tcs = [r["setups"][k]["metrics"]["tc_ad"] for k in r["good"]]
+    tc_used = max(tcs) if res["flag_wannier"] else prim["metrics"]["tc_ad"]
+    res["pass_T3a"] = bool(tc_used >= 0.3 * T)
+    return finish("ok")
 
 
 if __name__ == "__main__":
