@@ -3,7 +3,7 @@
     python3 zpe.py <jobs.json> <ids,comma> <workroot> <out.jsonl> [NT]
 
 jobs.json: {id: {structure: pymatgen dict}} (spglib-symmetrised by the caller). Per phase (<= 10 atoms):
-PBE vc-relax (ecut 80 Ry, k 0.20 A^-1, MP 0.02 Ry) -> scf -> ph.x at q = 0 (tr2_ph 1e-14, FP64: RTSC_STH=1,
+PBE vc-relax (ecut G5, k 0.20 A^-1, MP 0.02 Ry) -> scf -> ph.x at q = 0 (tr2_ph 1e-14, FP64: RTSC_STH=1,
 RTSC_STRICT=1, RTSC_STH_MP=0; if the engine declines, rerun with RTSC_STH=0, recorded as 'engine').
 ZPE = sum hbar omega / 2 over the 3N - 3 modes left after dropping the three smallest |omega| (acoustic);
 imaginary modes are dropped and counted. The PBE geometry's ZPE is used for both functionals (Q3).
@@ -33,6 +33,8 @@ def main(jobs, ids, root, out, nt="8"):
         seen = {json.loads(l)["id"] for l in Path(out).read_text().splitlines() if l.strip()}
     mpi = ["mpirun", "--bind-to", "none", "-np", "1", "-x", "OMP_NUM_THREADS", "-x", "RTSC_STH", "-x", "RTSC_STRICT",
            "-x", "RTSC_STH_MP"]
+    # G5 (FUNNEL section 8): one cutoff for the phases of one call (F0b: 80 Ry)
+    ecut = qe.ecut_rule({e for i in ids.split(",") if i for e in qe.from_pmg(jobs[i]["structure"])["species"]})
     for k in [i for i in ids.split(",") if i]:
         if k in seen:
             continue
@@ -52,14 +54,14 @@ def main(jobs, ids, root, out, nt="8"):
             return rc
 
         k3 = qe.kgrid(st["lattice"], 0.20)
-        (W / "relax.in").write_text(qe.pw_input(st, "vc-relax", "z", k3, 80, pseudo=PSEUDO, conv="1.0d-8"))
+        (W / "relax.in").write_text(qe.pw_input(st, "vc-relax", "z", k3, ecut, pseudo=PSEUDO, conv="1.0d-8"))
         run("relax", [f"{BIN}/pw.x"], "relax.in")
         try:
             x = qe.read_xml(W / "z.save/data-file-schema.xml")
             st = x["structure"]
             shutil.rmtree(W / "z.save")
             k3 = qe.kgrid(st["lattice"], 0.20)
-            (W / "scf.in").write_text(qe.pw_input(st, "scf", "z", k3, 80, pseudo=PSEUDO))
+            (W / "scf.in").write_text(qe.pw_input(st, "scf", "z", k3, ecut, pseudo=PSEUDO))
             if run("scf", [f"{BIN}/pw.x"], "scf.in", sth="1") != 0:
                 raise RuntimeError("scf")
             sp = qe.species_order(st)

@@ -66,9 +66,46 @@ def kgrid(lat, dk):
     return [max(1, math.ceil(x / dk)) for x in recip_norms(lat)]
 
 
+# G5 (FUNNEL.md section 8, pre-registered 2026-10-30): ecutwfc = max over the elements present of the pseudopotential
+# set's "normal" hint; ecutrho = 4 x ecutwfc (NC; pw.x default). Retires the F0 rule (80 Ry with H/B/C/N/O/F or a 3d
+# metal, else 60), which under-converged Nb (SG15 needs ~82 Ry).
+# SG15: PseudoDojo standard-table "normal" hints (github PseudoDojo/ONCVPSP-PBE-SR standard.djson; PSEUDO-SURVEY section 2).
+HINT_SG15 = dict(H=72, Li=74, Be=88, B=76, C=82, N=84, O=84, F=84, Na=88, Mg=84, Al=40, Si=36, P=44, S=52, Cl=58, K=74,
+                 Ca=68, Sc=78, Ti=84, V=84, Cr=94, Mn=96, Fe=90, Co=96, Ni=98, Cu=92, Zn=84, Ga=80, Ge=78, As=84, Se=86,
+                 Br=46, Rb=46, Sr=68, Y=72, Zr=66, Nb=82, Mo=80, Tc=84, Ru=84, Rh=88, Pd=82, Ag=82, Cd=102, In=70,
+                 Sn=72, Sb=80, Te=80, I=70, Cs=50, Ba=44, La=110, Hf=58, Ta=58, W=74, Re=72, Os=74, Ir=68, Pt=84,
+                 Au=76, Hg=66, Tl=62, Pb=56, Bi=66)
+# SPMS v1.0: the 1e-4 Ha/atom total-energy cutoff of SPMS_v1.0.pdf (Ha x 2; PSEUDO-SURVEY section 7, test P1).
+HINT_SPMS = dict(H=60, Li=52, Be=52, B=58, C=76, N=76, O=76, F=74, Na=48, Mg=56, Al=28, Si=30, P=34, S=40, Cl=40, K=26,
+                 Ca=32, Sc=40, Ti=52, V=62, Cr=64, Mn=74, Fe=64, Co=62, Ni=68, Cu=70, Zn=60, Ga=68, Ge=50, As=60, Se=60,
+                 Br=28, Rb=18, Sr=26, Y=32, Zr=34, Nb=56, Mo=46, Tc=28, Ru=48, Rh=50, Pd=48, Ag=44, Cd=48, In=40,
+                 Sn=36, Sb=48, Te=50, I=28, Cs=30, Ba=22, La=36, Hf=30, Ta=34, W=32, Re=32, Os=32, Ir=34, Pt=42,
+                 Au=38, Hg=46, Tl=28, Pb=28, Bi=38)
+
+
+def pset():
+    """Pseudopotential set of this run: env PSET (sg15 | spms), default sg15."""
+    import os
+    return os.environ.get("PSET", "sg15").lower()
+
+
 def ecut_rule(species):
-    s = set(species)
-    return 80 if (s & FIRST_ROW or s & D3) else 60
+    """G5: max over the elements present of the active set's normal hint (Ry)."""
+    hint = HINT_SPMS if pset() == "spms" else HINT_SG15
+    return max(hint[e] for e in set(species))
+
+
+def upf_name(e, pseudo=None):
+    """UPF file of element e in the active set: SG15 '<El>_ONCV_PBE-1.2.upf'; SPMS '<Z>_<El>_<z>_<rc>..._v1.0.upf'
+    (found by glob in the pseudo dir)."""
+    if pset() != "spms":
+        return f"{e}_ONCV_PBE-1.2.upf"
+    import glob
+    import os
+    hits = sorted(glob.glob(os.path.join(pseudo or os.environ.get("PSEUDO_DIR", "."), f"[0-9][0-9]_{e}_*.upf")))
+    if len(hits) != 1:
+        raise FileNotFoundError(f"SPMS UPF for {e}: {hits}")
+    return os.path.basename(hits[0])
 
 
 def species_order(st):
@@ -106,7 +143,7 @@ def pw_input(st, calc, prefix, k, ecut, pseudo="@PSEUDO@", smear=0.02, extra_sys
         txt += "&ions\n/\n"
     if calc == "vc-relax":
         txt += "&cell\n    press_conv_thr = 0.5\n" + (f"    press = {press}\n" if press else "") + "/\n"
-    txt += "ATOMIC_SPECIES\n" + "".join(f" {e} {MASS[e]} {e}_ONCV_PBE-1.2.upf\n" for e in sp)
+    txt += "ATOMIC_SPECIES\n" + "".join(f" {e} {MASS[e]} {upf_name(e, pseudo)}\n" for e in sp)
     txt += "CELL_PARAMETERS angstrom\n" + "".join(" " + " ".join(f"{x:.10f}" for x in v) + "\n" for v in st["lattice"])
     txt += "ATOMIC_POSITIONS crystal\n" + "".join(
         f" {e} {f[0]:.10f} {f[1]:.10f} {f[2]:.10f}\n" for e, f in zip(st["species"], st["frac"]))
@@ -198,7 +235,7 @@ VAL_E = dict(H=1, Li=1, Na=1, K=1, Rb=1, Cs=1, Be=2, Mg=2, Ca=2, Sr=2, Ba=2, B=3
 
 
 def z_valence(e, pseudo):
-    t = open(f"{pseudo}/{e}_ONCV_PBE-1.2.upf").read(20000)
+    t = open(f"{pseudo}/{upf_name(e, pseudo)}").read(20000)
     return float(re.search(r'z_valence\s*=\s*"\s*([-+0-9.eEdD]+)', t).group(1).replace("d", "e").replace("D", "e"))
 
 

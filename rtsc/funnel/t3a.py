@@ -12,6 +12,16 @@ coordinates wrapped into [0,1), sites sorted by Z); (b) EPW use_ws = .true.; (c)
 band check; (d) two setups, generic atomic projections and SCDM erfc (mu E_F, sigma 2 eV) WITH the frozen window; (e) if
 they disagree (S_W > 0.15) or only one passes, Wannier k is refined to 3 q and both rerun; (f) still S_W > 0.15 ->
 flag_wannier (E1 s x 2; pass rule uses the larger Tc); no setup passes -> fail:wannier (FUNNEL.md section 8 routing).
+G4 is registered in FUNNEL.md section 8 (2026-10-30). F0c fixes: no frozen window -> neither setup runs (SCDM without a
+window is retired); a 3q result replaces the 2q one only if a 3q setup passes its gate.
+G5 (section 8): ecut = qe.ecut_rule (the active set's normal hints; env PSET = sg15 | spms).
+S1 (section 8, s1.py): any DFPT mode < -30 cm^-1 (Gamma acoustic excluded) -> no pass; EPW skipped; one re-relax along the
+most negative mode and a rerun (child <id>__s1, cap S1_CAP s); still unstable -> status unstable_dfpt, disposition sscha
+(H participation > 0.5) or reject.
+Workflow-failure routing (section 8): a fail:* keeps its status and gets `route`; one automatic T3b-lite attempt
+(child <id>__t3bl: q + 1, scf k = smallest multiple of that q >= 4/3 x the T3a k, Wannier k = 2 q, T3a pass rule); then the
+hand queue (<workroot>/hand_queue.jsonl). fail:timeout -> hand queue.
+Study overrides in a job (not generator rules): st (plain dict), ecut, nq, kscf, no_relax.
 """
 import json
 import math
@@ -39,13 +49,96 @@ def run(cmd, out, env_extra=None, timeout=None):
     return p.returncode, time.time() - t0
 
 
+S1_CAP = int(os.environ.get("S1_CAP", "2700"))
+T3BL_CAP = int(os.environ.get("T3BL_CAP", "3600"))
+
+
+def child(jobs, jid, root, cid, cjob, nt, ne, cap):
+    """Run a child T3a job (S1 rerun or T3b-lite) in <root>/<cid> under a wall cap; returns its result dict."""
+    allj = json.loads(Path(jobs).read_text())
+    allj[cid] = cjob
+    cj = Path(root).resolve() / f"{cid}.jobs.json"
+    cj.write_text(json.dumps(allj))
+    t0 = time.time()
+    pr = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), str(cj), cid, str(Path(root).resolve()), nt, ne],
+                          stdout=open(Path(root) / f"{cid}.log", "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        pr.wait(timeout=cap)
+    except subprocess.TimeoutExpired:
+        import signal
+        os.killpg(pr.pid, signal.SIGTERM)     # the child's own session: its mpirun/pw.x/ph.x/epw.x go too
+        time.sleep(5)
+        try:
+            os.killpg(pr.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return dict(status="fail:timeout", wall_s=round(time.time() - t0, 1))
+    rp = Path(root) / cid / "result.json"
+    r = json.loads(rp.read_text()) if rp.exists() else dict(status="fail:child")
+    r["wall_s"] = round(time.time() - t0, 1)
+    return r
+
+
 def main(jobs, jid, root, nt="8", ne="8"):
+    root = str(Path(root).resolve())
+    job = json.loads(Path(jobs).read_text())[jid]
+    res = run_chain(jobs, jid, root, nt, ne)
+    W = Path(root) / jid
+    if res["status"] == "s1_rerelax":                    # S1: one re-relax along the unstable mode, then a rerun
+        import s1
+        stc, ncell = s1.displaced(W, res["relaxed"], res["s1"]["worst"])
+        cj = {k: v for k, v in job.items() if k not in ("structure", "st", "no_relax")}
+        cj.update(st=stc, s1_rerun=True, s1_supercell=ncell)
+        cr = child(jobs, jid, root, f"{jid}__s1", cj, nt, ne, S1_CAP)
+        res["s1"]["rerun"] = json.loads(json.dumps({k: cr.get(k) for k in (
+            "status", "metrics", "pass_T3a", "s1", "omega_min_cm", "wall_s", "total_s", "flag_wannier", "S_W")}))
+        res["s1"]["supercell"] = ncell
+        res["stages"]["s1_child"] = cr.get("wall_s", 0.0)
+        if cr["status"] == "ok":                         # stable after the re-relax: the child's verdict stands
+            res.update(status="ok", metrics=cr["metrics"], pass_T3a=cr["pass_T3a"], s1_rerelaxed=True,
+                       flag_wannier=cr.get("flag_wannier"), S_W=cr.get("S_W"))
+        else:
+            wst = (cr.get("s1") or res["s1"])["worst"]
+            res.update(status="unstable_dfpt", pass_T3a=False,
+                       disposition="sscha" if wst["H_participation"] > 0.5 else "reject")
+            if cr["status"] != "unstable_dfpt":
+                res["s1"]["note"] = f"rerun {'cost-skipped' if cr['status'] == 'fail:timeout' else 'failed'} ({cr['status']})"
+    elif res["status"].startswith("fail:") and not job.get("t3b_lite") and not job.get("s1_rerun"):
+        route = ["G4 alternative path (setup B, 3q refinement)"] if res["status"] in ("fail:wannier",) else []
+        if res["status"] != "fail:timeout":
+            g = res.get("grids") or {}
+            nq = (g.get("nq") or 2) + 1
+            k = g.get("k") or [nq] * 3
+            kscf = [nq * math.ceil(4 * x / (3 * nq)) for x in k]
+            cj = {kk: v for kk, v in job.items() if kk not in ("nq", "kscf")}
+            cj.update(nq=nq, kscf=kscf, t3b_lite=True)
+            cr = child(jobs, jid, root, f"{jid}__t3bl", cj, nt, ne, T3BL_CAP)
+            route.append(f"T3b-lite: {cr['status']}")
+            res["t3b_lite"] = {k: cr.get(k) for k in ("status", "metrics", "pass_T3a", "grids", "wall_s", "flag_wannier")}
+            res["stages"]["t3b_lite_child"] = cr.get("wall_s", 0.0)
+            if cr["status"] == "ok":
+                res["pass_T3a"] = cr["pass_T3a"]
+                res["resolved_by"] = "t3b_lite"
+        if "resolved_by" not in res:
+            route.append("hand queue")
+            with open(Path(root) / "hand_queue.jsonl", "a") as fo:
+                fo.write(json.dumps(dict(id=jid, status=res["status"], t3b_lite=res.get("t3b_lite", {}).get("status"))) + "\n")
+        res["route"] = route
+    res["total_s"] = round(sum(res["stages"].values()), 2)
+    (W / "result.json").write_text(json.dumps(res, indent=1))
+    print("FINAL", jid, res["status"], res.get("pass_T3a"), res.get("disposition"), res.get("metrics"), flush=True)
+    return res
+
+
+def run_chain(jobs, jid, root, nt="8", ne="8"):
     job = json.loads(Path(jobs).read_text())[jid]
     W = Path(root) / jid
     W.mkdir(parents=True, exist_ok=True)
     os.chdir(W)
     st0 = qe.canonical(job["st"] if "st" in job else qe.from_pmg(job["structure"]))   # G4(a): wrapped into [0,1), sites sorted by Z
-    res = dict(id=jid, Ttarget=job.get("Ttarget"), stages={}, nat=len(st0["species"]), generator="G1G2")
+    res = dict(id=jid, Ttarget=job.get("Ttarget"), stages={}, nat=len(st0["species"]), generator="G1-G5+S1",
+               pset=qe.pset(), overrides={k: job[k] for k in ("ecut", "nq", "kscf", "no_relax", "t3b_lite", "s1_rerun")
+                                          if k in job})
     tsv = open("timings.tsv", "a")
 
     def stage(name, cmd, out, env_extra=None, timeout=None):
@@ -66,7 +159,7 @@ def main(jobs, jid, root, nt="8", ne="8"):
     omp = {"OMP_NUM_THREADS": nt, "RTSC_STH": "0", "RTSC_STRICT": "0", "RTSC_STH_MP": "0"}
     ecut = job.get("ecut") or qe.ecut_rule(st0["species"])
     nq_over = job.get("nq")          # study override (task 4: q 3^3); the generator rule is qe.t3a_grids
-    g = qe.t3a_grids(st0, nq=nq_over)
+    g = grids(st0, job)
     res["grids"] = dict(g, ecut=ecut)
     prefix = "x"
     done = {}
@@ -82,7 +175,7 @@ def main(jobs, jid, root, nt="8", ne="8"):
         xn = qe.read_xml(f"{prefix}.save/data-file-schema.xml")
         st = xn["structure"]
         res["relaxed"] = st
-        g = qe.t3a_grids(st, nq=nq_over)
+        g = grids(st, job)
         res["grids"] = dict(g, ecut=ecut)
         import re
         ef = float(re.findall(r"the Fermi energy is\s+(-?[\d.]+) ev", Path("scf.out").read_text())[-1])
@@ -108,12 +201,19 @@ def main(jobs, jid, root, nt="8", ne="8"):
     return after_relax(res, st, ecut, nq_over, prefix, ne, stage, finish, job, mpi, omp)
 
 
+def grids(st, job):
+    g = qe.t3a_grids(st, nq=job.get("nq"))
+    if job.get("kscf"):
+        g["k"] = list(job["kscf"])
+    return g
+
+
 def after_relax(res, st, ecut, nq_over, prefix, ne, stage, finish, job, mpi, omp):
     res["relaxed"] = st
     shutil.rmtree(f"{prefix}.save", ignore_errors=True)
     for f in Path(".").glob(f"{prefix}.wfc*"):
         f.unlink()
-    g = qe.t3a_grids(st, nq=nq_over)      # grids from the relaxed cell
+    g = grids(st, job)      # grids from the relaxed cell
     res["grids"] = dict(g, ecut=ecut)
     # 2. scf
     Path("scf.in").write_text(qe.pw_input(st, "scf", prefix, g["k"], ecut, pseudo=PSEUDO))
@@ -133,6 +233,15 @@ def after_relax(res, st, ecut, nq_over, prefix, ne, stage, finish, job, mpi, omp
     import re
     freqs = [float(c) for _, c in re.findall(r"freq \(\s*\d+\) =\s*(-?[\d.]+) \[THz\] =\s*(-?[\d.]+) \[cm-1\]", phout)]
     res["omega_min_cm"] = min(freqs) if freqs else None
+    import s1   # S1: DFPT stability (Gamma acoustic excluded); an unstable candidate does not pass and skips EPW
+    try:
+        res["s1"] = s1.analyze(".", prefix)
+    except Exception as ex:  # noqa: BLE001
+        res["s1_error"] = str(ex)[:200]
+        return finish("fail:s1")
+    if res["s1"]["unstable"]:
+        res["pass_T3a"] = False
+        return finish("unstable_dfpt" if job.get("s1_rerun") else "s1_rerelax")
     # 4. collect (as run-fork.sh)
     nqirr = int(open(f"{prefix}.dyn0").read().split("\n")[1].split()[0])
     os.makedirs("save", exist_ok=True)
@@ -170,7 +279,7 @@ def run_setups(st, g, nk, xs, xn, nsemi, nw, froz, prefix, ne, stage, tag=""):
                f"-x OMP_NUM_THREADS {BIN}/epw.x -npool {ne} -in epw.in")
     setups = {}
     for attempt, scdm in (("epw_atomic", False), ("epw_scdmf", True)):
-        if froz is None and not scdm:
+        if froz is None:     # F0c fix: no frozen window -> no setup (SCDM without a window is the retired G3 leg)
             continue
         # EPW resumes from restart.fmt ("All q-points are done, no need to restart") and would silently reuse the
         # previous setup's interpolated e-ph data (found in W1: the second setup returned a stale lambda). Clear it.

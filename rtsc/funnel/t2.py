@@ -2,7 +2,7 @@
 
     python3 t2.py <t1 relaxed.jsonl> <ids,comma|all> <workroot> <out.jsonl> [NT]
 
-ecutwfc 80 Ry for every phase (one cutoff across a reaction), MP smearing 0.02 Ry, k spacing 0.20 A^-1,
+ecutwfc: G5 over all elements of the phases in one call (one cutoff across a reaction; F0/F0b: 80 Ry), MP smearing 0.02 Ry, k spacing 0.20 A^-1,
 spin-polarised if a Cr/Mn/Fe/Co/Ni is present. 'H2' (molecule in its 12 A box) uses one k-point.
 N(E_F): Gaussian 0.1 eV on the SCF eigenvalues, states/eV/atom. Restart-safe on (id, xc).
 """
@@ -32,6 +32,8 @@ def main(src, ids, root, out, nt="8"):
     if Path(out).exists():
         seen = {(json.loads(l)["id"], json.loads(l)["xc"]) for l in Path(out).read_text().splitlines() if l.strip()}
     env = dict(os.environ, OMP_NUM_THREADS=nt, RTSC_STH="0")
+    # G5 (FUNNEL section 8): one cutoff across the reaction = the G5 cutoff over every element of the phases run together
+    ecut = qe.ecut_rule({e for k in want if k in recs for e in qe.from_pmg(recs[k]["structure"])["species"]})
     with open(out, "a") as fo:
         for k in want:
             if k not in recs:
@@ -45,7 +47,7 @@ def main(src, ids, root, out, nt="8"):
                 W.mkdir(parents=True, exist_ok=True)
                 mag = bool(set(st["species"]) & qe.MAGNETIC)
                 kk = [1, 1, 1] if k == "H2" else qe.kgrid(st["lattice"], 0.20)
-                txt = qe.pw_input(st, "scf", "t2", kk, 80, pseudo=PSEUDO, nspin=2 if mag else 1,
+                txt = qe.pw_input(st, "scf", "t2", kk, ecut, pseudo=PSEUDO, nspin=2 if mag else 1,
                                   xc="pbesol" if xc == "pbesol" else None, conv="1.0d-8")
                 (W / "scf.in").write_text(txt)
                 t0 = time.time()
@@ -54,7 +56,7 @@ def main(src, ids, root, out, nt="8"):
                                          f"{BIN}/pw.x", "-in", "scf.in"], cwd=W, stdout=f, stderr=subprocess.STDOUT,
                                         env=env, timeout=3600).returncode
                 dt = time.time() - t0
-                rec = dict(id=k, xc=xc, nat=len(st["species"]), k=kk, spin=mag, wall_s=round(dt, 2), rc=rc)
+                rec = dict(id=k, xc=xc, nat=len(st["species"]), k=kk, ecut=ecut, spin=mag, wall_s=round(dt, 2), rc=rc)
                 try:
                     x = qe.read_xml(W / "t2.save/data-file-schema.xml")
                     rec.update(energy=x["energy"], e_atom=x["energy"] / len(st["species"]), ef=x["ef"],
