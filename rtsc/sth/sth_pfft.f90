@@ -35,8 +35,8 @@ MODULE sth_pfft
   LOGICAL, SAVE :: ready = .FALSE.
   INTEGER, SAVE :: n1, n2, n3, ld, nst, nxa, nzst, ngrp, nkq, pchunk, shm_xy, shm_z
   INTEGER, SAVE :: h_nf(3), h_fac(MAXF, 3), lb(3)
-  INTEGER, DEVICE, ALLOCATABLE :: d_fac(:,:), d_sx(:), d_sy(:), d_xa(:), d_zmap(:,:)
-  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_tw1(:), d_tw2(:), d_tw3(:), d_S(:,:)
+  INTEGER, DEVICE, ALLOCATABLE :: d_fac(:,:), d_sx(:), d_sy(:), d_xa(:), d_zmap(:,:), d_tab(:,:,:)
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_tw1(:), d_tw2(:), d_tw3(:), d_tw1m(:), d_tw2m(:), d_S(:,:)
   !
 CONTAINS
   !
@@ -53,67 +53,35 @@ CONTAINS
   ! device FFT building blocks
   !-------------------------------------------------------------------------------------------------
   !
-  ATTRIBUTES(DEVICE) SUBROUTINE bfly(P, base, es, n, R, m, ns, step, j, tw, sgn, d, a0, a1, a2, a3, a4)
-    ! Stockham butterfly j of one stage (radix R, ns = product of the previous radices, m = n/R):
-    ! loads P(base + es*(j + r*m)), applies the twiddles exp(sgn 2 pi i r (j mod ns) / (ns R)) and the
-    ! radix-R DFT with sign sgn; returns the outputs and their first destination index d (stride ns).
+  ATTRIBUTES(DEVICE) SUBROUTINE bfly(P, base, es, R, m, j, ke, tw, sgn, a0, a1, a2, a3, a4)
+    ! Stockham butterfly j of one stage (radix R, m = n/R): loads P(base + es*(j + r*m)), applies the
+    ! twiddles tw(r*ke) = exp(sgn 2 pi i r (j mod ns) / (ns R)) (tw is the table of sign sgn) and the
+    ! radix-R DFT with sign sgn. Destinations are precomputed by the caller (stage tables).
     COMPLEX(dp) :: P(0:*), tw(0:*)
-    INTEGER, VALUE :: base, es, n, R, m, ns, step, j, sgn
-    INTEGER :: d
+    INTEGER, VALUE :: base, es, R, m, j, ke, sgn
     COMPLEX(dp) :: a0, a1, a2, a3, a4
     COMPLEX(dp) :: t1, t2, t3, t4, b1, b2, c1, c2
-    INTEGER :: k, e
     REAL(dp), PARAMETER :: s3 = 0.866025403784438646763723170752936183_dp
     REAL(dp), PARAMETER :: c51 = 0.309016994374947424102293417182819059_dp, &
                            c52 = -0.809016994374947424102293417182819059_dp, &
                            s51 = 0.951056516295153572116439333379382143_dp, &
                            s52 = 0.587785252292473129168705954639072769_dp
     REAL(dp) :: sg
-    k = MOD(j, ns)
-    d = (j / ns) * ns * R + k
     sg = REAL(sgn, dp)
     a0 = P(base + es * j)
     a1 = P(base + es * (j + m))
-    e = k * step
-    IF (k > 0) THEN
-      IF (sgn > 0) THEN
-        a1 = a1 * tw(e)
-      ELSE
-        a1 = a1 * CONJG(tw(e))
-      ENDIF
-    ENDIF
+    IF (ke > 0) a1 = a1 * tw(ke)
     IF (R >= 3) THEN
       a2 = P(base + es * (j + 2 * m))
-      IF (k > 0) THEN
-        e = 2 * k * step
-        IF (sgn > 0) THEN
-          a2 = a2 * tw(e)
-        ELSE
-          a2 = a2 * CONJG(tw(e))
-        ENDIF
-      ENDIF
+      IF (ke > 0) a2 = a2 * tw(2 * ke)
     ENDIF
     IF (R >= 4) THEN
       a3 = P(base + es * (j + 3 * m))
-      IF (k > 0) THEN
-        e = 3 * k * step
-        IF (sgn > 0) THEN
-          a3 = a3 * tw(e)
-        ELSE
-          a3 = a3 * CONJG(tw(e))
-        ENDIF
-      ENDIF
+      IF (ke > 0) a3 = a3 * tw(3 * ke)
     ENDIF
     IF (R == 5) THEN
       a4 = P(base + es * (j + 4 * m))
-      IF (k > 0) THEN
-        e = 4 * k * step
-        IF (sgn > 0) THEN
-          a4 = a4 * tw(e)
-        ELSE
-          a4 = a4 * CONJG(tw(e))
-        ENDIF
-      ENDIF
+      IF (ke > 0) a4 = a4 * tw(4 * ke)
     ENDIF
     SELECT CASE (R)
     CASE (2)
@@ -168,42 +136,44 @@ CONTAINS
     IF (R == 5) P(base + es * (d + 4 * ns)) = a4
   END SUBROUTINE bstore
   !
-  ATTRIBUTES(DEVICE) SUBROUTINE wfft(P, b0, bs, xa, usexa, l0, nlb, es, n, nf, fac, tw, sgn, lane)
+  ATTRIBUTES(DEVICE) SUBROUTINE wfft(P, b0, bs, xa, usexa, l0, nlb, es, n, nf, fac, tab, tw, sgn, lane)
     ! in-place FFTs (sign sgn, unnormalised) of the nlb lines l = l0..l0+nlb-1 by one warp; line l is
     ! P(base_l + es*i), i = 0..n-1, base_l = xa(l+1) if usexa, else b0 + bs*l. The (line, butterfly)
     ! items of a stage are spread over the 32 lanes, at most two per lane (nlb * n/R <= 64).
+    ! tab(t+1, st) packs, for item t of stage st: line (6 bits), butterfly j (7), destination (7) and
+    ! twiddle exponent (7); tw is the twiddle table of sign sgn.
     COMPLEX(dp) :: P(0:*), tw(0:*)
     INTEGER, VALUE :: b0, bs, usexa, l0, nlb, es, n, nf, sgn, lane
-    INTEGER :: fac(*), xa(*)
-    INTEGER :: st, R, m, ns, step, dA, dB, tot, it, l, jA, jB, baseA, baseB
+    INTEGER :: fac(*), xa(*), tab(64, *)
+    INTEGER :: st, R, m, ns, dA, dB, tot, l, jA, jB, kA, kB, baseA, baseB, e
     LOGICAL :: okA, okB
     COMPLEX(dp) :: a0, a1, a2, a3, a4, b0v, b1, b2, b3, b4
     ns = 1
     DO st = 1, nf
       R = fac(st)
       m = n / R
-      step = n / (ns * R)
       tot = nlb * m
       okA = lane < tot
       okB = lane + 32 < tot
       IF (okA) THEN
-        l = lane / m; jA = lane - l * m
+        e = tab(lane + 1, st)
+        l = IAND(e, 63); jA = IAND(ISHFT(e, -6), 127); dA = IAND(ISHFT(e, -13), 127); kA = ISHFT(e, -20)
         IF (usexa /= 0) THEN
           baseA = xa(l0 + l + 1)
         ELSE
           baseA = b0 + bs * (l0 + l)
         ENDIF
-        CALL bfly(P, baseA, es, n, R, m, ns, step, jA, tw, sgn, dA, a0, a1, a2, a3, a4)
+        CALL bfly(P, baseA, es, R, m, jA, kA, tw, sgn, a0, a1, a2, a3, a4)
       ENDIF
       IF (okB) THEN
-        it = lane + 32
-        l = it / m; jB = it - l * m
+        e = tab(lane + 33, st)
+        l = IAND(e, 63); jB = IAND(ISHFT(e, -6), 127); dB = IAND(ISHFT(e, -13), 127); kB = ISHFT(e, -20)
         IF (usexa /= 0) THEN
           baseB = xa(l0 + l + 1)
         ELSE
           baseB = b0 + bs * (l0 + l)
         ENDIF
-        CALL bfly(P, baseB, es, n, R, m, ns, step, jB, tw, sgn, dB, b0v, b1, b2, b3, b4)
+        CALL bfly(P, baseB, es, R, m, jB, kB, tw, sgn, b0v, b1, b2, b3, b4)
       ENDIF
       CALL syncwarp(-1)
       IF (okA) CALL bstore(P, baseA, es, R, ns, dA, a0, a1, a2, a3, a4)
@@ -218,11 +188,11 @@ CONTAINS
   !-------------------------------------------------------------------------------------------------
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_pz_inv(S, x, list, s0, nslot, npert, npwx, nst, n3, zmap, nzst, &
-                                         fac, nf3, tw3, lbz)
+                                         fac, nf3, tw3, lbz, tab)
     ! S(stick + nst*z, j) = inverse z-FFT of the column list(s0+j) on the sticks of group blockIdx%x
     INTEGER, VALUE :: s0, nslot, npert, npwx, nst, n3, nzst, nf3, lbz
     COMPLEX(dp) :: S(nzst, *), x(npwx, *), tw3(0:*)
-    INTEGER :: list(*), zmap(nzst, *), fac(MAXF, 3)
+    INTEGER :: list(*), zmap(nzst, *), fac(MAXF, 3), tab(64, MAXF, 3)
     COMPLEX(dp), SHARED :: sm(0:*)
     INTEGER :: j, col, k, g, tid, lane, w, nw, p, sl, i3, sg, ig, l, lz, tw0, nlz
     COMPLEX(dp) :: v
@@ -248,7 +218,7 @@ CONTAINS
     CALL syncthreads()
     nlz = MIN(GS, nst - g * GS)
     DO l = w * lbz, nlz - 1, nw * lbz
-      CALL wfft(sm, 0, 1, fac, 0, l, MIN(lbz, nlz - l), GS + 1, n3, nf3, fac(1, 3), sm(tw0), 1, lane)
+      CALL wfft(sm, 0, 1, fac, 0, l, MIN(lbz, nlz - l), GS + 1, n3, nf3, fac(1, 3), tab(1, 1, 3), sm(tw0), 1, lane)
     ENDDO
     CALL syncthreads()
     DO p = tid, GS * n3 - 1, blockDim%x
@@ -258,28 +228,21 @@ CONTAINS
   END SUBROUTINE k_pz_inv
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_pxy(S, v, nst, n1, n2, n3, ld, nzst, sx, sy, xa, nxa, fac, nf1, nf2, tw1, tw2, &
-                                      lbx, lby)
+                                      tw1m, tw2m, lbx, lby, tab)
     ! one z-plane (blockIdx%x) of column j: y-inverse on the occupied x-columns, x-inverse, *V,
     ! x-forward, y-forward on the occupied x-columns; reads and writes only the stick values
     INTEGER, VALUE :: nst, n1, n2, n3, ld, nzst, nxa, nf1, nf2, lbx, lby
-    COMPLEX(dp) :: S(nzst, *), tw1(0:*), tw2(0:*)
+    COMPLEX(dp) :: S(nzst, *), tw1(0:*), tw2(0:*), tw1m(0:*), tw2m(0:*)
     REAL(dp) :: v(*)
-    INTEGER :: sx(*), sy(*), xa(*), fac(MAXF, 3)
+    INTEGER :: sx(*), sy(*), xa(*), fac(MAXF, 3), tab(64, MAXF, 3)
     COMPLEX(dp), SHARED :: sm(0:*)
-    INTEGER :: j, i3, tid, lane, w, nw, p, l, i1, i2, o1, o2, np
+    INTEGER :: j, i3, tid, lane, w, nw, p, l, i1, i2, np
     j = blockIdx%y
     i3 = blockIdx%x - 1
     tid = threadIdx%x - 1; lane = IAND(tid, 31); w = tid / 32; nw = blockDim%x / 32
     np = ld * n2
-    o1 = np; o2 = np + n1
     DO p = tid, np - 1, blockDim%x
       sm(p) = (0.0_dp, 0.0_dp)
-    ENDDO
-    DO p = tid, n1 - 1, blockDim%x
-      sm(o1 + p) = tw1(p)
-    ENDDO
-    DO p = tid, n2 - 1, blockDim%x
-      sm(o2 + p) = tw2(p)
     ENDDO
     CALL syncthreads()
     DO p = tid, nst - 1, blockDim%x
@@ -287,11 +250,11 @@ CONTAINS
     ENDDO
     CALL syncthreads()
     DO l = w * lby, nxa - 1, nw * lby
-      CALL wfft(sm, 0, 0, xa, 1, l, MIN(lby, nxa - l), ld, n2, nf2, fac(1, 2), sm(o2), 1, lane)
+      CALL wfft(sm, 0, 0, xa, 1, l, MIN(lby, nxa - l), ld, n2, nf2, fac(1, 2), tab(1, 1, 2), tw2, 1, lane)
     ENDDO
     CALL syncthreads()
     DO l = w * lbx, n2 - 1, nw * lbx
-      CALL wfft(sm, 0, ld, xa, 0, l, MIN(lbx, n2 - l), 1, n1, nf1, fac(1, 1), sm(o1), 1, lane)
+      CALL wfft(sm, 0, ld, xa, 0, l, MIN(lbx, n2 - l), 1, n1, nf1, fac(1, 1), tab(1, 1, 1), tw1, 1, lane)
     ENDDO
     CALL syncthreads()
     DO p = tid, n1 * n2 - 1, blockDim%x
@@ -300,11 +263,11 @@ CONTAINS
     ENDDO
     CALL syncthreads()
     DO l = w * lbx, n2 - 1, nw * lbx
-      CALL wfft(sm, 0, ld, xa, 0, l, MIN(lbx, n2 - l), 1, n1, nf1, fac(1, 1), sm(o1), -1, lane)
+      CALL wfft(sm, 0, ld, xa, 0, l, MIN(lbx, n2 - l), 1, n1, nf1, fac(1, 1), tab(1, 1, 1), tw1m, -1, lane)
     ENDDO
     CALL syncthreads()
     DO l = w * lby, nxa - 1, nw * lby
-      CALL wfft(sm, 0, 0, xa, 1, l, MIN(lby, nxa - l), ld, n2, nf2, fac(1, 2), sm(o2), -1, lane)
+      CALL wfft(sm, 0, 0, xa, 1, l, MIN(lby, nxa - l), ld, n2, nf2, fac(1, 2), tab(1, 1, 2), tw2m, -1, lane)
     ENDDO
     CALL syncthreads()
     DO p = tid, nst - 1, blockDim%x
@@ -313,13 +276,13 @@ CONTAINS
   END SUBROUTINE k_pxy
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_pz_fwd(y, x, S, list, s0, nslot, npert, npwx, nksq, nbnd, nst, n3, &
-                                         zmap, nzst, fac, nf3, tw3, npwq, g2, etk, scale, lbz)
+                                         zmap, nzst, fac, nf3, tw3, npwq, g2, etk, scale, lbz, tab)
     ! forward z-FFT of the sticks of group blockIdx%x, then (as k_gather_h, opvar 0)
     !   y(G) = g2kin(G) x(G) + scale * Vx(G) - e_n x(G) on the sphere; rows > npwq zeroed (group 0)
     INTEGER, VALUE :: s0, nslot, npert, npwx, nksq, nbnd, nst, n3, nzst, nf3, lbz
     REAL(dp), VALUE :: scale
     COMPLEX(dp) :: y(npwx, *), x(npwx, *), S(nzst, *), tw3(0:*)
-    INTEGER :: list(*), zmap(nzst, *), fac(MAXF, 3), npwq(nksq)
+    INTEGER :: list(*), zmap(nzst, *), fac(MAXF, 3), npwq(nksq), tab(64, MAXF, 3)
     REAL(dp) :: g2(npwx, nksq), etk(nbnd, nksq)
     COMPLEX(dp), SHARED :: sm(0:*)
     INTEGER :: j, col, k, n, g, tid, lane, w, nw, p, sl, i3, sg, ig, l, lz, tw0, nlz
@@ -333,7 +296,7 @@ CONTAINS
     lz = (GS + 1) * n3
     tw0 = lz
     DO p = tid, n3 - 1, blockDim%x
-      sm(tw0 + p) = tw3(p)
+      sm(tw0 + p) = CONJG(tw3(p))
     ENDDO
     DO p = tid, GS * n3 - 1, blockDim%x
       sl = MOD(p, GS); i3 = p / GS; sg = g * GS + sl
@@ -346,7 +309,7 @@ CONTAINS
     CALL syncthreads()
     nlz = MIN(GS, nst - g * GS)
     DO l = w * lbz, nlz - 1, nw * lbz
-      CALL wfft(sm, 0, 1, fac, 0, l, MIN(lbz, nlz - l), GS + 1, n3, nf3, fac(1, 3), sm(tw0), -1, lane)
+      CALL wfft(sm, 0, 1, fac, 0, l, MIN(lbz, nlz - l), GS + 1, n3, nf3, fac(1, 3), tab(1, 1, 3), sm(tw0), -1, lane)
     ENDDO
     CALL syncthreads()
     DO p = tid, GS * n3 - 1, blockDim%x
@@ -423,7 +386,7 @@ CONTAINS
     DO d = 1, 3
       lb(d) = MAX(1, 64 / (nr(d) / MINVAL(h_fac(1:h_nf(d), d))))
     ENDDO
-    shm_xy = 16 * (ld * n2 + n1 + n2)
+    shm_xy = 16 * ld * n2
     shm_z = 16 * ((GS + 1) * n3 + n3)
     IF (shm_xy > 99 * 1024 .OR. shm_z > 48 * 1024) THEN
       ierr = 3; RETURN
@@ -483,10 +446,29 @@ CONTAINS
     istat = cudaMemGetInfo(freeb, totb)
     pchunk = INT(MIN(INT(chunk, 8), MAX(1_8, (freeb / 8) / (16_8 * nzst))))
     ALLOCATE(d_fac(MAXF, 3), d_sx(nst), d_sy(nst), d_xa(nxa), d_zmap(nzst, nksq))
-    ALLOCATE(d_tw1(0:n1 - 1), d_tw2(0:n2 - 1), d_tw3(0:n3 - 1))
+    ALLOCATE(d_tw1(0:n1 - 1), d_tw2(0:n2 - 1), d_tw3(0:n3 - 1), d_tw1m(0:n1 - 1), d_tw2m(0:n2 - 1))
     ALLOCATE(d_S(nzst, pchunk))
     d_fac = h_fac; d_sx = sx; d_sy = sy; d_xa = xa; d_zmap = zm
+    ! stage tables: item t of stage st -> line, butterfly, destination, twiddle exponent (packed)
+    BLOCK
+      INTEGER :: htab(64, MAXF, 3), st, ns, R, m, step, t, ll, jj, kk, dd
+      htab = 0
+      DO d = 1, 3
+        ns = 1
+        DO st = 1, h_nf(d)
+          R = h_fac(st, d); m = nr(d) / R; step = nr(d) / (ns * R)
+          DO t = 0, 63
+            ll = t / m; jj = MOD(t, m); kk = MOD(jj, ns); dd = (jj / ns) * ns * R + kk
+            htab(t + 1, st, d) = IOR(IOR(IOR(MIN(ll, 63), ISHFT(jj, 6)), ISHFT(dd, 13)), ISHFT(kk * step, 20))
+          ENDDO
+          ns = ns * R
+        ENDDO
+      ENDDO
+      ALLOCATE(d_tab(64, MAXF, 3))
+      d_tab = htab
+    END BLOCK
     d_tw1 = tw(0:n1 - 1); d_tw2 = tw(n1:n1 + n2 - 1); d_tw3 = tw(n1 + n2:nmax - 1)
+    d_tw1m = CONJG(tw(0:n1 - 1)); d_tw2m = CONJG(tw(n1:n1 + n2 - 1))
     DEALLOCATE(smap, xon, sx, sy, xa, zm, tw)
     istat = cudaFuncSetAttribute(k_pxy, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_xy)
     IF (istat /= cudaSuccess) THEN
@@ -497,7 +479,7 @@ CONTAINS
   END SUBROUTINE pfft_setup
   !
   SUBROUTINE pfft_free()
-    IF (ALLOCATED(d_fac)) DEALLOCATE(d_fac, d_sx, d_sy, d_xa, d_zmap, d_tw1, d_tw2, d_tw3)
+    IF (ALLOCATED(d_fac)) DEALLOCATE(d_fac, d_sx, d_sy, d_xa, d_zmap, d_tw1, d_tw2, d_tw3, d_tab, d_tw1m, d_tw2m)
     IF (ALLOCATED(d_S)) DEALLOCATE(d_S)
     ready = .FALSE.
   END SUBROUTINE pfft_free
@@ -516,11 +498,11 @@ CONTAINS
     DO WHILE (s0 < nl)
       nb = MIN(pchunk, nl - s0)
       CALL k_pz_inv<<<dim3(ngrp, nb, 1), NTH, shm_z, strm>>>(d_S, x, list, s0, nslot, npert, npwx, nst, n3, &
-           d_zmap, nzst, d_fac, h_nf(3), d_tw3, lb(3))
+           d_zmap, nzst, d_fac, h_nf(3), d_tw3, lb(3), d_tab)
       CALL k_pxy<<<dim3(n3, nb, 1), NTH, shm_xy, strm>>>(d_S, vrs, nst, n1, n2, n3, ld, nzst, d_sx, d_sy, d_xa, &
-           nxa, d_fac, h_nf(1), h_nf(2), d_tw1, d_tw2, lb(1), lb(2))
+           nxa, d_fac, h_nf(1), h_nf(2), d_tw1, d_tw2, d_tw1m, d_tw2m, lb(1), lb(2), d_tab)
       CALL k_pz_fwd<<<dim3(ngrp, nb, 1), NTH, shm_z, strm>>>(y, x, d_S, list, s0, nslot, npert, npwx, nksq, &
-           nbnd, nst, n3, d_zmap, nzst, d_fac, h_nf(3), d_tw3, npwq, g2, etk, scale, lb(3))
+           nbnd, nst, n3, d_zmap, nzst, d_fac, h_nf(3), d_tw3, npwq, g2, etk, scale, lb(3), d_tab)
       istat = cudaGetLastError()
       IF (istat /= cudaSuccess) THEN
         WRITE(*, '(A,A)') 'sth_pfft: launch failed: ', TRIM(cudaGetErrorString(istat))

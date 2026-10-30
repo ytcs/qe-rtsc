@@ -27,6 +27,7 @@ MODULE sth_engine
   USE cufft
   USE cublas_v2
   USE sth_pfft, ONLY : pfft_setup, pfft_free, pfft_local, pfft_ok, pfft_info
+  USE sth_pfft_s, ONLY : pfs_setup, pfs_free, pfs_local, pfs_ok
   IMPLICIT NONE
   PRIVATE
   !
@@ -1150,6 +1151,11 @@ CONTAINS
     CALL k_coef_h_s<<<nsl, 32 * ((nproj + 31) / 32), 0, strm>>>(s_cf2, s_cf, s_dmat, nproj, nkb, nslot, &
          npert, nksq, d_nockq, REAL(alpha_pv, sp))
     CALL kerr('coef_h_s')
+    IF (pfs_ok()) THEN
+      CALL pfs_local(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, s_vrs, d_npwq, s_g2, d_etk, scale, strm)
+      CALL gemm_back_s(s_cf2, y)
+      RETURN
+    ENDIF
     s0 = 0
     DO WHILE (s0 < nl)
       nb = MIN(sth_bmax, nl - s0)
@@ -1705,6 +1711,10 @@ CONTAINS
         ELSE
           WRITE(*, '(A,I3,A)') '     rtsc pfft: unsupported grid/box (', ier, '), cuFFT path kept'
         ENDIF
+        IF (ier == 0 .AND. mp_q) THEN
+          CALL pfs_setup(nr, nrx, nksq, npwx, h_npwq, h_idxkq, 1024, ier)
+          IF (ier /= 0) WRITE(*, '(A,I3,A)') '     rtsc pfft: FP32 twin unsupported (', ier, '), C2C cuFFT kept'
+        ENDIF
       END BLOCK
     ENDIF
     istat = cudaDeviceSynchronize()
@@ -2095,6 +2105,7 @@ CONTAINS
     IF (ALLOCATED(s_W)) DEALLOCATE(s_W, s_hd, s_g2, s_vrs, s_dmat, s_box)
     mp_q = .FALSE.
     CALL pfft_free()
+    CALL pfs_free()
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
   !

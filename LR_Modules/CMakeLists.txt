@@ -85,6 +85,7 @@ set(sources
 if(QE_ENABLE_CUDA)
     # rtsc: batched Sternheimer engine (CUDA Fortran, cuFFT, cuBLAS); used by sth_batched.f90
     list(PREPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/sth_pfft.f90
+                         ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/sth_pfft_s.f90
                          ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/sth_engine.f90
                          ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/nscf_engine.f90)
 endif()
