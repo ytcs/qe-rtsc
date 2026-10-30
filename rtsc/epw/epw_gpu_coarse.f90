@@ -230,20 +230,19 @@ CONTAINS
     REAL(dp), INTENT(IN) :: kqg(ldv, 3), tpiba
     COMPLEX(dp), INTENT(IN) :: becp1(ldb, nbnd), al1(ldb, nbnd), al2(ldb, nbnd), al3(ldb, nbnd)
     COMPLEX(dp), INTENT(OUT) :: g(nbnd, nbnd, nvset)
-    INTEGER :: istat, kb, a
+    INTEGER :: istat, a
     COMPLEX(dp), PARAMETER :: one = (1.0_dp, 0.0_dp), zero = (0.0_dp, 0.0_dp)
-    CALL egc_local_dev(npw, indk, ck, npwq, indq, cq)
+    ! all uploads first (synchronous copies), so that only the final D2H waits for the GPU work
     IF (nkbs > 0) THEN
-      DO kb = 1, nkbs
-        istat = cudaMemcpy(d_vkb(1, kb), vkb(1, kb), npwq); CALL chk(istat, 'H2D vkb')
-      ENDDO
-      DO a = 1, 3
-        istat = cudaMemcpy(d_kqg(1, a), kqg(1, a), npwq); CALL chk(istat, 'H2D kqg')
-      ENDDO
+      istat = cudaMemcpy2D(d_vkb, ldc, vkb, ldv, npwq, nkbs); CALL chk(istat, 'H2D vkb')
+      istat = cudaMemcpy2D(d_kqg, ldc, kqg, ldv, npwq, 3); CALL chk(istat, 'H2D kqg')
       istat = cudaMemcpy2D(d_bp, nkbs, becp1, ldb, nkbs, nbnd); CALL chk(istat, 'H2D becp1')
       istat = cudaMemcpy2D(d_al(1, 1, 1), nkbs, al1, ldb, nkbs, nbnd); CALL chk(istat, 'H2D alphap')
       istat = cudaMemcpy2D(d_al(1, 1, 2), nkbs, al2, ldb, nkbs, nbnd); CALL chk(istat, 'H2D alphap')
       istat = cudaMemcpy2D(d_al(1, 1, 3), nkbs, al3, ldb, nkbs, nbnd); CALL chk(istat, 'H2D alphap')
+    ENDIF
+    CALL egc_local_dev(npw, indk, ck, npwq, indq, cq)
+    IF (nkbs > 0) THEN
       ! becq_0 = vkb^H psi_k+q ; becq_a = [vkb (k+q+G)_a]^H psi_k+q
       istat = cublasZgemm(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkbs, nbnd, npwq, one, d_vkb, ldc, d_cq, ldc, zero, &
                           d_becq(1, 1, 0), nkbs)
