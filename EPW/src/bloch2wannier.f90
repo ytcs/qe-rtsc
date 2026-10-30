@@ -20,6 +20,20 @@
   CONTAINS
     !
     !--------------------------------------------------------------------------
+    LOGICAL FUNCTION b2w_gemm()
+    !--------------------------------------------------------------------------
+    !! rtsc epw3: RTSC_EPW_B2W=1 (ephbloch2wane step 2 by ZGEMM; groups/compute/EPW3-LOG.md)
+    LOGICAL, SAVE :: rd = .FALSE., on = .FALSE.
+    CHARACTER(LEN = 16) :: ev
+    IF (.NOT. rd) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_B2W', ev)
+      on = TRIM(ev) == '1'
+      rd = .TRUE.
+    ENDIF
+    b2w_gemm = on
+    END FUNCTION b2w_gemm
+    !
+    !--------------------------------------------------------------------------
     SUBROUTINE hambloch2wan(nbnd, nbndsub, nks, nkstot, et, xk, cu, &
        lwin, exband, nrr, irvec, wslen, chw)
     !--------------------------------------------------------------------------
@@ -1405,6 +1419,8 @@
     !!  e-p matrix, temporary
     COMPLEX(KIND = DP), ALLOCATABLE :: epmats(:, :, :, :)
     !!  e-p matrix  in smooth Bloch basis, coarse mesh
+    COMPLEX(KIND = DP), ALLOCATABLE :: cf(:, :)
+    !! rtsc epw3: e^{-i k R} / nkstot (RTSC_EPW_B2W)
     CHARACTER(LEN = 256) :: fnm
     !! Buffer file name
     !
@@ -1470,6 +1486,24 @@
     !
     CALL cryst_to_cart(nks, xk, at, -1)
     !
+    ! rtsc epw3 (RTSC_EPW_B2W=1; groups/compute/EPW3-LOG.md): the same sum as one ZGEMM per mode,
+    ! epmatw(:, :, :, imode) = epmats(:, :, :, imode) x cf(nks, nrr), and one reduction for all modes. Default off.
+    IF (b2w_gemm()) THEN
+      ALLOCATE(cf(nks, nrr), STAT = ierr)
+      IF (ierr /= 0) CALL errore('ephbloch2wane', 'Error allocating cf', 1)
+      DO ir = 1, nrr
+        DO ik = 1, nks
+          rdotk = twopi * DOT_PRODUCT(xk(:, ik), DBLE(irvec(:, ir)))
+          cf(ik, ir) = EXP(-ci * rdotk) / DBLE(nkstot)
+        ENDDO
+      ENDDO
+      DO imode = 1, nmodes
+        CALL ZGEMM('n', 'n', nbndsub * nbndsub, nrr, nks, cone, epmats(1, 1, 1, imode), nbndsub * nbndsub, &
+                   cf, nks, czero, epmatw(1, 1, 1, imode), nbndsub * nbndsub)
+      ENDDO
+      DEALLOCATE(cf)
+      CALL mp_sum(epmatw, inter_pool_comm)
+    ELSE
     DO imode = 1, nmodes
       DO ir = 1, nrr
         DO ik = 1, nks
@@ -1485,6 +1519,7 @@
     DO imode = 1, nmodes
       CALL mp_sum(epmatw(:, :, :, imode), inter_pool_comm)
     ENDDO
+    ENDIF ! rtsc epw3
     !
     ! bring xk back into cart coord
     !
