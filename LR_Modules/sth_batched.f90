@@ -30,8 +30,20 @@ MODULE sth_batched
   IMPLICIT NONE
   PRIVATE
   PUBLIC :: sth_call_eta
+  TYPE bec_type_copy
+    COMPLEX(DP), ALLOCATABLE :: k(:,:)
+  END TYPE bec_type_copy
   PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs, sth_batched_flush_end, &
-            sth_batched_end_q, sth_strict_check
+            sth_batched_end_q, sth_strict_check, sth_batched_dvb_ok, sth_batched_dvb_prepare
+  !
+  ! dV_bare psi built in the engine (RTSC_STH_DVB=1, KERNEL-LOG lever 4). solve_linter (PHonon) decides it
+  ! with sth_batched_dvb_ok() and, instead of the per-(k, pert) dvqpsi_us + save_buffer loop, hands over
+  ! the irrep's dvloc, patterns and alphap with sth_batched_dvb_prepare (PHonon modules are not visible
+  ! here). RTSC_STH_DVB_CHECK=1: solve_linter runs its loop too and the engine's result is compared.
+  LOGICAL, SAVE :: dvb_on = .FALSE.
+  INTEGER, SAVE :: dvb_tag = 0
+  COMPLEX(DP), ALLOCATABLE, SAVE :: dvb_vl(:,:), dvb_u(:,:)
+  TYPE(bec_type_copy), ALLOCATABLE, SAVE :: dvb_al(:,:)
   !
   LOGICAL, SAVE :: have_state = .FALSE.
   LOGICAL, SAVE :: pending = .FALSE.        ! engine dpsi not yet written to iudwf
@@ -63,6 +75,77 @@ CONTAINS
     CALL get_environment_variable(name, s, STATUS=ios)
     IF (ios == 0) sth_env_flag = (TRIM(s) == '1')
   END FUNCTION sth_env_flag
+  !
+  LOGICAL FUNCTION sth_case_ok(time_reversed, npert)
+    !! the engine's supported case (STH-ENGINE.md, v1): sth_batched_kernel runs the engine only if true
+    USE fft_base,         ONLY : dffts
+    USE mp_bands,         ONLY : nproc_bgrp, nbgrp
+    USE klist,            ONLY : lgauss, ltetra
+    USE noncollin_module, ONLY : noncolin, npol, nspin_mag
+    USE lsda_mod,         ONLY : lsda
+    USE uspp,             ONLY : okvan
+    USE ldaU,             ONLY : lda_plus_u
+    USE control_flags,    ONLY : gamma_only, scissor
+    USE realus,           ONLY : real_space
+    USE bp,               ONLY : lelfield
+    USE xc_lib,           ONLY : exx_is_active, xclib_dft_is
+    USE two_chem,         ONLY : twochem
+    USE qpoint,           ONLY : nksq
+    LOGICAL, INTENT(IN) :: time_reversed
+    INTEGER, INTENT(IN) :: npert
+    sth_case_ok = .FALSE.
+    IF (time_reversed .OR. okvan .OR. noncolin .OR. lsda .OR. nspin_mag /= 1 .OR. npol /= 1) RETURN
+    ! q = Gamma (lgamma, evq => evc): k+q = k, so the engine gets the same psi twice; the Fermi
+    ! shift of metals (ef_shift_new on drho, ef_shift_wfc_new on iudwf after the flush) acts
+    ! outside this kernel, unchanged
+    IF (lda_plus_u .OR. gamma_only .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
+    IF (xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space .OR. scissor .OR. lelfield) RETURN
+    IF (nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups) RETURN
+    IF (dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x) RETURN
+    IF (nksq < 1 .OR. npert > 6) RETURN
+    sth_case_ok = .TRUE.
+  END FUNCTION sth_case_ok
+  !
+  LOGICAL FUNCTION sth_batched_dvb_ok(time_reversed, npert)
+    !! may solve_linter skip its dV_bare psi loop? Exactly the engine's supported case (sth_case_ok, so
+    !! sth_batched_kernel cannot fall back to vanilla on an unwritten buffer), plus no NLCC
+    USE uspp,             ONLY : nlcc_any
+    LOGICAL, INTENT(IN) :: time_reversed
+    INTEGER, INTENT(IN) :: npert
+    sth_batched_dvb_ok = .FALSE.
+#if defined(__CUDA)
+    IF (.NOT. (sth_env_flag('RTSC_STH') .AND. sth_env_flag('RTSC_STH_DVB'))) RETURN
+    IF (nlcc_any .OR. .NOT. sth_case_ok(time_reversed, npert)) RETURN
+    sth_batched_dvb_ok = .TRUE.
+#endif
+  END FUNCTION sth_batched_dvb_ok
+  !
+  SUBROUTINE sth_batched_dvb_prepare(on, npe, imode0, dvl, uq, alphap)
+    !! per irrep, from solve_linter: on = engine builds dV_bare psi; dvl(nnr, npe) = compute_dvloc of each
+    !! perturbation; uq(3 nat, npe) its pattern; alphap(3, nksq) (phus) for the per-q engine state
+    USE becmod,  ONLY : bec_type
+    USE qpoint,  ONLY : nksq
+    USE fft_base, ONLY : dffts
+    LOGICAL, INTENT(IN) :: on
+    INTEGER, INTENT(IN) :: npe, imode0
+    COMPLEX(DP), INTENT(IN) :: dvl(dffts%nnr, npe), uq(:, :)
+    TYPE(bec_type), INTENT(IN) :: alphap(3, nksq)
+    INTEGER :: ik, a
+    dvb_on = on
+    IF (.NOT. on) RETURN
+    dvb_tag = imode0 + 1
+    IF (ALLOCATED(dvb_vl)) DEALLOCATE(dvb_vl, dvb_u)
+    ALLOCATE(dvb_vl(dffts%nnr, npe), dvb_u(SIZE(uq, 1), npe))
+    dvb_vl = dvl
+    dvb_u = uq(:, 1:npe)
+    IF (ALLOCATED(dvb_al)) DEALLOCATE(dvb_al)
+    ALLOCATE(dvb_al(3, nksq))
+    DO ik = 1, nksq
+      DO a = 1, 3
+        ALLOCATE(dvb_al(a, ik)%k, SOURCE = alphap(a, ik)%k)
+      ENDDO
+    ENDDO
+  END SUBROUTINE sth_batched_dvb_prepare
   !
   SUBROUTINE env_real(name, val)
     !! val = the environment variable's value if it is set and reads as a number; unchanged otherwise
@@ -231,24 +314,20 @@ CONTAINS
     eng_last = .FALSE.
 #if defined(__CUDA)
     IF (.NOT. sth_env_flag('RTSC_STH')) RETURN
-    ! supported case (STH-ENGINE.md, v1)
-    IF (time_reversed .OR. okvan .OR. noncolin .OR. lsda .OR. nspin_mag /= 1 .OR. npol /= 1) RETURN
-    ! q = Gamma (lgamma, evq => evc): k+q = k, so the engine gets the same psi twice; the Fermi
-    ! shift of metals (ef_shift_new on drho, ef_shift_wfc_new on iudwf after the flush) acts
-    ! outside this kernel, unchanged
-    IF (lda_plus_u .OR. gamma_only .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
-    IF (xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space .OR. scissor .OR. lelfield) RETURN
-    IF (nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups) RETURN
-    IF (dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x) RETURN
-    IF (nksq < 1 .OR. npert > 6) RETURN
+    ! supported case (STH-ENGINE.md, v1); the same test decides sth_batched_dvb_ok
+    IF (.NOT. sth_case_ok(time_reversed, npert)) RETURN
     !
     ! engine state belongs to this irrep? (re-initialised at every first iteration; otherwise the
     ! dV_bare psi of (k=1, pert=1) identifies the irrep, e.g. after a restart)
     xp_m = sth_env_int('RTSC_STH_XP')
     xp_m = MAX(0, MIN(8, xp_m))
     sth_xp_m = xp_m
-    CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, 1)
-    key = SUM(dvpsi(:, 1)) + (0.d0, 1.d0) * SUM(ABS(dvpsi(:, 1)))
+    IF (dvb_on) THEN
+      key = CMPLX(REAL(dvb_tag, DP), REAL(npert, DP), KIND=DP)   ! no dV_bare buffer on this path
+    ELSE
+      CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, 1)
+      key = SUM(dvpsi(:, 1)) + (0.d0, 1.d0) * SUM(ABS(dvpsi(:, 1)))
+    ENDIF
     reinit = first_iter .OR. .NOT. have_state .OR. .NOT. sth_engine_ready() .OR. npert /= st_npert &
              .OR. iudvpsi /= st_iudvpsi .OR. nksq /= st_nksq .OR. key /= st_key
     IF (reinit) THEN
@@ -265,6 +344,8 @@ CONTAINS
       ENDIF
       IF (ierr /= 0) THEN
         WRITE(stdout, '(5x,"rtsc sth: engine declined (code ",I0,"), vanilla path")') ierr
+        IF (dvb_on) CALL errore('sth_batched_kernel', 'engine declined with RTSC_STH_DVB=1 (no dV_bare buffer)', &
+             ABS(ierr))
         IF (sth_env_flag('RTSC_STRICT')) CALL errore('sth_batched_kernel', &
              'engine declined (see the sth_engine line above) and RTSC_STRICT=1', ABS(ierr))
         RETURN
@@ -487,14 +568,16 @@ CONTAINS
       npwq = ngk(ikqs(ik)); nock = nbnd_occ(ikks(ik))
       DO ipert = 1, npert
         nrec = (ipert - 1) * nksq + ik
-        CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
-        IF (npwq < npwx) THEN
-          IF (ANY(dvpsi(npwq + 1:npwx, 1:nock) /= (0.d0, 0.d0))) THEN
-            ierr = 10
-            RETURN
+        IF (.NOT. dvb_on) THEN
+          CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
+          IF (npwq < npwx) THEN
+            IF (ANY(dvpsi(npwq + 1:npwx, 1:nock) /= (0.d0, 0.d0))) THEN
+              ierr = 10
+              RETURN
+            ENDIF
           ENDIF
+          CALL sth_engine_set_dvbare(ik, ipert, dvpsi)
         ENDIF
-        CALL sth_engine_set_dvbare(ik, ipert, dvpsi)
         IF (.NOT. first_iter) THEN
           CALL get_buffer(dpsi, lrdwf, iudwf, nrec)
           CALL sth_engine_set_dpsi(ik, ipert, dpsi)
@@ -502,6 +585,7 @@ CONTAINS
       ENDDO
     ENDDO
     CALL sth_engine_irrep_commit(ierr)
+    IF (ierr == 0 .AND. dvb_on) CALL dvb_build(npert, lrdvpsi, iudvpsi)
     CALL stop_clock('sth_irrep')
   END SUBROUTINE sth_batched_irrep
   !
@@ -526,7 +610,9 @@ CONTAINS
     USE eqv,              ONLY : dpsi, dvpsi, evq
     USE sth_engine,       ONLY : sth_engine_init, sth_engine_set_global, sth_engine_set_k, &
                                  sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup, &
-                                 sth_mp, sth_mp_eta, sth_mp_safe
+                                 sth_mp, sth_mp_eta, sth_mp_safe, sth_pfft_req, sth_pfft_check, sth_dvb_req, &
+                                 sth_engine_set_nlk
+    USE lrus,             ONLY : becp1
     !
     LOGICAL, INTENT(IN) :: first_iter
     INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
@@ -542,6 +628,9 @@ CONTAINS
     CALL start_clock('sth_init')
     ! mixed precision (per q; the FP32 copies are built by sth_engine_setup)
     sth_mp = sth_env_flag('RTSC_STH_MP')
+    sth_pfft_req = sth_env_flag('RTSC_STH_PFFT')
+    sth_pfft_check = sth_env_flag('RTSC_STH_PFFT_CHECK')
+    sth_dvb_req = dvb_on
     CALL env_real('RTSC_MP_ETA', sth_mp_eta)
     CALL env_real('RTSC_MP_SAFE', sth_mp_safe)
     nslot = 0
@@ -599,8 +688,16 @@ CONTAINS
       !
       CALL sth_engine_set_k(ik, npw, npwq, nock, nockq, wk(ikk), idxk(1:npw), idxkq(1:npwq), evc, evq, &
                             et(:, ikk), g2kin, vkb, wwg(:, 1:nock), wg1(1:nock), et_kq=et(:, ikq))
+      IF (dvb_on) CALL sth_engine_set_nlk(ik, becp1(ik)%k, dvb_al(1, ik)%k, dvb_al(2, ik)%k, dvb_al(3, ik)%k)
       DO ipert = 1, npert
         nrec = (ipert - 1) * nksq + ik
+        IF (dvb_on) THEN
+          IF (.NOT. first_iter) THEN
+            CALL get_buffer(dpsi, lrdwf, iudwf, nrec)
+            CALL sth_engine_set_dpsi(ik, ipert, dpsi)
+          ENDIF
+          CYCLE
+        ENDIF
         CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
         ! the engine keeps rows > npwq at zero; vanilla carries dvbare's padding through cgsolve_all
         ! (h = g on those rows), so the two agree only when that padding is zero
@@ -625,8 +722,63 @@ CONTAINS
       !$acc update device(evc, evq)
     ENDIF
     CALL sth_engine_setup(ierr)
+    IF (ierr == 0 .AND. dvb_on) CALL dvb_build(npert, lrdvpsi, iudvpsi)
     CALL stop_clock('sth_init')
   END SUBROUTINE sth_batched_init
+  !
+  !--------------------------------------------------------------------------------------------
+  SUBROUTINE dvb_build(npert, lrdvpsi, iudvpsi)
+    !--------------------------------------------------------------------------------------------
+    !! dV_bare psi of the current irrep on the device (after the engine's irrep commit)
+    USE ions_base,        ONLY : nat, ityp
+    USE uspp,             ONLY : nkb, ofsbeta
+    USE uspp_param,       ONLY : nh
+    USE cell_base,        ONLY : tpiba
+    USE gvect,            ONLY : g
+    USE klist,            ONLY : xk, ngk, igk_k
+    USE wvfct,            ONLY : npwx
+    USE qpoint,           ONLY : nksq, ikqs
+    USE buffers,          ONLY : get_buffer
+    USE eqv,              ONLY : dvpsi
+    USE io_global,        ONLY : stdout
+    USE sth_engine,       ONLY : sth_engine_build_dvb, sth_engine_dvb_check
+    INTEGER, INTENT(IN) :: npert, lrdvpsi, iudvpsi
+    INTEGER, ALLOCATABLE :: kbat(:)
+    REAL(DP), ALLOCATABLE :: kqg(:,:,:)
+    INTEGER :: na, ih, ik, ikq, ig, a, ipert, nrec
+    REAL(DP) :: dmax, ymax
+    CALL start_clock('sth_dvb')
+    ALLOCATE(kbat(MAX(nkb, 1)), kqg(npwx, 3, nksq))
+    DO na = 1, nat
+      DO ih = 1, nh(ityp(na))
+        kbat(ofsbeta(na) + ih) = na
+      ENDDO
+    ENDDO
+    kqg = 0.d0
+    DO ik = 1, nksq
+      ikq = ikqs(ik)
+      DO a = 1, 3
+        DO ig = 1, ngk(ikq)
+          kqg(ig, a, ik) = xk(a, ikq) + g(a, igk_k(ig, ikq))
+        ENDDO
+      ENDDO
+    ENDDO
+    CALL sth_engine_build_dvb(dvb_vl, dvb_u, 3 * nat, kbat, tpiba, kqg)
+    DEALLOCATE(kbat, kqg)
+    IF (sth_env_flag('RTSC_STH_DVB_CHECK')) THEN
+      dmax = 0.d0; ymax = 0.d0
+      DO ik = 1, nksq
+        DO ipert = 1, npert
+          nrec = (ipert - 1) * nksq + ik
+          CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
+          CALL sth_engine_dvb_check(ik, ipert, dvpsi, dmax, ymax)
+        ENDDO
+      ENDDO
+      WRITE(stdout, '(5x,"rtsc dvb check: max|engine - vanilla| / max|vanilla| ",ES10.3," (max ",ES10.3,")")') &
+           dmax / MAX(ymax, TINY(1.d0)), ymax
+    ENDIF
+    CALL stop_clock('sth_dvb')
+  END SUBROUTINE dvb_build
 #endif
   !
 END MODULE sth_batched

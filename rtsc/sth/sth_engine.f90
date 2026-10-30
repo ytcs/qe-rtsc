@@ -26,6 +26,8 @@ MODULE sth_engine
   USE cudafor
   USE cufft
   USE cublas_v2
+  USE sth_pfft, ONLY : pfft_setup, pfft_free, pfft_local, pfft_ok, pfft_info
+  USE sth_pfft_s, ONLY : pfs_setup, pfs_free, pfs_local, pfs_ok
   IMPLICIT NONE
   PRIVATE
   !
@@ -42,7 +44,8 @@ MODULE sth_engine
             sth_engine_set_dpsi, sth_engine_setup, sth_engine_solve, sth_engine_get_dpsi, &
             sth_engine_get_hdiag, sth_engine_set_hdiag, sth_engine_reset_dpsi, sth_engine_free, sth_engine_shutdown, &
             sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
-            sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set
+            sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set, &
+            sth_engine_set_nlk, sth_engine_build_dvb, sth_engine_dvb_check
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -101,6 +104,17 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_debug_slot = 0      ! >0: print the CG history of this slot
   INTEGER, PUBLIC, SAVE :: sth_opvar = 0           ! testing: 1 = (g2 - e) x + Vx (same operator, other rounding)
   INTEGER, PUBLIC, SAVE :: sth_rb = 128            ! threads per column reduction (power of 2, <= 256)
+  ! pruned fused local operator (rtsc/sth/sth_pfft.f90; KERNEL-LOG lever 1), set before setup (per q).
+  ! sth_pfft_check: at the first operator application of each q, run the cuFFT path too and print the
+  ! difference of the local part (diagnostic; costs one extra application).
+  LOGICAL, PUBLIC, SAVE :: sth_pfft_req = .FALSE., sth_pfft_check = .FALSE.
+  LOGICAL, SAVE :: pfft_checked = .FALSE.
+  ! dV_bare psi built in the engine (KERNEL-LOG lever 4; RTSC_STH_DVB=1), set before init (per q):
+  ! becp1 / alphap of every k (staged by sth_engine_set_nlk), D becp1 and D alphap on the device
+  LOGICAL, PUBLIC, SAVE :: sth_dvb_req = .FALSE.
+  LOGICAL, SAVE :: dvb_q = .FALSE.
+  COMPLEX(dp), ALLOCATABLE, SAVE :: h_bp(:,:,:), h_al(:,:,:,:)
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_db(:,:,:), d_da(:,:,:,:)
   !
   LOGICAL, SAVE :: ready = .FALSE., staged = .FALSE., qready = .FALSE.
   INTEGER, SAVE :: nksq, npwx, nbnd, nkb, npert, nslot, nproj, nsl, ngrp, nnr, nvalid, nbox
@@ -1125,6 +1139,52 @@ CONTAINS
     ENDDO
   END SUBROUTINE k_copy_list
   !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_ps(ps, da, db, u, at, ia, nkb, nproj, nslot, npert, nksq, nat3, ctp)
+    ! nonlocal coefficients of dV_bare psi (dvqpsi_us_only, NC) for every slot s = (n, p, k):
+    !   ia = 0: ps(kb, s) = sum_a u(3(at(kb)-1)+a, p) da(kb, n, a, k)
+    !   ia > 0: ps(kb, s) = ctp u(3(at(kb)-1)+ia, p) db(kb, n, k)          (ctp = -i tpiba)
+    INTEGER, VALUE :: ia, nkb, nproj, nslot, npert, nksq, nat3
+    COMPLEX(dp), VALUE :: ctp
+    COMPLEX(dp) :: ps(nproj, *), da(nkb, nslot, 3, nksq), db(nkb, nslot, nksq), u(nat3, npert)
+    INTEGER :: at(nkb)
+    INTEGER :: s, kb, n, p, k, mu, a
+    COMPLEX(dp) :: acc
+    s = blockIdx%x
+    kb = threadIdx%x
+    IF (kb > nkb) RETURN
+    n = MOD(s - 1, nslot) + 1
+    p = MOD((s - 1) / nslot, npert) + 1
+    k = (s - 1) / (nslot * npert) + 1
+    mu = 3 * (at(kb) - 1)
+    IF (ia == 0) THEN
+      acc = (0.0_dp, 0.0_dp)
+      DO a = 1, 3
+        acc = acc + da(kb, n, a, k) * u(mu + a, p)
+      ENDDO
+      ps(kb, s) = acc
+    ELSE
+      ps(kb, s) = db(kb, n, k) * (0.0_dp, -1.0_dp) * u(mu + ia, p) * REAL(ctp, dp)
+    ENDIF
+  END SUBROUTINE k_ps
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_kqg_axpy(y, t, kqg, ipol, npwx, nslot, npert, nksq, ntot)
+    ! y(:, s) += t(:, s) * kqg(:, ipol, k(s))
+    INTEGER, VALUE :: ipol, npwx, nslot, npert, nksq
+    INTEGER(8), VALUE :: ntot
+    COMPLEX(dp) :: y(*), t(*)
+    REAL(dp) :: kqg(npwx, 3, nksq)
+    INTEGER(8) :: i
+    INTEGER :: ig, s, k
+    i = INT(blockIdx%x - 1, 8) * blockDim%x + threadIdx%x
+    DO WHILE (i <= ntot)
+      ig = INT(MOD(i - 1, INT(npwx, 8))) + 1
+      s = INT((i - 1) / npwx) + 1
+      k = (s - 1) / (nslot * npert) + 1
+      y(i) = y(i) + t(i) * kqg(ig, ipol, k)
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_kqg_axpy
+  !
   !=================================================================================================
   ! host helpers
   !=================================================================================================
@@ -1313,6 +1373,11 @@ CONTAINS
     CALL k_coef_h_s<<<nsl, 32 * ((nproj + 31) / 32), 0, strm>>>(s_cf2, s_cf, s_dmat, nproj, nkb, nslot, &
          npert, nksq, d_nockq, REAL(alpha_pv, sp))
     CALL kerr('coef_h_s')
+    IF (pfs_ok()) THEN
+      CALL pfs_local(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, s_vrs, d_npwq, s_g2, d_etk, scale, strm)
+      CALL gemm_back_s(s_cf2, y)
+      RETURN
+    ENDIF
     s0 = 0
     DO WHILE (s0 < nl)
       nb = MIN(sth_bmax, nl - s0)
@@ -1665,6 +1730,7 @@ CONTAINS
     INTEGER :: s0, nb, ip, np
     REAL(dp) :: scale
     REAL(dp) :: ta, tb
+    LOGICAL :: use_p
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     IF (sth_prof) THEN
       CALL tsync(); ta = wtime()
@@ -1676,24 +1742,31 @@ CONTAINS
     IF (sth_prof) THEN
       CALL tsync(); tb = wtime(); sth_t_gemm = sth_t_gemm + tb - ta; ta = tb
     ENDIF
-    s0 = 0
-    DO WHILE (s0 < nl)
-      nb = MIN(sth_bmax, nl - s0)
-      ip = plan_for(nb)
-      nb = 2**ip
-      np = 2**ip
-      CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, x, list, s0, nnr, npwx, &
-           nslot, npert, nksq, d_inv)
-      CALL kerr('scatter')
-      CALL fft_exec(ip, d_box, CUFFT_INVERSE)
-      CALL k_vmul<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_vrs, nnr)
-      CALL kerr('vmul')
-      CALL fft_exec(ip, d_box, CUFFT_FORWARD)
-      CALL k_gather_h<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(y, x, d_box, list, s0, nnr, npwx, &
-           nslot, npert, nksq, nbnd, d_npwq, d_idxkq, d_g2, d_etk, scale, sth_opvar)
-      CALL kerr('gather_h')
-      s0 = s0 + nb
-    ENDDO
+    use_p = pfft_ok() .AND. sth_opvar == 0
+    IF (.NOT. use_p .OR. (sth_pfft_check .AND. .NOT. pfft_checked)) THEN
+      s0 = 0
+      DO WHILE (s0 < nl)
+        nb = MIN(sth_bmax, nl - s0)
+        ip = plan_for(nb)
+        nb = 2**ip
+        np = 2**ip
+        CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, x, list, s0, nnr, npwx, &
+             nslot, npert, nksq, d_inv)
+        CALL kerr('scatter')
+        CALL fft_exec(ip, d_box, CUFFT_INVERSE)
+        CALL k_vmul<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_vrs, nnr)
+        CALL kerr('vmul')
+        CALL fft_exec(ip, d_box, CUFFT_FORWARD)
+        CALL k_gather_h<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(y, x, d_box, list, s0, nnr, npwx, &
+             nslot, npert, nksq, nbnd, d_npwq, d_idxkq, d_g2, d_etk, scale, sth_opvar)
+        CALL kerr('gather_h')
+        s0 = s0 + nb
+      ENDDO
+    ENDIF
+    IF (use_p) THEN
+      IF (sth_pfft_check .AND. .NOT. pfft_checked) CALL pfft_compare(x, y, list, nl, scale)
+      CALL pfft_local(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+    ENDIF
     IF (sth_prof) THEN
       CALL tsync(); tb = wtime(); sth_t_fft = sth_t_fft + tb - ta; ta = tb
     ENDIF
@@ -1702,6 +1775,39 @@ CONTAINS
       CALL tsync(); tb = wtime(); sth_t_gemm = sth_t_gemm + tb - ta
     ENDIF
   END SUBROUTINE apply_op
+  !
+  SUBROUTINE pfft_compare(x, y, list, nl, scale)
+    ! diagnostic (RTSC_STH_PFFT_CHECK=1): y holds the cuFFT local part on list(1:nl); compute the
+    ! pruned one into a scratch array and print the difference over those columns
+    COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
+    INTEGER, DEVICE :: list(*)
+    INTEGER, INTENT(IN) :: nl
+    REAL(dp), INTENT(IN) :: scale
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: yp(:,:)
+    COMPLEX(dp), ALLOCATABLE :: a(:,:), b(:,:)
+    INTEGER, ALLOCATABLE :: hl(:)
+    INTEGER :: i, c
+    REAL(dp) :: dmax, ymax, d2, y2
+    ALLOCATE(yp(npwx, nsl), a(npwx, nsl), b(npwx, nsl), hl(nl))
+    CALL tsync()
+    CALL pfft_local(x, yp, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+    CALL tsync()
+    a = y(:, 1:nsl)
+    b = yp
+    hl = list(1:nl)
+    dmax = 0; ymax = 0; d2 = 0; y2 = 0
+    DO i = 1, nl
+      c = hl(i)
+      dmax = MAX(dmax, MAXVAL(ABS(a(:, c) - b(:, c)))); ymax = MAX(ymax, MAXVAL(ABS(a(:, c))))
+      d2 = d2 + SUM(ABS(a(:, c) - b(:, c))**2); y2 = y2 + SUM(ABS(a(:, c))**2)
+    ENDDO
+    IF (ymax > 0.0_dp) THEN
+      WRITE(*, '(A,I8,A,ES10.3,A,ES10.3)') '     rtsc pfft check: columns', nl, ', max|dy|/max|y| ', dmax / ymax, &
+           ', rel L2 ', SQRT(d2 / y2)
+      pfft_checked = .TRUE.     ! (a zero input, e.g. dpsi = 0 at the first iteration, is not a test)
+    ENDIF
+    DEALLOCATE(yp, a, b, hl)
+  END SUBROUTINE pfft_compare
   !
   !=================================================================================================
   ! public API
@@ -1811,6 +1917,133 @@ CONTAINS
     ENDDO
     have_dpsi0 = .TRUE.
   END SUBROUTINE sth_engine_set_dpsi
+  !
+  SUBROUTINE sth_engine_set_nlk(ik, becp1, al1, al2, al3)
+    !! per-k <beta_k|psi_k> and its k+G derivatives (phq_init's becp1, alphap), (nkb, nbnd): bands <= nocc_k
+    INTEGER, INTENT(IN) :: ik
+    COMPLEX(dp), INTENT(IN) :: becp1(nkb, *), al1(nkb, *), al2(nkb, *), al3(nkb, *)
+    INTEGER :: n
+    IF (.NOT. ALLOCATED(h_bp)) THEN
+      ALLOCATE(h_bp(nkb, nslot, nksq), h_al(nkb, nslot, 3, nksq))
+      h_bp = (0.0_dp, 0.0_dp); h_al = (0.0_dp, 0.0_dp)
+    ENDIF
+    DO n = 1, h_nock(ik)
+      h_bp(:, n, ik) = becp1(:, n)
+      h_al(:, n, 1, ik) = al1(:, n); h_al(:, n, 2, ik) = al2(:, n); h_al(:, n, 3, ik) = al3(:, n)
+    ENDDO
+  END SUBROUTINE sth_engine_set_nlk
+  !
+  SUBROUTINE nl_setup()
+    ! D becp1 and D alphap_a for every k (strided-batched over k, D shared)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: d_bp(:,:,:), d_al(:,:,:,:)
+    INTEGER :: istat
+    IF (ALLOCATED(d_db)) DEALLOCATE(d_db, d_da)
+    ALLOCATE(d_db(nkb, nslot, nksq), d_da(nkb, nslot, 3, nksq), d_bp(nkb, nslot, nksq), d_al(nkb, nslot, 3, nksq))
+    d_bp = h_bp
+    d_al = h_al
+    istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, nkb, nslot, nkb, (1.0_dp, 0.0_dp), &
+            d_dmat, nkb, 0_8, d_bp, nkb, INT(nkb, 8) * nslot, (0.0_dp, 0.0_dp), d_db, nkb, INT(nkb, 8) * nslot, nksq)
+    CALL chk(istat, 'cublasZgemmStridedBatched (D becp1)')
+    istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, nkb, nslot, nkb, (1.0_dp, 0.0_dp), &
+            d_dmat, nkb, 0_8, d_al, nkb, INT(nkb, 8) * nslot, (0.0_dp, 0.0_dp), d_da, nkb, INT(nkb, 8) * nslot, &
+            3 * nksq)
+    CALL chk(istat, 'cublasZgemmStridedBatched (D alphap)')
+    CALL tsync()
+    DEALLOCATE(d_bp, d_al)
+  END SUBROUTINE nl_setup
+  !
+  SUBROUTINE sth_engine_build_dvb(dvl, uq, nat3, kbat, tpiba, kqg)
+    !! dV_bare psi of the current irrep for every valid slot, on the device (replaces the per-(k, pert)
+    !! dvqpsi_us + save_buffer loop of solve_linter and the buffer reads of the adapter), NC, no NLCC:
+    !!   local:    (1/N) gather_kq( FFT( dvloc_p(r) psi_kn(r) ) )            (dvqpsi_us)
+    !!   nonlocal: vkb_kq ps1 + sum_a [(k+q+G)_a vkb_kq] ps2_a,               (dvqpsi_us_only)
+    !!             ps1 = D sum_a u_a alphap_a,  ps2_a = -i tpiba u_a D becp1
+    !! dvl(nnr, npert): dvloc of each perturbation (compute_dvloc); uq(nat3, npert): its pattern;
+    !! kbat(nkb): atom of each projector; kqg(npwx, 3, nksq): k+q+G.
+    INTEGER, INTENT(IN) :: nat3, kbat(nkb)
+    COMPLEX(dp), INTENT(IN) :: dvl(nnr, npert), uq(nat3, npert)
+    REAL(dp), INTENT(IN) :: tpiba, kqg(npwx, 3, nksq)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: d_u(:,:)
+    INTEGER, DEVICE, ALLOCATABLE :: d_at(:)
+    REAL(dp), DEVICE, ALLOCATABLE :: d_kqg(:,:,:)
+    INTEGER :: istat, s0, nb, ip, a
+    REAL(dp) :: scale
+    scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
+    IF (.NOT. dvb_q) CALL kerr('build_dvb without the per-q NL state (sth_dvb_req not set before init)')
+    CALL zero_c(d_dvb, INT(npwx, 8) * nsl)
+    ! local part, as the dpot step with dV = dvloc
+    d_dv = dvl
+    istat = cudaDeviceSynchronize()
+    s0 = 0
+    DO WHILE (s0 < nvalid)
+      nb = MIN(sth_bmax, nvalid - s0)
+      ip = plan_for(nb)
+      nb = 2**ip
+      IF (psir_cached) THEN
+        CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
+             nnr, nslot, npert, 0)
+      ELSE
+        CALL psir_chunk(s0, nb, ip)
+        CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_box2, d_dv, d_valid, s0, &
+             nnr, nslot, npert, 1)
+      ENDIF
+      CALL kerr('dvpsir (dvb)')
+      CALL fft_exec(ip, d_box, CUFFT_FORWARD)
+      CALL k_gather_add<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_dvb, d_box, d_valid, s0, nnr, &
+           npwx, nslot, npert, nksq, d_npwq, d_idxkq, scale)
+      CALL kerr('gather_add (dvb)')
+      s0 = s0 + nb
+    ENDDO
+    IF (nkb > 0) THEN
+      ALLOCATE(d_u(nat3, npert), d_at(nkb), d_kqg(npwx, 3, nksq))
+      d_u = uq
+      d_at = kbat
+      d_kqg = kqg
+      istat = cudaDeviceSynchronize()
+      ! dvb += vkb_kq ps1   (ps in d_cf, leading dimension nproj)
+      CALL k_ps<<<nsl, 32 * ((nkb + 31) / 32), 0, strm>>>(d_cf, d_da, d_db, d_u, d_at, 0, nkb, nproj, nslot, &
+           npert, nksq, nat3, CMPLX(tpiba, 0.0_dp, dp))
+      CALL kerr('ps1')
+      istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, nslot * npert, nkb, &
+              (1.0_dp, 0.0_dp), d_W, npwx, INT(npwx, 8) * nproj, d_cf, nproj, INT(nproj, 8) * nslot * npert, &
+              (1.0_dp, 0.0_dp), d_dvb, npwx, INT(npwx, 8) * nslot * npert, nksq)
+      CALL chk(istat, 'cublasZgemmStridedBatched (dvb ps1)')
+      DO a = 1, 3
+        ! t = vkb_kq ps2_a ; dvb += (k+q+G)_a t
+        CALL k_ps<<<nsl, 32 * ((nkb + 31) / 32), 0, strm>>>(d_cf, d_da, d_db, d_u, d_at, a, nkb, nproj, nslot, &
+             npert, nksq, nat3, CMPLX(tpiba, 0.0_dp, dp))
+        CALL kerr('ps2')
+        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, nslot * npert, nkb, &
+                (1.0_dp, 0.0_dp), d_W, npwx, INT(npwx, 8) * nproj, d_cf, nproj, INT(nproj, 8) * nslot * npert, &
+                (0.0_dp, 0.0_dp), d_t, npwx, INT(npwx, 8) * nslot * npert, nksq)
+        CALL chk(istat, 'cublasZgemmStridedBatched (dvb ps2)')
+        CALL k_kqg_axpy<<<4096, TPB, 0, strm>>>(d_dvb, d_t, d_kqg, a, npwx, nslot, npert, nksq, INT(npwx, 8) * nsl)
+        CALL kerr('kqg_axpy')
+      ENDDO
+      CALL tsync()
+      DEALLOCATE(d_u, d_at, d_kqg)
+      ! the CG temporaries used here start from zero in the solve
+      CALL zero_c(d_t, INT(npwx, 8) * nsl)
+      CALL zero_c(d_cf, INT(nproj, 8) * nsl)
+    ENDIF
+    CALL tsync()
+  END SUBROUTINE sth_engine_build_dvb
+  !
+  SUBROUTINE sth_engine_dvb_check(ik, ipert, dvpsi, dmax, ymax)
+    !! diagnostic: compare the device dV_bare psi of (k, pert) with vanilla's (npwx, nbnd); accumulates
+    !! the max |difference| and max |value| over bands <= nocc_k, rows <= npwq. h_dvb is the download.
+    INTEGER, INTENT(IN) :: ik, ipert
+    COMPLEX(dp), INTENT(IN) :: dvpsi(npwx, *)
+    REAL(dp), INTENT(INOUT) :: dmax, ymax
+    INTEGER :: n, nq, s
+    IF (ik == 1 .AND. ipert == 1) h_dvb = d_dvb
+    nq = h_npwq(ik)
+    DO n = 1, h_nock(ik)
+      s = slot(n, ipert, ik)
+      dmax = MAX(dmax, MAXVAL(ABS(h_dvb(1:nq, s) - dvpsi(1:nq, n))))
+      ymax = MAX(ymax, MAXVAL(ABS(dvpsi(1:nq, n))))
+    ENDDO
+  END SUBROUTINE sth_engine_dvb_check
   !
   SUBROUTINE sth_engine_setup(ierr)
     !! Upload the staged data, build h_diag, psi_k(r) and the cuFFT plans.
@@ -1956,6 +2189,27 @@ CONTAINS
       DEALLOCATE(d_evc)
     ENDIF
     DEALLOCATE(h_evc, h_W)
+    dvb_q = sth_dvb_req .AND. ALLOCATED(h_bp)
+    IF (dvb_q .AND. nkb > 0) CALL nl_setup()
+    IF (ALLOCATED(h_bp)) DEALLOCATE(h_bp, h_al)
+    pfft_checked = .FALSE.
+    IF (sth_pfft_req) THEN
+      BLOCK
+        INTEGER :: ier, ns_, nx_, pc_
+        CALL pfft_setup(nr, nrx, nksq, npwx, h_npwq, h_idxkq, 1024, ier)
+        IF (ier == 0) THEN
+          CALL pfft_info(ns_, nx_, pc_)
+          WRITE(*, '(A,I6,A,F6.3,A,I4,A,I5)') '     rtsc pfft: on, sticks', ns_, ' (', &
+               REAL(ns_) / REAL(nr(1) * nr(2)), ' of the z-columns), occupied x-columns', nx_, ', chunk', pc_
+        ELSE
+          WRITE(*, '(A,I3,A)') '     rtsc pfft: unsupported grid/box (', ier, '), cuFFT path kept'
+        ENDIF
+        IF (ier == 0 .AND. mp_q) THEN
+          CALL pfs_setup(nr, nrx, nksq, npwx, h_npwq, h_idxkq, 1024, ier)
+          IF (ier /= 0) WRITE(*, '(A,I3,A)') '     rtsc pfft: FP32 twin unsupported (', ier, '), C2C cuFFT kept'
+        ENDIF
+      END BLOCK
+    ENDIF
     istat = cudaDeviceSynchronize()
     CALL chk(istat, 'setup')
     qready = .TRUE.
@@ -2405,6 +2659,11 @@ CONTAINS
     mp_q = .FALSE.
     IF (ALLOCATED(d_etkq)) DEALLOCATE(d_etkq)
     IF (ALLOCATED(h_xh)) DEALLOCATE(h_xh)
+    CALL pfft_free()
+    CALL pfs_free()
+    IF (ALLOCATED(d_db)) DEALLOCATE(d_db, d_da)
+    IF (ALLOCATED(h_bp)) DEALLOCATE(h_bp, h_al)
+    dvb_q = .FALSE.
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
   !

@@ -9,7 +9,7 @@ if(QE_WANNIER90_INTERNAL)
     set(sources
         wannier90/src/comms.F90
         wannier90/src/constants.F90
-        wannier90/src/disentangle.F90
+        ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/w90/disentangle.F90
         wannier90/src/hamiltonian.F90
         wannier90/src/io.F90
         wannier90/src/kmesh.F90
@@ -36,6 +36,10 @@ if(QE_WANNIER90_INTERNAL)
 
     qe_add_library(qe_wannier90 ${sources})
     target_link_libraries(qe_wannier90 PRIVATE qe_lapack)
+    # rtsc: OpenMP over k in dis_extract (RTSC_W90_NT); the copy is bitwise identical to the original
+    if(QE_ENABLE_OPENMP)
+        target_link_libraries(qe_wannier90 PRIVATE qe_openmp_fortran)
+    endif()
 
     ###########################################################
     # wannier90.x

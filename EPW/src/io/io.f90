@@ -3323,6 +3323,12 @@
     COMPLEX(KIND = DP), ALLOCATABLE :: cu_big(:, :, :)
     !! U(k) matrix for all k-points
     COMPLEX(KIND = DP), ALLOCATABLE :: cuq_big(:, :, :)
+    ! rtsc: the parsed .ukk file is kept on the ionode after the first call (it is re-read once per
+    ! coarse q otherwise: 64 formatted reads of ~15 MB at B2 frozen, 18 s). Same values (class B).
+    COMPLEX(KIND = DP), ALLOCATABLE, SAVE :: cu_keep(:, :, :)
+    LOGICAL, ALLOCATABLE, SAVE :: lwin_keep(:, :), exband_keep(:)
+    REAL(KIND = DP), ALLOCATABLE, SAVE :: wc_keep(:, :)
+    CHARACTER(LEN = 256), SAVE :: ukk_keep = ' '
     !! U(k+q) matrix for all k+q-points
     !
     ALLOCATE(cu_big(nbndep, nbndsub, nkstot), STAT = ierr)
@@ -3332,7 +3338,23 @@
     !
     cu_big = czero
     cuq_big = czero
-    IF (ionode) THEN
+    IF (ionode .AND. ALLOCATED(cu_keep)) THEN
+      IF (TRIM(ukk_keep) /= TRIM(filukk) .OR. SIZE(cu_keep, 1) /= nbndep .OR. SIZE(cu_keep, 2) /= nbndsub &
+          .OR. SIZE(cu_keep, 3) /= nkstot .OR. SIZE(exband_keep) /= nbnd) &
+        DEALLOCATE(cu_keep, lwin_keep, exband_keep, wc_keep)
+    ENDIF
+    IF (ionode .AND. ALLOCATED(cu_keep)) THEN
+      cu_big = cu_keep
+      lwin_big = lwin_keep
+      exband = exband_keep
+      w_centers = wc_keep
+      xkq(:, :) = zero
+      CALL createkmap2(xxq)
+      DO ik = 1, nkstot
+        cuq_big(:, :, ik) = cu_big(:, :, kmap(ik))
+        lwinq_big(:, ik) = lwin_big(:, kmap(ik))
+      ENDDO
+    ELSE IF (ionode) THEN
       !
       ! First proc read rotation matrix (coarse mesh) from file
       !
@@ -3367,6 +3389,13 @@
       ENDDO
       !
       CLOSE(iunukk)
+      ALLOCATE(cu_keep(nbndep, nbndsub, nkstot), lwin_keep(nbndep, nkstot), exband_keep(nbnd), &
+               wc_keep(3, nbndsub))
+      cu_keep = cu_big
+      lwin_keep = lwin_big
+      exband_keep = exband
+      wc_keep = w_centers
+      ukk_keep = filukk
       !
       ! Generate U(k+q) through the map
       ! here we create the map k+q --> k

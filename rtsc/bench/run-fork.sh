@@ -12,6 +12,9 @@ cp "$IN"/*.in .
 PSEUDO_DIR=$(realpath "${PSEUDO_DIR:-$HERE/../pseudo/sg15}")
 sed -i "s|@PSEUDO@|$PSEUDO_DIR|" *.in
 export RTSC_STH=1 RTSC_STRICT=1   # strict: an engine decline stops ph.x (no silent vanilla path)
+# kernel branch (groups/compute/KERNEL-LOG.md): dV_bare psi built in the engine (class E, gated on the B1/B2 smoke
+# chains), and wannier90's disentanglement over NE OpenMP threads on EPW's ionode (bitwise identical)
+export RTSC_STH_DVB=${RTSC_STH_DVB:-1} RTSC_W90_NT=${RTSC_W90_NT:-$NE}
 prefix=$(grep -oP "prefix\s*=\s*'\K[^']+" scf.in)
 : > timings.tsv
 stage() { local name=$1; shift; local t0=$(date +%s.%N); "$@"; local t1=$(date +%s.%N)
@@ -29,5 +32,5 @@ stage collect bash -c "
     else cp _ph0/$prefix.q_\$i/$prefix.dvscf1 save/$prefix.dvscf_q\$i; fi
   done"
 stage nscf env OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 -x OMP_NUM_THREADS "$BIN"/pw.x -in nscf.in > nscf.out
-stage epw  bash -c "nvidia-cuda-mps-control -d 2>/dev/null || true; OMP_NUM_THREADS=1 mpirun --bind-to none -np $NE -x OMP_NUM_THREADS $BIN/epw.x -npool $NE -in epw.in > epw.out; echo quit | nvidia-cuda-mps-control 2>/dev/null || true"
+stage epw  bash -c "nvidia-cuda-mps-control -d 2>/dev/null || true; OMP_NUM_THREADS=1 mpirun --bind-to none -np $NE -x OMP_NUM_THREADS $XR $BIN/epw.x -npool $NE -in epw.in > epw.out; echo quit | nvidia-cuda-mps-control 2>/dev/null || true"
 awk -v a="$T0" -v b="$(date +%s.%N)" 'BEGIN{printf "total\t%.2f\n", b-a}' | tee -a timings.tsv

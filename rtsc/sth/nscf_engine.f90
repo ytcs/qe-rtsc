@@ -476,8 +476,17 @@ CONTAINS
       CALL gemm_sb(CUBLAS_OP_C, CUBLAS_OP_N, nvx, nvx, npwx, ONE, d_psi, npwx, snv, d_psi, npwx, snv, ZERO, &
            d_sc, nvx, INT(nvx, 8) * nvx, nk)
       istat = cudaStreamSynchronize(strm)
-      hc = d_hc
-      sc = d_sc
+      ! reduced matrices: all k at once while most are active, else only the active k
+      IF (2 * COUNT(active) >= nk) THEN
+        hc = d_hc
+        sc = d_sc
+      ELSE
+        DO ik = 1, nk
+          IF (.NOT. active(ik)) CYCLE
+          istat = cudaMemcpy(hc(1, 1, ik), d_hc(1, 1, ik), nvx * nvx)
+          istat = cudaMemcpy(sc(1, 1, ik), d_sc(1, 1, ik), nvx * nvx)
+        ENDDO
+      ENDIF
       CALL SYSTEM_CLOCK(c1)
       ! Ritz pairs (host, LAPACK, OpenMP over k)
       info = 0
@@ -554,21 +563,16 @@ CONTAINS
              INT(nvx, 8) * nbnd, ZERO, d_t2, npwx, sbn, nk)
         IF (ANY(flag == 2 .OR. flag == 3)) THEN
           istat = cudaStreamSynchronize(strm)
-          ! final vectors of the k-points that stop now
-          BLOCK
-            COMPLEX(dp), ALLOCATABLE :: t(:,:,:)
-            ALLOCATE(t(npwx, nbnd, nk))
-            t = d_t1
-            DO ik = 1, nk
-              IF (flag(ik) == 2 .OR. flag(ik) == 3) THEN
-                h_evc(:, :, ik) = t(:, :, ik)
-                h_e(:, ik) = e(:, ik)
-                h_ok(ik) = (flag(ik) == 2)
-                active(ik) = .FALSE.
-              ENDIF
-            ENDDO
-            DEALLOCATE(t)
-          END BLOCK
+          ! final vectors of the k-points that stop now: copy only their (npwx, nbnd) slices (the whole
+          ! d_t1 was copied at every such step before: ~0.4 GB per step at B1 q2, 7 GB per nscf)
+          DO ik = 1, nk
+            IF (flag(ik) == 2 .OR. flag(ik) == 3) THEN
+              istat = cudaMemcpy(h_evc(1, 1, ik), d_t1(1, 1, ik), npwx * nbnd)
+              h_e(:, ik) = e(:, ik)
+              h_ok(ik) = (flag(ik) == 2)
+              active(ik) = .FALSE.
+            ENDIF
+          ENDDO
         ENDIF
         IF (ANY(flag == 1)) THEN
           CALL k_restart<<<dim3(nblk(npwx, TPB), nbnd, nk), TPB, 0, strm>>>(d_psi, d_hpsi, d_t1, d_t2, d_flag, &
