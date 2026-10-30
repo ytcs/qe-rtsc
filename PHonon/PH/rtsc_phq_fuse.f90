@@ -21,6 +21,8 @@ MODULE rtsc_phq_fuse
   COMPLEX(DP), ALLOCATABLE, SAVE :: dyn_nl(:,:)
   LOGICAL, SAVE :: dyn_nl_valid = .FALSE.
   COMPLEX(DP), ALLOCATABLE, SAVE :: auxa(:,:), bb(:,:)
+  REAL(DP), SAVE :: t_gpu = 0, t_host = 0
+  INTEGER, SAVE :: nkf = 0
   !
 CONTAINS
   !
@@ -55,9 +57,12 @@ CONTAINS
   END SUBROUTINE phq_fuse_begin
   !
   SUBROUTINE phq_fuse_end()
+    USE io_global, ONLY : stdout
     !$acc exit data delete(auxa, bb)
     DEALLOCATE(auxa, bb)
     dyn_nl_valid = .TRUE.
+    WRITE(stdout, '(5x,"rtsc phq_fuse: ",I0," k (cumulative): GPU blocks+GEMM+copy ",F8.3," s, host becp/dyn ",F8.3," s")') &
+         nkf, t_gpu, t_host
   END SUBROUTINE phq_fuse_end
   !
   !------------------------------------------------------------------------------------------
@@ -84,7 +89,9 @@ CONTAINS
     COMPLEX(DP) :: e, s
     COMPLEX(DP), ALLOCATABLE :: x(:,:,:), y(:,:,:), dm(:,:)
     !
+    INTEGER(8) :: c0, c1, c2, cr
     CALL start_clock('phq_fuse')
+    CALL SYSTEM_CLOCK(c0, cr)
     k1 = xk(1, ikk); k2 = xk(2, ikk); k3 = xk(3, ikk)
     tp = tpiba; tp2 = tpiba2; nb = nbnd; nx = npwx
     !$acc parallel loop collapse(2) present(auxa, evc, igk_k, g)
@@ -115,6 +122,7 @@ CONTAINS
     CALL MYZGEMM('C', 'N', nkb, 10 * nbnd, npw, (1.0_DP, 0.0_DP), vkb, npwx, auxa, npwx, (0.0_DP, 0.0_DP), bb, nkb)
     !$acc end host_data
     !$acc update host(bb)
+    CALL SYSTEM_CLOCK(c1)
     !
     becp1(ik)%k(1:nkb, 1:nbnd) = bb(1:nkb, 1:nbnd)
     DO ipol = 1, 3
@@ -153,6 +161,10 @@ CONTAINS
         DEALLOCATE(x, y, dm)
       ENDDO
     ENDIF
+    CALL SYSTEM_CLOCK(c2)
+    t_gpu = t_gpu + REAL(c1 - c0, DP) / REAL(cr, DP)
+    t_host = t_host + REAL(c2 - c1, DP) / REAL(cr, DP)
+    nkf = nkf + 1
     CALL stop_clock('phq_fuse')
   CONTAINS
     INTEGER FUNCTION gidx(a, b)
