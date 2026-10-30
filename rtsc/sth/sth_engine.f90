@@ -77,6 +77,10 @@ MODULE sth_engine
   ! sum_j c_j [dpsi(j) - dpsi(j-1)]. The call starts CG from dpsi(k-1) + that sum and solves to the
   ! unchanged thresh, so only the starting point changes. History of dpsi increments: pinned host
   ! memory (sth_xp_m slots); one extra device column array holds dpsi at the start of a call.
+  ! relative stopping test for non-final SCF calls (RTSC_STH_ETA, set per call by the adapter): a column
+  ! also stops when its residual has fallen below sth_eta x its residual at the first test; 0 = off
+  REAL(dp), PUBLIC, SAVE :: sth_eta = 0.0_dp
+  REAL(dp), DEVICE, ALLOCATABLE :: d_r0(:)
   INTEGER, PUBLIC, SAVE :: sth_xp_m = 0            ! history slots; 0 = off (set before irrep commit)
   INTEGER, SAVE :: xp_nc = 0, xp_rec = 0, xp_slot(16) = 0
   COMPLEX(dp), SAVE :: xp_c(16) = (0.0_dp, 0.0_dp)
@@ -359,14 +363,14 @@ CONTAINS
   END SUBROUTINE k_scale_wg1
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_check(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
-                                        cnt, ethr, first)
+                                        cnt, ethr, first, eta, r0)
     ! cgsolve_all, per active column: h = h_diag*g ; rho = <h|g> ; converged if sqrt(rho) < ethr;
     ! otherwise h = -h + (rho/rhoold) hold  (hold is the previous h, kept in place).
     ! cnt(group) counts the columns that were active at this test (kter_eff).
     INTEGER, VALUE :: nslot, npert, npwx, nksq, first
-    REAL(dp), VALUE :: ethr
+    REAL(dp), VALUE :: ethr, eta
     INTEGER :: list(*), npwq(nksq), conv(*), cnt(*)
-    REAL(dp) :: hd(npwx, nslot, nksq), rho(*)
+    REAL(dp) :: hd(npwx, nslot, nksq), rho(*), r0(*)
     COMPLEX(dp) :: g(npwx, *), h(npwx, *)
     REAL(dp), SHARED :: red(RB)
     REAL(dp), SHARED :: gam
@@ -395,7 +399,8 @@ CONTAINS
     IF (tid == 1) THEN
       rn = red(1)
       istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
-      IF (SQRT(rn) < ethr) THEN
+      IF (first == 1) r0(s) = SQRT(rn)
+      IF (SQRT(rn) < MAX(ethr, eta * r0(s))) THEN
         conv(s) = 1
         cvd = 1
       ELSE
@@ -1201,7 +1206,7 @@ CONTAINS
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
-                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho)
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
   END SUBROUTINE irrep_free
   !
@@ -1242,7 +1247,7 @@ CONTAINS
     INTEGER(8) :: need, freeb, totb
     ierr = 0
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
-                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho)
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
@@ -1258,7 +1263,7 @@ CONTAINS
     ENDIF
     ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
     ALLOCATE(d_t(npwx, nsl), d_cf(nproj, nsl), d_cf2(nproj, nsl), d_ps(nbnd, nsl))
-    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl))
+    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl), d_r0(nsl))
     ALLOCATE(d_dv(nnr, npert), d_drho(nnr, npert))
     ALLOCATE(h_dpsi(npwx, nsl))
     h_dpsi_valid = .FALSE.
@@ -1401,7 +1406,7 @@ CONTAINS
       first = 0
       IF (iter == 1) first = 1
       CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
-           d_conv, d_cnt, thresh, first)
+           d_conv, d_cnt, thresh, first, sth_eta, d_r0)
       CALL kerr('check')
       CALL k_kter<<<nblk(ngrp, TPB), TPB, 0, strm>>>(ngrp, npert, nksq, d_nock, d_cnt, d_kter)
       CALL kerr('kter')

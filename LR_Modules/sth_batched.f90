@@ -24,6 +24,7 @@ MODULE sth_batched
   USE kinds, ONLY : DP
   IMPLICIT NONE
   PRIVATE
+  PUBLIC :: sth_call_eta
   PUBLIC :: sth_batched_kernel, sth_env_flag, sth_batched_flush, sth_batched_becs, sth_batched_flush_end, &
             sth_batched_end_q, sth_strict_check
   !
@@ -43,6 +44,8 @@ MODULE sth_batched
   REAL(DP), SAVE :: xp_rho = 0.d0                    ! last fit: |residual| / |increment|
   COMPLEX(DP), SAVE :: xp_cprint(8) = (0.d0, 0.d0)
   INTEGER, SAVE :: xp_ncprint = 0
+  ! relative stopping factor for the next call (set by dfpt_kernel: RTSC_STH_ETA on non-final iterations)
+  REAL(DP), SAVE :: sth_call_eta = 0.d0
   !
 CONTAINS
   !
@@ -180,7 +183,7 @@ CONTAINS
     USE eqv,              ONLY : dpsi, dvpsi
 #if defined(__CUDA)
     USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready, &
-                                 sth_xp_m, sth_engine_xp_set, sth_timing, sth_prof, sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, &
+                                 sth_xp_m, sth_engine_xp_set, sth_eta, sth_timing, sth_prof, sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, &
                                  sth_nsteps, sth_ncolapp, sth_nvalid, sth_nact0, sth_r0hist, sth_r0med, &
                                  sth_t_gemm, sth_t_fft
     USE qpoint,           ONLY : xq
@@ -263,6 +266,7 @@ CONTAINS
     dr(:, :) = drhoout(:, 1, :)
     sth_timing = sth_env_flag('RTSC_STH_TIME')
     sth_prof = sth_env_flag('RTSC_STH_PROF')
+    sth_eta = sth_call_eta
     CALL sth_engine_solve(first_iter, thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
     drhoout(:, 1, :) = dr(:, :)
     DEALLOCATE(dv, dr)

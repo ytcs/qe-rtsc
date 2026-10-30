@@ -84,7 +84,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !
    USE kinds,                ONLY : DP
    USE mp_pools,             ONLY : inter_pool_comm
-   USE sth_batched,          ONLY : sth_batched_flush_end
+   USE sth_batched,          ONLY : sth_batched_flush_end, sth_call_eta
    USE mp_bands,             ONLY : intra_bgrp_comm
    USE mp,                   ONLY : mp_sum
    USE fft_base,             ONLY : dfftp, dffts
@@ -191,7 +191,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    ! predicted |ddv|^2 (dr2 * min(1, dr2/dr2_prev)) is below RTSC_THRESH_G (default 100) x tr2_ph uses
    ! tv. If the SCF converges on a loose iteration, one polish iteration re-solves with the same
    ! dV_in at tv (no mixing), so the final dpsi / drho always come from a solve at the vanilla thresh.
-   REAL(DP) :: xl_l, xl_g, tv, tl, dr2_prev, xl_pred
+   REAL(DP) :: xl_l, xl_g, tv, tl, dr2_prev, xl_pred, xl_eta
    LOGICAL :: xl_on, xl_loose, xl_polish
    REAL(DP), EXTERNAL :: dnrm2
    !! timing variables
@@ -259,8 +259,12 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
      CALL get_environment_variable('RTSC_THRESH_G', sv, STATUS=ios)
      IF (ios == 0) READ(sv, *, IOSTAT=ios) xl_g
      IF (ios /= 0) xl_g = 1.d2
+     xl_eta = 0.d0
+     CALL get_environment_variable('RTSC_STH_ETA', sv, STATUS=ios)
+     IF (ios == 0) READ(sv, *, IOSTAT=ios) xl_eta
+     IF (ios /= 0) xl_eta = 0.d0
    END BLOCK
-   xl_on = xl_l > 1.d0 .AND. .NOT. okpaw .AND. .NOT. finite_freq .AND. .NOT. twochem
+   xl_on = (xl_l > 1.d0 .OR. xl_eta > 0.d0) .AND. .NOT. okpaw .AND. .NOT. finite_freq .AND. .NOT. twochem
    xl_loose = .FALSE.
    xl_polish = .FALSE.
    tv = 1.d-2
@@ -310,7 +314,16 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          ENDIF
          IF (.NOT. xl_polish) dr2_prev = dr2   ! for the next prediction: the |ddv|^2 before the last
       ENDIF
-      xl_loose = xl_on .AND. (thresh > tv * (1.d0 + 1.d-12))
+      ! loose = not (predicted) final: a looser thresh (L) and/or the relative test (eta) in the engine
+      xl_loose = .FALSE.
+      sth_call_eta = 0.d0
+      IF (xl_on .AND. .NOT. (first_iter .OR. kter == 1) .AND. .NOT. xl_polish) THEN
+         IF (thresh > tv * (1.d0 + 1.d-12)) xl_loose = .TRUE.
+         IF (xl_eta > 0.d0 .AND. .NOT. (xl_pred < xl_g * tr2_ph)) THEN
+            xl_loose = .TRUE.
+            sth_call_eta = xl_eta
+         ENDIF
+      ENDIF
       !
       ! DFPT+U: at each ph iteration calculate dnsscf,
       ! i.e. the scf variation of the occupation matrix ns.
@@ -545,6 +558,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       IF (convt) EXIT
       !
    ENDDO ! iteration
+   sth_call_eta = 0.d0
    !
    ! rtsc: write the batched engine's dpsi to iudwf when a later step reads it there (no-op unless the
    ! engine ran this irrep)
