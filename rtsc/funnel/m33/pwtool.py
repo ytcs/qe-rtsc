@@ -157,6 +157,26 @@ class System:
         self.tau = x["tau"]                                 # bohr (cart)
         self.ef = x["ef"]
 
+    def beta_q(self, e, ib, q):
+        """beta_hat_l(q) = int r (r beta)(r) j_l(q r) dr (QE simpson), from a per-species cubic-spline table on
+        dq = 0.002 bohr^-1 (QE tabulates on dq = 0.01 with 4-point Lagrange); identical for every k, so std and fact
+        share the same H."""
+        if not hasattr(self, "_btab"):
+            self._btab = {}
+        key = (e, ib)
+        if key not in self._btab:
+            from scipy.interpolate import CubicSpline
+            u = self.upf[e]
+            b = u["betas"][ib]
+            ic = min(len(u["r"]), b["ic"] + 1 + (b["ic"] % 2))   # odd point count covering the cutoff
+            r, rab, rb = u["r"][:ic], u["rab"][:ic], b["rb"][:ic]
+            qmax = math.sqrt(self.x["ecutwfc"]) * 1.2 + 2 * float(np.linalg.norm(self.bg, axis=1).max())
+            qg = np.arange(0, qmax + 0.01, 0.002)
+            tab = np.concatenate([simpson_vec(rb * r * spherical_jn(b["l"], np.outer(qg[i:i + 2000], r)), rab)
+                                  for i in range(0, len(qg), 2000)])
+            self._btab[key] = CubicSpline(qg, tab)
+        return self._btab[key](q)
+
     # ---- G-vector bases
     def basis(self, kcrys, mill=None):
         """Basis at k (crystal coords): mill from a wfc file or generated (|k+G|^2 <= ecutwfc)."""
@@ -186,10 +206,8 @@ class Basis:
                 continue
             sk = np.exp(-1j * kpg @ sysm.tau[ia])
             blocks = []
-            for b in u["betas"]:
-                ic = min(len(u["r"]), b["ic"] + 1 + (b["ic"] % 2))   # odd point count covering the cutoff
-                r, rab, rb = u["r"][:ic], u["rab"][:ic], b["rb"][:ic]
-                f = simpson_vec(rb * r * spherical_jn(b["l"], np.outer(q, r)), rab)
+            for ib, b in enumerate(u["betas"]):
+                f = sysm.beta_q(e, ib, q)
                 ylm = real_ylm(b["l"], qh)
                 blocks.append([pref * f * ylm[m] * (-1j) ** b["l"] * sk for m in range(2 * b["l"] + 1)])
             ls = [b["l"] for b in u["betas"]]
