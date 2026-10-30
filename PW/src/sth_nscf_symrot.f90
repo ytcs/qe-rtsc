@@ -92,21 +92,24 @@ CONTAINS
     last_notconv = n
   END SUBROUTINE symrot_note_notconv
   !
-  SUBROUTINE symrot_rep_guard(ik)
+  LOGICAL FUNCTION symrot_rep_guard(ik)
     !! RTSC_PW_SYMROT: a representative whose eigensolve left unconverged eigenvalues is not a rotation source;
-    !! the k-points waiting for it are diagonalized themselves (as the switch-off build does for every k)
+    !! the k-points waiting for it are diagonalized themselves (as the switch-off build does for every k).
+    !! .TRUE. = ik was such a representative (the caller re-diagonalizes it at pw.x's own ethr)
     USE io_global, ONLY : stdout
     INTEGER, INTENT(IN) :: ik
+    symrot_rep_guard = .FALSE.
     IF (last_notconv > 0 .AND. ALLOCATED(kind_)) THEN
       IF (kind_(ik) == 2) THEN
         kind_(ik) = 0
         nbadrep = nbadrep + 1
+        symrot_rep_guard = .TRUE.
         WRITE(stdout, '(5x,"rtsc nscf symrot: representative ",I0," has ",I0, &
              &" unconverged eigenvalues: its orbit is diagonalized instead (",I0," such reps)")') ik, last_notconv, nbadrep
       ENDIF
     ENDIF
     last_notconv = 0
-  END SUBROUTINE symrot_rep_guard
+  END FUNCTION symrot_rep_guard
   !
   LOGICAL FUNCTION symrot_pw_on()
     !! RTSC_PW_SYMROT=1, with the same declines as RTSC_NSCF_SYMROT

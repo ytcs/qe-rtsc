@@ -963,6 +963,8 @@ SUBROUTINE c_bands_nscf( )
   IF (ipass == 2) THEN
      IF (.NOT. symrot) EXIT pass_loop
      CALL symrot_after_solve(kdone, kskip)
+     ! fallbacks (and representatives rejected by the guard) at pw.x's own ethr, as the switch-off build
+     ethr = ethr_save
   ENDIF
   k_loop: DO ik = ik_+1, nks
      !
@@ -1019,7 +1021,8 @@ SUBROUTINE c_bands_nscf( )
      IF ( io_level > -1 ) CALL save_buffer( evc, nwordwfc, iunwfc, ik )
      IF (symrot) THEN
         kdone(ik) = .TRUE.
-        CALL symrot_rep_guard(ik)
+        ! a rejected representative is diagonalized again in pass 2 at pw.x's own ethr
+        IF (ipass == 1 .AND. symrot_rep_guard(ik)) kdone(ik) = .FALSE.
      ENDIF
      !
      ! ... beware: with pools, if the number of k-points on different
