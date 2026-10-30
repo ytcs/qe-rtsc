@@ -93,6 +93,7 @@ set(src_ph
     PH/ph_set_upert.f90
     PH/phescf.f90
     PH/phq_init.f90
+    PH/rtsc_phq_fuse.f90
     PH/phq_readin.f90
     PH/phq_recover.f90
     PH/phq_setup.f90

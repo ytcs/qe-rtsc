@@ -61,6 +61,7 @@ SUBROUTINE phq_init()
   USE control_lr,           ONLY : nbnd_occ, lgamma
   USE ldaU,                 ONLY : lda_plus_u
   USE uspp_init,            ONLY : init_us_2
+  USE rtsc_phq_fuse,        ONLY : phq_fuse_on, phq_fuse_begin, phq_fuse_k, phq_fuse_end
   !
   IMPLICIT NONE
   !
@@ -78,6 +79,7 @@ SUBROUTINE phq_init()
   INTEGER :: ikqg         !for the case elph_mat=.true.
   INTEGER :: npw, npwq
   REAL(DP) :: arg
+  LOGICAL :: fuse
     ! the argument of the phase
   COMPLEX(DP), ALLOCATABLE :: aux1(:,:), tevc(:,:)
     ! used to compute alphap
@@ -139,6 +141,10 @@ SUBROUTINE phq_init()
           !$acc enter data create(tevc(1:npwx*npol,1:nbnd))
   ENDIF
   !
+  ! rtsc: RTSC_PHQ_FUSE=1, one device GEMM per k for becp1, alphap and dynmat_us's gamma terms
+  fuse = phq_fuse_on()
+  IF (fuse) CALL phq_fuse_begin()
+  !
   !$acc data copyin(xk) create(aux1( 1:npwx*npol, 1:nbnd )) 
   DO ik = 1, nksq
      !
@@ -192,6 +198,10 @@ SUBROUTINE phq_init()
      !
 #if defined(__CUDA)
      !$acc update device(evc) 
+     IF (fuse) THEN
+        CALL phq_fuse_k(ik, ikk, npw)
+        GOTO 50
+     ENDIF
      Call calbec( offload_type, npw, vkb, evc, bectmp )
      Call becupdate( offload_type, becp1, ik, nksq, bectmp ) 
 #else
@@ -277,7 +287,7 @@ SUBROUTINE phq_init()
          END DO
       ENDIF
 !!!!!!!!!!!!!!!!!!!!!!!! ACFDT TEST !!!!!!!!!!!!!!!!
-     IF (acfdt_is_active) THEN
+50   IF (acfdt_is_active) THEN
         ! ACFDT -test always read calculated wcf from non_scf calculation
         IF(acfdt_num_der) then 
            CALL get_buffer( evq, lrwfc, iuwfc, ikq )
@@ -307,6 +317,7 @@ SUBROUTINE phq_init()
 
   END DO
   !$acc end data
+  IF (fuse) CALL phq_fuse_end()
   !
   DEALLOCATE( aux1 )
   IF (noncolin.AND.domag) THEN
