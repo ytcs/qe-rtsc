@@ -26,6 +26,8 @@
 ! of dV_bare psi / dpsi when nothing is staged, the device work arrays kept across irreps of one shape, the k+q+G
 ! table built once per q on the device (dvb_build, becs). Per q: vkb at k+q copied device-to-device into the
 ! engine (no update host), evq/evc uploaded per k (no host W stage), d_inv built on the device.
+! Class B: dyn/dvscf/EPW outputs bitwise identical on/off (B1, B2 smoke chains; B1 frozen q7; B2 frozen q2).
+! Measured, A40, B1 frozen q7: per-q setup 5.45 -> 2.17 s, per-irrep 1.53 -> 0.455 s (what is left is GPU work).
 !
 ! sth_batched_end_q (do_phonon, after each q) releases the per-q engine state and the device blocks
 ! the NVHPC runtime keeps after DEALLOCATE, and prints one line with the q's device-memory high-water.
