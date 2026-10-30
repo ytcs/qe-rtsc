@@ -166,7 +166,7 @@ SUBROUTINE solve_linter (irr, imode0, dfpt_data)
   ! (rtsc: RTSC_STH_DVB=1 hands dvloc and the patterns to the batched engine instead, which builds
   !  dV_bare psi for all (k, pert) on the device; the loop then runs only for RTSC_STH_DVB_CHECK=1)
   !
-  dvb_engine = .NOT. elph .AND. .NOT. lmultipole .AND. sth_batched_dvb_ok(nsolv == 2)
+  dvb_engine = .NOT. elph .AND. .NOT. lmultipole .AND. sth_batched_dvb_ok(nsolv == 2, npe)
   ALLOCATE(dvb_loc(dffts%nnr, npe))
   IF (dvb_engine) THEN
      DO ipert = 1, npe

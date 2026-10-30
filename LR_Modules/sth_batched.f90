@@ -63,20 +63,46 @@ CONTAINS
     IF (ios == 0) sth_env_flag = (TRIM(s) == '1')
   END FUNCTION sth_env_flag
   !
-  LOGICAL FUNCTION sth_batched_dvb_ok(time_reversed)
-    !! may solve_linter skip its dV_bare psi loop? (engine path, its supported case, NC, no NLCC)
-    USE uspp,             ONLY : okvan, nlcc_any
+  LOGICAL FUNCTION sth_case_ok(time_reversed, npert)
+    !! the engine's supported case (STH-ENGINE.md, v1): sth_batched_kernel runs the engine only if true
+    USE fft_base,         ONLY : dffts
+    USE mp_bands,         ONLY : nproc_bgrp, nbgrp
+    USE klist,            ONLY : lgauss, ltetra
     USE noncollin_module, ONLY : noncolin, npol, nspin_mag
     USE lsda_mod,         ONLY : lsda
+    USE uspp,             ONLY : okvan
     USE ldaU,             ONLY : lda_plus_u
-    USE klist,            ONLY : lgauss, ltetra
+    USE control_flags,    ONLY : gamma_only, scissor
+    USE realus,           ONLY : real_space
+    USE bp,               ONLY : lelfield
+    USE xc_lib,           ONLY : exx_is_active, xclib_dft_is
     USE two_chem,         ONLY : twochem
+    USE qpoint,           ONLY : nksq
     LOGICAL, INTENT(IN) :: time_reversed
+    INTEGER, INTENT(IN) :: npert
+    sth_case_ok = .FALSE.
+    IF (time_reversed .OR. okvan .OR. noncolin .OR. lsda .OR. nspin_mag /= 1 .OR. npol /= 1) RETURN
+    ! q = Gamma (lgamma, evq => evc): k+q = k, so the engine gets the same psi twice; the Fermi
+    ! shift of metals (ef_shift_new on drho, ef_shift_wfc_new on iudwf after the flush) acts
+    ! outside this kernel, unchanged
+    IF (lda_plus_u .OR. gamma_only .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
+    IF (xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space .OR. scissor .OR. lelfield) RETURN
+    IF (nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups) RETURN
+    IF (dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x) RETURN
+    IF (nksq < 1 .OR. npert > 6) RETURN
+    sth_case_ok = .TRUE.
+  END FUNCTION sth_case_ok
+  !
+  LOGICAL FUNCTION sth_batched_dvb_ok(time_reversed, npert)
+    !! may solve_linter skip its dV_bare psi loop? Exactly the engine's supported case (sth_case_ok, so
+    !! sth_batched_kernel cannot fall back to vanilla on an unwritten buffer), plus no NLCC
+    USE uspp,             ONLY : nlcc_any
+    LOGICAL, INTENT(IN) :: time_reversed
+    INTEGER, INTENT(IN) :: npert
     sth_batched_dvb_ok = .FALSE.
 #if defined(__CUDA)
     IF (.NOT. (sth_env_flag('RTSC_STH') .AND. sth_env_flag('RTSC_STH_DVB'))) RETURN
-    IF (time_reversed .OR. okvan .OR. nlcc_any .OR. noncolin .OR. npol /= 1 .OR. lsda .OR. nspin_mag /= 1) RETURN
-    IF (lda_plus_u .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
+    IF (nlcc_any .OR. .NOT. sth_case_ok(time_reversed, npert)) RETURN
     sth_batched_dvb_ok = .TRUE.
 #endif
   END FUNCTION sth_batched_dvb_ok
@@ -176,17 +202,8 @@ CONTAINS
     eng_last = .FALSE.
 #if defined(__CUDA)
     IF (.NOT. sth_env_flag('RTSC_STH')) RETURN
-    ! (with dvb_on the remaining case checks are those of sth_batched_dvb_ok, already passed)
-    ! supported case (STH-ENGINE.md, v1)
-    IF (time_reversed .OR. okvan .OR. noncolin .OR. lsda .OR. nspin_mag /= 1 .OR. npol /= 1) RETURN
-    ! q = Gamma (lgamma, evq => evc): k+q = k, so the engine gets the same psi twice; the Fermi
-    ! shift of metals (ef_shift_new on drho, ef_shift_wfc_new on iudwf after the flush) acts
-    ! outside this kernel, unchanged
-    IF (lda_plus_u .OR. gamma_only .OR. .NOT. lgauss .OR. ltetra .OR. twochem) RETURN
-    IF (xclib_dft_is('meta') .OR. exx_is_active() .OR. real_space .OR. scissor .OR. lelfield) RETURN
-    IF (nproc_bgrp /= 1 .OR. nbgrp /= 1 .OR. dffts%has_task_groups) RETURN
-    IF (dffts%nnr /= dffts%nr1x * dffts%nr2x * dffts%nr3x) RETURN
-    IF (nksq < 1 .OR. npert > 6) RETURN
+    ! supported case (STH-ENGINE.md, v1); the same test decides sth_batched_dvb_ok
+    IF (.NOT. sth_case_ok(time_reversed, npert)) RETURN
     !
     ! engine state belongs to this irrep? (re-initialised at every first iteration; otherwise the
     ! dV_bare psi of (k=1, pert=1) identifies the irrep, e.g. after a restart)
