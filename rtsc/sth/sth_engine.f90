@@ -41,7 +41,7 @@ MODULE sth_engine
             sth_engine_set_dpsi, sth_engine_setup, sth_engine_solve, sth_engine_get_dpsi, &
             sth_engine_get_hdiag, sth_engine_set_hdiag, sth_engine_reset_dpsi, sth_engine_free, sth_engine_shutdown, &
             sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
-            sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw
+            sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -70,6 +70,18 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_r0hist(0:11) = 0
   REAL(dp), PUBLIC, SAVE :: sth_r0med = 0, sth_t_gemm = 0, sth_t_fft = 0
   LOGICAL, PUBLIC, SAVE :: sth_prof = .FALSE.      ! sync inside apply_op to time GEMMs vs FFTs
+  !
+  ! rtsc dpsi extrapolation across the SCF iterations of one irrep (RTSC_STH_XP, SOLVE-LOG.md).
+  ! dpsi(dV_in) is affine in dV_in (one fixed operator per column), so when the adapter finds
+  ! dV_in(k) - dV_in(k-1) ~ sum_j c_j [dV_in(j) - dV_in(j-1)], the solution moves by about
+  ! sum_j c_j [dpsi(j) - dpsi(j-1)]. The call starts CG from dpsi(k-1) + that sum and solves to the
+  ! unchanged thresh, so only the starting point changes. History of dpsi increments: pinned host
+  ! memory (sth_xp_m slots); one extra device column array holds dpsi at the start of a call.
+  INTEGER, PUBLIC, SAVE :: sth_xp_m = 0            ! history slots; 0 = off (set before irrep commit)
+  INTEGER, SAVE :: xp_nc = 0, xp_rec = 0, xp_slot(16) = 0
+  COMPLEX(dp), SAVE :: xp_c(16) = (0.0_dp, 0.0_dp)
+  COMPLEX(dp), PINNED, ALLOCATABLE, SAVE :: h_xh(:,:,:)
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_xp(:,:)
   INTEGER, PUBLIC, SAVE :: sth_bmax = 256          ! FFT chunk (largest batch); set before init
   INTEGER, PUBLIC, SAVE :: sth_debug_slot = 0      ! >0: print the CG history of this slot
   INTEGER, PUBLIC, SAVE :: sth_opvar = 0           ! testing: 1 = (g2 - e) x + Vx (same operator, other rounding)
@@ -165,6 +177,19 @@ CONTAINS
       i = i + INT(blockDim%x, 8) * gridDim%x
     ENDDO
   END SUBROUTINE k_sub
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_axpyc(y, x, a, n)
+    ! y = y + a x
+    INTEGER(8), VALUE :: n
+    COMPLEX(dp), VALUE :: a
+    COMPLEX(dp) :: y(n), x(n)
+    INTEGER(8) :: i
+    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    DO WHILE (i <= n)
+      y(i) = y(i) + a * x(i)
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_axpyc
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_icopy(a, b, n)
     INTEGER, VALUE :: n
@@ -1070,7 +1095,7 @@ CONTAINS
       have_handles = .TRUE.
     ENDIF
     ! memory check (bytes): column arrays, psi(r) cache, FFT box, W
-    need = 16_8 * npwx * nsl * 7 + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
+    need = 16_8 * npwx * nsl * (7 + MIN(sth_xp_m, 1)) + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
     BLOCK
@@ -1171,6 +1196,7 @@ CONTAINS
   END SUBROUTINE sth_engine_setup
   !
   SUBROUTINE irrep_free()
+    IF (ALLOCATED(d_xp)) DEALLOCATE(d_xp)
     IF (ALLOCATED(h_dvb)) DEALLOCATE(h_dvb, h_dpsi0)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
@@ -1220,7 +1246,8 @@ CONTAINS
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
-    need = 16_8 * npwx * nsl * 7
+    IF (ALLOCATED(d_xp)) DEALLOCATE(d_xp)
+    need = 16_8 * npwx * nsl * (7 + MIN(sth_xp_m, 1))
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
     IF (need > freeb - 512_8 * 1024**2) THEN
@@ -1235,6 +1262,15 @@ CONTAINS
     ALLOCATE(d_dv(nnr, npert), d_drho(nnr, npert))
     ALLOCATE(h_dpsi(npwx, nsl))
     h_dpsi_valid = .FALSE.
+    xp_nc = 0
+    xp_rec = 0
+    IF (sth_xp_m > 0) THEN
+      ALLOCATE(d_xp(npwx, nsl))
+      IF (ALLOCATED(h_xh)) THEN
+        IF (SIZE(h_xh, 1) /= npwx .OR. SIZE(h_xh, 2) /= nsl .OR. SIZE(h_xh, 3) /= sth_xp_m) DEALLOCATE(h_xh)
+      ENDIF
+      IF (.NOT. ALLOCATED(h_xh)) ALLOCATE(h_xh(npwx, nsl, sth_xp_m))
+    ENDIF
     d_dvb = h_dvb
     d_dpsi = h_dpsi0
     ! valid slot list (k-major, then pert, then band)
@@ -1336,6 +1372,18 @@ CONTAINS
     !
     ! CG (cgsolve_all), all columns at once
     IF (first_iter) CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
+    ! dpsi extrapolation (sth_engine_xp_set): keep the start dpsi(k-1), then add sum_j c_j delta_j
+    IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
+      CALL k_copy<<<4096, TPB, 0, strm>>>(d_xp, d_dpsi, INT(npwx, 8) * nsl)
+      CALL kerr('copy (xp)')
+    ENDIF
+    IF (ALLOCATED(d_xp)) THEN
+      DO i = 1, xp_nc
+        istat = cudaMemcpyAsync(d_g, h_xh(:, :, xp_slot(i)), INT(npwx, 8) * nsl, strm)
+        CALL k_axpyc<<<4096, TPB, 0, strm>>>(d_dpsi, d_g, xp_c(i), INT(npwx, 8) * nsl)
+        CALL kerr('axpy (xp)')
+      ENDDO
+    ENDIF
     d_conv = 0
     d_cnt = 0
     d_kter = 0.0_dp
@@ -1374,6 +1422,16 @@ CONTAINS
       CALL kerr('update')
       IF (sth_debug_slot > 0) CALL debug_step(iter)
     ENDDO
+    ! dpsi extrapolation: delta = dpsi(k) - dpsi(k-1) into history slot xp_rec (d_g is free after CG)
+    IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
+      CALL k_copy<<<4096, TPB, 0, strm>>>(d_g, d_dpsi, INT(npwx, 8) * nsl)
+      CALL k_sub<<<4096, TPB, 0, strm>>>(d_g, d_xp, INT(npwx, 8) * nsl)
+      CALL kerr('delta (xp)')
+      istat = cudaMemcpyAsync(h_xh(:, :, xp_rec), d_g, INT(npwx, 8) * nsl, strm)
+      CALL tsync()
+    ENDIF
+    xp_nc = 0
+    xp_rec = 0
     IF (sth_timing) THEN
       CALL tsync(); t1 = wtime(); sth_t_cg = t1 - t0; t0 = t1
     ENDIF
@@ -1423,6 +1481,20 @@ CONTAINS
       sth_t_total = sth_t_dpot + sth_t_ortho + sth_t_cg + sth_t_drho
     ENDIF
   END SUBROUTINE sth_engine_solve
+  !
+  SUBROUTINE sth_engine_xp_set(nc, slots, c, rec)
+    !! for the next sth_engine_solve only: start from dpsi + sum_i c(i) history(slots(i)); after the
+    !! solve store dpsi(end) - dpsi(start, before the extrapolation) in history slot rec (0 = do not)
+    INTEGER, INTENT(IN) :: nc, slots(*), rec
+    COMPLEX(dp), INTENT(IN) :: c(*)
+    xp_nc = 0
+    xp_rec = 0
+    IF (sth_xp_m <= 0 .OR. .NOT. ALLOCATED(h_xh)) RETURN
+    xp_nc = MIN(nc, sth_xp_m)
+    xp_slot(1:xp_nc) = slots(1:xp_nc)
+    xp_c(1:xp_nc) = c(1:xp_nc)
+    xp_rec = rec
+  END SUBROUTINE sth_engine_xp_set
   !
   SUBROUTINE sth_engine_becs(kqg, bec, alp)
     !! For drhodv, after the last solve of the irrep: bec(:, n, p, k) = vkb_kq^H dpsi_(k,p,n) and
@@ -1522,6 +1594,7 @@ CONTAINS
     IF (ALLOCATED(d_box2)) DEALLOCATE(d_box2)
     IF (ALLOCATED(d_evc)) DEALLOCATE(d_evc)
     IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+    IF (ALLOCATED(h_xh)) DEALLOCATE(h_xh)
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
   !
