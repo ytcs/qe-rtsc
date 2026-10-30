@@ -61,7 +61,7 @@ SUBROUTINE phq_init()
   USE control_lr,           ONLY : nbnd_occ, lgamma
   USE ldaU,                 ONLY : lda_plus_u
   USE uspp_init,            ONLY : init_us_2
-  USE rtsc_phq_fuse,        ONLY : phq_fuse_on, phq_fuse_begin, phq_fuse_k, phq_fuse_end
+  USE rtsc_phq_fuse,        ONLY : phq_fuse_on, phq_fuse_begin, phq_fuse_k, phq_fuse_end, phq_vkb_on, phq_fuse_all
   !
   IMPLICIT NONE
   !
@@ -146,6 +146,11 @@ SUBROUTINE phq_init()
   IF (fuse) CALL phq_fuse_begin()
   !
   !$acc data copyin(xk) create(aux1( 1:npwx*npol, 1:nbnd )) 
+  ! rtsc: RTSC_PHQ_VKB=1 (with FUSE), the whole k loop in chunks (rtsc_phq_fuse.f90)
+  IF (fuse .AND. phq_vkb_on()) THEN
+     CALL phq_fuse_all()
+     GOTO 60
+  ENDIF
   DO ik = 1, nksq
      !
      ikk  = ikks(ik)
@@ -316,6 +321,7 @@ SUBROUTINE phq_init()
      !
 
   END DO
+60 CONTINUE
   !$acc end data
   IF (fuse) CALL phq_fuse_end()
   !
