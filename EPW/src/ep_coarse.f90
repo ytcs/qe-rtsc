@@ -296,7 +296,7 @@
 #endif
 #if defined (__CUDA)
     USE epw_gpu_coarse,   ONLY : egc_init, egc_set_v, egc_local, egc_nl_set, egc_local_nl, egc_prof_on, &
-                                 egc_prof_add, egc_prof_print, egc_wall
+                                 egc_prof_add, egc_prof_print, egc_wall, egc_becs_set
 #endif
     USE ions_base,        ONLY : ityp, ntyp => nsp
     USE uspp_param,       ONLY : nh, nhm
@@ -408,6 +408,9 @@
     !! projector for S*atomic wavefunctions at k+q-point
     ! rtsc: GPU path (local part by Parseval on the GPU, nonlocal part by projections)
     LOGICAL :: use_gpu, nl_gpu
+    LOGICAL :: bec_gpu
+    !! rtsc amdahl: RTSC_EPW_BEC (becp1 / alphap on the device)
+    REAL(KIND = DP), ALLOCATABLE :: kgk(:, :)
     INTEGER :: nt, na, mu, ih, jh, ikb, jkb, ijkb0
     INTEGER, ALLOCATABLE :: kbatom(:)
     REAL(KIND = DP), ALLOCATABLE :: kqg(:, :)
@@ -484,6 +487,7 @@
     ! rtsc: decide on the GPU path (NC, collinear, no spin, no DFT+U); RTSC_EPW_COARSE=0 disables it
     use_gpu = .FALSE.
     nl_gpu = .FALSE.
+    bec_gpu = .FALSE.
 #if defined (__CUDA)
     use_gpu = ep_coarse_gpu_ok()
     IF (use_gpu) THEN
@@ -512,6 +516,9 @@
         CHARACTER(LEN = 16) :: ev
         CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_NL', ev)
         nl_gpu = (TRIM(ev) /= '0') .AND. nkb > 0
+        CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_BEC', ev)
+        bec_gpu = nl_gpu .AND. TRIM(ev) == '1' .AND. .NOT. noncolin .AND. lower_band == 1 .AND. upper_band == nbndep
+        IF (bec_gpu) ALLOCATE(kgk(npwx, 3))
       END BLOCK
       IF (nl_gpu) THEN
         ALLOCATE(kbatom(nkb), dmat(nkb, nkb), uqm(3 * nat, npe), kqg(npwx, 3))
@@ -709,6 +716,16 @@
       ! here we generate vkb on the igk() set and for k ...
       CALL init_us_2(npw, igk, sxk, vkb)
       !
+      ! rtsc amdahl (RTSC_EPW_BEC=1, GPU NL path): becp1 and alphap are formed on the device in egc_local_nl
+      IF (bec_gpu) THEN
+        DO ipol = 1, 3
+          DO ig = 1, npw
+            kgk(ig, ipol) = sxk(ipol) + g(ipol, igk(ig))
+          ENDDO
+        ENDDO
+        CALL egc_becs_set(npw, nkb, npwx, vkb, kgk, tpiba)
+      ELSE
+      !
       ! ... and we recompute the becp terms with the wfs (rotated through igk)
       !
       CALL calbec(npw, vkb, aux5, becp1(ik), nbndep)
@@ -729,6 +746,7 @@
         ENDDO
         CALL calbec(npw, vkb, aux2(:, lower_band:upper_band), alphap(ipol, ik), upper_band - lower_band + 1)
       ENDDO
+      ENDIF   ! rtsc bec_gpu
       !
       ! now we generate vkb on the igkq() set because dvpsi is needed on that set
       ! we need S(k)+q_0 in the KB projector: total momentum transfer must be q_0
@@ -900,6 +918,7 @@
     IF (use_gpu) CALL egc_prof_print()
     IF (use_gpu) DEALLOCATE(vtot, deff, becq, auxv, ps1, ps2, indk, indq)
     IF (ALLOCATED(kbatom)) DEALLOCATE(kbatom, dmat, uqm, kqg)
+    IF (ALLOCATED(kgk)) DEALLOCATE(kgk)
     DEALLOCATE(elphmat, STAT = ierr)
     IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error deallocating elphmat', 1)
     DEALLOCATE(aux1, STAT = ierr)

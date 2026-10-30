@@ -2055,6 +2055,16 @@
     COMPLEX(KIND = DP), ALLOCATABLE :: qgm(:)
     !! Local variables for uspp
     COMPLEX(KIND = DP), ALLOCATABLE :: qq_so(:, :, :, :)
+    ! rtsc amdahl (RTSC_W90_MMN=1; groups/compute/AMDAHL-LOG.md): the phase product e^{i G0 r} of vanilla
+    ! (invfft, multiply, fwfft per band) is an exact cyclic shift of the FFT grid, so <u_mk|u_nk+b> is formed by
+    ! an index map (k sphere -> k+q sphere shifted by G0) and one ZGEMM per (k, b). NC, collinear, serial FFT only.
+    ! RTSC_W90_MMN_CHECK=1 also runs the vanilla band loop and prints the largest difference.
+    LOGICAL :: fmmn, fmmn_chk
+    CHARACTER(LEN = 16) :: fev
+    INTEGER :: n1x, n2x, s1, s2, s3, l0, i1, i2, i3, ig
+    INTEGER, ALLOCATABLE :: kinv(:), smap(:)
+    COMPLEX(KIND = DP), ALLOCATABLE :: amat(:, :), mfast(:, :)
+    REAL(KIND = DP) :: dfm, mfm
     !! Local variables for uspp
     !
     any_uspp = ANY(upf(:)%tvanp)
@@ -2154,6 +2164,17 @@
       !
     ENDIF
     !
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_W90_MMN', fev)
+    fmmn = TRIM(fev) == '1' .AND. .NOT. noncolin .AND. .NOT. any_uspp .AND. &
+           dffts%nnr == dffts%nr1x * dffts%nr2x * dffts%nr3x
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_W90_MMN_CHECK', fev)
+    fmmn_chk = fmmn .AND. TRIM(fev) == '1'
+    dfm = 0.d0; mfm = 0.d0
+    IF (fmmn) THEN
+      n1x = dffts%nr1x; n2x = dffts%nr2x
+      ALLOCATE(kinv(dffts%nnr), smap(npwx), amat(npwx, nbnd), mfast(nbnd, nbnd))
+      WRITE(stdout, '(5x,a)') 'rtsc: MMN by G-shift index map + ZGEMM (RTSC_W90_MMN)'
+    ENDIF
     ALLOCATE(Mkb(nbnd, nbnd), STAT = ierr)
     IF (ierr /= 0) CALL errore('compute_mmn_para', 'Error allocating Mkb', 1)
     !
@@ -2183,6 +2204,13 @@
       !
       ! sorts k+G vectors in order of increasing magnitude, up to ecut
       CALL gk_sort(xk_loc(1, ik), ngm, g, gcutw, npw, igk_k_loc(1, ik), g2kin)
+      IF (fmmn) THEN
+        ! FFT-grid index -> position on the k sphere (0: outside)
+        kinv(:) = 0
+        DO ig = 1, npw
+          kinv(dffts%nl(igk_k_loc(ig, ik))) = ig
+        ENDDO
+      ENDIF
       !
       !  USPP
       !
@@ -2286,6 +2314,44 @@
           ENDDO ! ntyp
         ENDIF ! any_uspp
         !
+        IF (fmmn) THEN
+          ! shift G0 = G(ig_) (zero when zerophase): aux(ig) = c_k(G_kq(ig) - G0), cyclic on the grid
+          s1 = 0; s2 = 0; s3 = 0
+          IF (.NOT. zerophase(ik_g, ib)) THEN
+            IF (ig_(ik_g, ib) > 0) THEN
+              l0 = dffts%nl(ig_(ik_g, ib)) - 1
+              s1 = MOD(l0, n1x); s2 = MOD(l0 / n1x, n2x); s3 = l0 / (n1x * n2x)
+            ENDIF
+          ENDIF
+          DO ig = 1, npwq
+            l0 = dffts%nl(igkq(ig)) - 1
+            i1 = MODULO(MOD(l0, n1x) - s1, dffts%nr1)
+            i2 = MODULO(MOD(l0 / n1x, n2x) - s2, dffts%nr2)
+            i3 = MODULO(l0 / (n1x * n2x) - s3, dffts%nr3)
+            smap(ig) = kinv(1 + i1 + n1x * (i2 + n2x * i3))
+          ENDDO
+          ! vanilla: a zero phase array (no G0 found) makes the product zero
+          IF (.NOT. zerophase(ik_g, ib) .AND. ig_(ik_g, ib) <= 0) smap(1:npwq) = 0
+          DO m = 1, nbnd
+            amat(:, m) = czero
+            IF (excluded_band(m)) CYCLE
+            DO ig = 1, npwq
+              IF (smap(ig) > 0) amat(ig, m) = evc(smap(ig), m)
+            ENDDO
+          ENDDO
+          CALL ZGEMM('C', 'N', nbnd, nbnd, npwq, cone, amat, npwx, evcq, npwx * npol, czero, mfast, nbnd)
+          CALL mp_sum(mfast, intra_pool_comm)
+          IF (.NOT. fmmn_chk) THEN
+            DO m = 1, nbnd
+              IF (excluded_band(m)) CYCLE
+              DO n = 1, nbnd
+                IF (excluded_band(n)) CYCLE
+                Mkb(m, n) = mfast(m, n) + Mkb(m, n)
+              ENDDO
+            ENDDO
+          ENDIF
+        ENDIF
+        IF (.NOT. fmmn .OR. fmmn_chk) THEN
         DO m = 1, nbnd  ! loop on band m
           IF (excluded_band(m)) CYCLE
           !
@@ -2337,6 +2403,16 @@
             ENDDO ! n
           ENDIF ! scalar wavefunction
         ENDDO   ! m
+        IF (fmmn_chk) THEN
+          DO m = 1, nbnd
+            IF (excluded_band(m)) CYCLE
+            DO n = 1, nbnd
+              IF (excluded_band(n)) CYCLE
+              dfm = MAX(dfm, ABS(mfast(m, n) - Mkb(m, n))); mfm = MAX(mfm, ABS(Mkb(m, n)))
+            ENDDO
+          ENDDO
+        ENDIF
+        ENDIF   ! rtsc: vanilla band loop
         !
         ibnd_n = 0
         DO n = 1, nbnd
@@ -2355,6 +2431,9 @@
       ENDDO ! ib
     ENDDO ! ik
     !
+    IF (fmmn_chk) WRITE(stdout, '(5x,a,es10.3,a,es10.3)') 'rtsc MMN check (this pool): max|fast - vanilla| ', dfm, &
+                         ', max|M| ', mfm
+    IF (fmmn) DEALLOCATE(kinv, smap, amat, mfast)
     CALL mp_sum(m_mat, inter_pool_comm)
     !
     ! RM - write mmn to file (file needed with vme = true)
@@ -3077,6 +3156,14 @@
     COMPLEX(KIND = DP) :: lphase
     !! (-i)^l
     COMPLEX(KIND = DP), ALLOCATABLE :: sk(:)
+    ! rtsc amdahl (RTSC_W90_AMN=1; groups/compute/AMDAHL-LOG.md): the radial integrals depend only on
+    ! (alpha_w, r_w, l, |k+G|); compute them once per run of projectors with the same (alpha_w, r_w), and only
+    ! for the l that one of them uses (csph /= 0). Same calls with the same inputs: bitwise identical.
+    LOGICAL :: famn, lneed(0:3)
+    CHARACTER(LEN = 16) :: fev
+    INTEGER :: jw
+    REAL(KIND = DP) :: alpha_c
+    INTEGER :: rw_c
     !! e^{-i*2*pi*(k+G)*r}
     !
     ALLOCATE(gk(3, npw), STAT = ierr)
@@ -3106,11 +3193,28 @@
     qg(:) = DSQRT(qg(:)) * tpiba
     !
     ! RM changed according to QE4.0.3/PP/pw2wannier90
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_W90_AMN', fev)
+    famn = TRIM(fev) == '1'
+    alpha_c = -1.d0; rw_c = -1
     DO iw = 1, n_proj
       !
       gf(:, iw) = czero
       !
-      CALL radialpart(npw, qg, alpha_w(iw), r_w(iw), lmax, radial)
+      IF (famn) THEN
+        IF (alpha_w(iw) /= alpha_c .OR. r_w(iw) /= rw_c) THEN
+          lneed(:) = .FALSE.
+          DO jw = iw, n_proj
+            IF (alpha_w(jw) /= alpha_w(iw) .OR. r_w(jw) /= r_w(iw)) CYCLE
+            DO lm = 1, lmax2
+              IF (ABS(csph(lm, jw)) >= eps8) lneed(INT(DSQRT(lm - 1.d0))) = .TRUE.
+            ENDDO
+          ENDDO
+          CALL rtsc_radialpart(npw, qg, alpha_w(iw), r_w(iw), lmax, lneed, radial)
+          alpha_c = alpha_w(iw); rw_c = r_w(iw)
+        ENDIF
+      ELSE
+        CALL radialpart(npw, qg, alpha_w(iw), r_w(iw), lmax, radial)
+      ENDIF
       !
       DO lm = 1, lmax2
         IF (ABS(csph(lm, iw)) < eps8) CYCLE
@@ -4518,6 +4622,132 @@
     !
     !-----------------------------------------------------------------------
     END SUBROUTINE radialpart
+    !
+    !-----------------------------------------------------------------------
+    SUBROUTINE rtsc_radialpart(ng, q, alfa, rvalue, lmax, lneed, radial)
+    !-----------------------------------------------------------------------
+    !!
+    !! This routine computes a table with the radial Fourier transform
+    !! of the radial functions.
+    !!
+    USE kinds,         ONLY : DP
+    USE cell_base,     ONLY : omega
+    USE ep_constants,  ONLY : zero, fpi
+    !
+    IMPLICIT NONE
+    !
+    ! I/O
+    INTEGER, INTENT(in) :: ng
+    !! Number of plane waves
+    INTEGER, INTENT(in) :: rvalue
+    !!
+    INTEGER, INTENT(in) :: lmax
+    !! Maxium angular momentum
+    !
+    REAL(KIND = DP), INTENT(in) :: alfa
+    !!
+    REAL(KIND = DP), INTENT(in) :: q(ng)
+    !!
+    REAL(KIND = DP), INTENT(inout) :: radial(ng, 0:lmax)
+    !! rtsc: as radialpart, for the l with lneed(l) only (the others are left as they are)
+    LOGICAL, INTENT(in) :: lneed(0:lmax)
+    !!
+    !
+    ! local variables
+    INTEGER :: l
+    !! Counter on angular momentum
+    INTEGER :: ig
+    !! Counter on plane waves
+    INTEGER :: ir
+    !! Counter on mesh_r
+    INTEGER :: mesh_r
+    !! Size of the radial FFT mesh
+    INTEGER :: ierr
+    !! Error status
+    !
+    REAL(KIND = DP), PARAMETER :: xmin = -6.d0
+    !!
+    REAL(KIND = DP), PARAMETER :: dx = 0.025d0
+    !!
+    REAL(KIND = DP), PARAMETER :: rmax = 10.d0
+    !!
+    REAL(KIND = DP) :: rad_int
+    !!
+    REAL(KIND = DP) :: pref
+    !!
+    REAL(KIND = DP) :: x
+    !!
+    REAL(KIND = DP), ALLOCATABLE :: bes(:)
+    !!
+    REAL(KIND = DP), ALLOCATABLE :: func_r(:)
+    !!
+    REAL(KIND = DP), ALLOCATABLE :: r(:)
+    !!
+    REAL(KIND = DP), ALLOCATABLE :: rij(:)
+    !!
+    REAL(KIND = DP), ALLOCATABLE :: aux(:)
+    !!
+    !
+    mesh_r = NINT((log(rmax) - xmin) / dx + 1)
+    !
+    ALLOCATE(bes(mesh_r), STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error allocating bes', 1)
+    ALLOCATE(func_r(mesh_r), STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error allocating func_r', 1)
+    ALLOCATE(r(mesh_r), STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error allocating r', 1)
+    ALLOCATE(rij(mesh_r), STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error allocating rij', 1)
+    ALLOCATE(aux(mesh_r), STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error allocating aux', 1)
+    bes(:) = zero
+    func_r(:) = zero
+    r(:) = zero
+    rij(:) = zero
+    aux(:) = zero
+    !
+    ! compute the radial mesh
+    !
+    DO ir = 1, mesh_r
+      x = xmin  + DBLE(ir - 1) * dx
+      r(ir) = EXP(x) / alfa
+      rij(ir) = dx  * r(ir)
+    ENDDO
+    !
+    IF (rvalue == 1) func_r(:) = 2.d0 * alfa**(3.d0 / 2.d0) * EXP(-alfa * r(:))
+    IF (rvalue == 2) func_r(:) = 1.d0 / DSQRT(8.d0) * alfa**(3.d0 / 2.d0) * &
+                                (2.0d0 - alfa * r(:)) * EXP(-alfa * r(:) * 0.5d0)
+    IF (rvalue == 3) func_r(:) = DSQRT(4.d0 / 27.d0) * alfa**(2.0d0 / 3.0d0) * &
+                                (1.d0 - 1.5d0 * alfa * r(:) + &
+                                2.d0 * (alfa * r(:))**2 / 27.d0) * &
+                                EXP(-alfa * r(:) / 3.0d0)
+    pref = fpi / DSQRT(omega)
+    !
+    DO l = 0, lmax
+      IF (.NOT. lneed(l)) CYCLE
+      DO ig = 1, ng
+        CALL sph_bes(mesh_r, r(1), q(ig), l, bes)
+        aux(:) = bes(:) * func_r(:) * r(:) * r(:)
+        CALL simpson(mesh_r, aux, rij, rad_int)
+        radial(ig, l) = rad_int * pref
+      ENDDO
+    ENDDO
+    !
+    DEALLOCATE(bes, STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error deallocating bes', 1)
+    DEALLOCATE(func_r, STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error deallocating func_r', 1)
+    DEALLOCATE(r, STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error deallocating r', 1)
+    DEALLOCATE(rij, STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error deallocating rij', 1)
+    DEALLOCATE(aux, STAT = ierr)
+    IF (ierr /= 0) CALL errore('rtsc_radialpart', 'Error deallocating aux', 1)
+    !
+    RETURN
+    !
+    !-----------------------------------------------------------------------
+    END SUBROUTINE rtsc_radialpart
     !-----------------------------------------------------------------------
     !
     !-----------------------------------------------------------------------

@@ -30,7 +30,7 @@ if(QE_WANNIER90_INTERNAL)
         wannier90/src/sitesym.F90
         wannier90/src/transport.F90
         wannier90/src/utility.F90
-        wannier90/src/wannierise.F90
+        ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/w90/wannierise.F90
         wannier90/src/wannier_lib.F90
         wannier90/src/ws_distance.F90)
 

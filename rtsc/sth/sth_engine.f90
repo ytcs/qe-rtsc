@@ -2322,6 +2322,9 @@ CONTAINS
     IF (sth_timing) THEN
       CALL tsync(); tq(1) = wtime()
     ENDIF
+    ! rtsc amdahl: under RTSC_STH_FDXDP the FFT-index -> k+q map d_inv is used only by the box path (checks), so it
+    ! is built after the fftdx decision, and only when that path can run (sth_fdxdp_req unset: unchanged order)
+    IF (.NOT. sth_fdxdp_req) THEN
     BLOCK
       INTEGER, ALLOCATABLE :: hinv(:,:)
       INTEGER :: ig
@@ -2337,6 +2340,7 @@ CONTAINS
       d_inv = hinv
       DEALLOCATE(hinv)
     END BLOCK
+    ENDIF
     !
     IF (sth_timing) THEN
       CALL tsync(); tq(2) = wtime()
@@ -2426,6 +2430,26 @@ CONTAINS
       END BLOCK
     ENDIF
     dp_on = fdx_on .AND. sth_fdxdp_req .AND. nnr == nr(1) * nr(2) * nr(3)
+    IF (sth_fdxdp_req) THEN
+      IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+      IF (.NOT. dp_on .OR. sth_fdxdp_check .OR. sth_fftdx_check .OR. sth_pfft_check) THEN
+        BLOCK
+          INTEGER, ALLOCATABLE :: hinv(:,:)
+          INTEGER :: ig
+          ALLOCATE(hinv(nnr, nksq))
+          hinv = 0
+          DO ik = 1, nksq
+            DO ig = 1, h_npwq(ik)
+              hinv(h_idxkq(ig, ik), ik) = ig
+            ENDDO
+          ENDDO
+          IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+          ALLOCATE(d_inv(nnr, nksq))
+          d_inv = hinv
+          DEALLOCATE(hinv)
+        END BLOCK
+      ENDIF
+    ENDIF
     dp_checked = .FALSE.
     dr_checked = .FALSE.
     IF (sth_fdxdp_req) WRITE(*, '(A,L2)') '     rtsc fdxdp: dpot/drho/DVB-local on the pruned path:', dp_on

@@ -16,6 +16,7 @@ MODULE epw_gpu_coarse
   USE cudafor
   USE cufft
   USE cublas_v2
+  USE iso_c_binding, ONLY : c_int, c_double
   IMPLICIT NONE
   PRIVATE
   INTEGER, PARAMETER :: dp = KIND(1.d0)
@@ -50,6 +51,39 @@ MODULE epw_gpu_coarse
   REAL(dp), SAVE :: tp(6) = 0.0_dp
   INTEGER, SAVE :: np_calls = 0
   PUBLIC :: egc_prof_on, egc_prof_add, egc_prof_print, egc_wall
+  !
+  ! rtsc amdahl (RTSC_EPW_FDX=1; groups/compute/AMDAHL-LOG.md): the local part in G-space on the pruned cuFFTDx path
+  ! (rtsc/sth/fdx/sth_fftdx.cu), i.e. vanilla's own form dvpsi = fwfft(psi_k(r) V(r)) on the k+q sphere, then
+  ! g = psi_k+q^H dvpsi (one ZGEMM, K = npwq). Replaces the Parseval form, which materialises V psi for every band and
+  ! mode in a full box (nnr x nbnd x nmodes) before an M = nbnd ZGEMM over nnr. Only psi_k needs an inverse FFT.
+  ! RTSC_EPW_FDX_CHECK=1: at the first call also runs the Parseval form and prints the difference.
+  LOGICAL, SAVE :: fdx_req = .FALSE., fdx_chk = .FALSE., fdx_read = .FALSE., fdx_ok = .TRUE.
+  ! RTSC_EPW_BEC=1: becp1 and alphap of the current k on the device (egc_becs_set uploads vkb_k and (k+G)_a; they
+  ! are formed in egc_local_nl once psi_k is on the device)
+  LOGICAL, SAVE :: bec_dev = .FALSE.
+  INTEGER, SAVE :: bec_npw = 0
+  REAL(dp), SAVE :: bec_tpiba = 0.0_dp
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_vkbk(:,:), d_ckt(:,:)
+  REAL(dp), DEVICE, ALLOCATABLE :: d_kgk(:,:)
+  PUBLIC :: egc_becs_set
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_dvp(:,:)
+  INTEGER, DEVICE, ALLOCATABLE :: d_lst(:)
+  INTERFACE
+    INTEGER(c_int) FUNCTION fdx_geom1(nr, nrx, npwq, idxkq, ncols) BIND(C, name='fdx_geom1')
+      IMPORT :: c_int
+      INTEGER(c_int) :: nr(3), nrx(3), idxkq(*)
+      INTEGER(c_int), VALUE :: npwq, ncols
+    END FUNCTION fdx_geom1
+    INTEGER(c_int) FUNCTION fdx_dpot_d(d, psir, dv, list, s0, nb, nslot, npert, npwx, nnr, pj, scale, strm) &
+                                       BIND(C, name='fdx_dpot_d')
+      IMPORT :: c_int, c_double, cuda_stream_kind
+      COMPLEX(c_double), DEVICE :: d(*), psir(*), dv(*)
+      INTEGER(c_int), DEVICE :: list(*)
+      INTEGER(c_int), VALUE :: s0, nb, nslot, npert, npwx, nnr, pj
+      REAL(c_double), VALUE :: scale
+      INTEGER(cuda_stream_kind), VALUE :: strm
+    END FUNCTION fdx_dpot_d
+  END INTERFACE
   !
 CONTAINS
   !
@@ -121,6 +155,9 @@ CONTAINS
   SUBROUTINE egc_finalize()
     INTEGER :: istat
     IF (ALLOCATED(d_vkb)) DEALLOCATE(d_vkb, d_auxv, d_becq, d_bp, d_al, d_dm, d_db, d_da, d_u, d_kqg, d_at)
+    IF (ALLOCATED(d_dvp)) DEALLOCATE(d_dvp, d_lst)
+    IF (ALLOCATED(d_vkbk)) DEALLOCATE(d_vkbk, d_ckt, d_kgk)
+    bec_dev = .FALSE.
     nkbs = 0
     IF (.NOT. ready) RETURN
     istat = cufftDestroy(plan)
@@ -219,6 +256,108 @@ CONTAINS
     ENDIF
   END SUBROUTINE egc_local_dev
   !
+  LOGICAL FUNCTION egc_fdx_on()
+    CHARACTER(LEN=8) :: ev
+    IF (.NOT. fdx_read) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_FDX', ev)
+      fdx_req = TRIM(ev) == '1'
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_FDX_CHECK', ev)
+      fdx_chk = fdx_req .AND. TRIM(ev) == '1'
+      fdx_read = .TRUE.
+    ENDIF
+    egc_fdx_on = fdx_req .AND. fdx_ok
+  END FUNCTION egc_fdx_on
+  !
+  SUBROUTINE egc_local_fdx(npw, indk, ck, npwq, indq, cq)
+    !! as egc_local_dev (local part into d_g; d_cq keeps psi_k+q(G)), in G-space on the pruned path
+    INTEGER, INTENT(IN) :: npw, npwq
+    INTEGER, INTENT(IN) :: indk(npw), indq(npwq)
+    COMPLEX(dp), INTENT(IN) :: ck(ldc, nbnd), cq(ldc, nbnd)
+    INTEGER :: istat, ncol, i
+    TYPE(dim3) :: grd, blk
+    REAL(dp) :: fac, ta, tb
+    COMPLEX(dp), ALLOCATABLE :: ga(:,:), gb(:,:)
+    ncol = nbnd * nvset
+    IF (.NOT. ALLOCATED(d_dvp)) THEN
+      ALLOCATE(d_dvp(ldc, nbnd * nvmax), d_lst(nbnd * nvmax))
+      d_lst = (/ (i, i = 1, nbnd * nvmax) /)
+    ENDIF
+    IF (prof) ta = egc_wall(.TRUE.)
+    istat = cudaMemcpy(d_ik, indk, npw);       CALL chk(istat, 'H2D indk')
+    istat = cudaMemcpy(d_ck, ck, ldc * nbnd);  CALL chk(istat, 'H2D ck')
+    istat = cudaMemcpy(d_cq, cq, ldc * nbnd);  CALL chk(istat, 'H2D cq')
+    istat = fdx_geom1(nr, nrx, npwq, indq, ncol)
+    IF (istat /= 0) THEN
+      WRITE(*, '(a,i0,a)') 'epw_gpu_coarse: RTSC_EPW_FDX geometry unsupported (', istat, '), Parseval form kept'
+      fdx_ok = .FALSE.
+      CALL egc_local_dev(npw, indk, ck, npwq, indq, cq)
+      RETURN
+    ENDIF
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(1) = tp(1) + tb - ta; ta = tb
+    ENDIF
+    d_psi = (0.0_dp, 0.0_dp)
+    blk = dim3(256, 1, 1)
+    grd = dim3((npw + 255) / 256, nbnd, 1)
+    CALL k_scatter<<<grd, blk>>>(npw, nbnd, ldc, d_ik, d_ck, nnr, d_psi)
+    istat = cufftExecZ2Z(plan, d_psi, d_psi, CUFFT_INVERSE); CALL chk(istat, 'cufft psi')
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(2) = tp(2) + tb - ta; ta = tb
+    ENDIF
+    fac = 1.0_dp / DBLE(nr(1) * nr(2) * nr(3))
+    d_dvp(:, 1:ncol) = (0.0_dp, 0.0_dp)
+    ! column c = n + nbnd (nu - 1): band n of psi_k(r) (slot n, k = 1), perturbation nu of V
+    istat = fdx_dpot_d(d_dvp, d_psi, d_v, d_lst, 0, ncol, nbnd, nvset, ldc, nnr, 0, fac, 0_cuda_stream_kind)
+    IF (istat /= 0) CALL chk(istat, 'fdx_dpot_d')
+    istat = cublasZgemm(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nbnd, ncol, npwq, (1.0_dp, 0.0_dp), d_cq, ldc, &
+                        d_dvp, ldc, (0.0_dp, 0.0_dp), d_g, nbnd)
+    CALL chk(istat, 'cublasZgemm (fdx)')
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(3) = tp(3) + tb - ta
+    ENDIF
+    IF (fdx_chk) THEN
+      ALLOCATE(ga(nbnd, ncol), gb(nbnd, ncol))
+      ga = d_g(:, 1:ncol)
+      CALL egc_local_dev(npw, indk, ck, npwq, indq, cq)
+      gb = d_g(:, 1:ncol)
+      WRITE(*, '(a,i6,a,es10.3,a,es10.3)') '     rtsc epw fdx check: columns', ncol, ', max|d|/max ', &
+           MAXVAL(ABS(ga - gb)) / MAXVAL(ABS(gb)), ', rel L2 ', SQRT(SUM(ABS(ga - gb)**2) / SUM(ABS(gb)**2))
+      d_g(:, 1:ncol) = ga
+      DEALLOCATE(ga, gb)
+      fdx_chk = .FALSE.
+    ENDIF
+  END SUBROUTINE egc_local_fdx
+  !
+  SUBROUTINE egc_becs_set(npw, nkb_, ldv, vkbk, kgk, tpiba)
+    !! RTSC_EPW_BEC: vkb at k (ldv x nkb_, first npw rows) and (k+G)_a (ldv x 3, tpiba units) for the next
+    !! egc_local_nl, which then forms becp1 and alphap on the device instead of uploading them
+    INTEGER, INTENT(IN) :: npw, nkb_, ldv
+    COMPLEX(dp), INTENT(IN) :: vkbk(ldv, nkb_)
+    REAL(dp), INTENT(IN) :: kgk(ldv, 3), tpiba
+    INTEGER :: istat
+    IF (ALLOCATED(d_vkbk)) THEN
+      IF (SIZE(d_vkbk, 2) /= nkb_) DEALLOCATE(d_vkbk, d_ckt, d_kgk)
+    ENDIF
+    IF (.NOT. ALLOCATED(d_vkbk)) ALLOCATE(d_vkbk(ldc, nkb_), d_ckt(ldc, nbnd), d_kgk(ldc, 3))
+    istat = cudaMemcpy2D(d_vkbk, ldc, vkbk, ldv, npw, nkb_); CALL chk(istat, 'H2D vkb_k')
+    istat = cudaMemcpy2D(d_kgk, ldc, kgk, ldv, npw, 3); CALL chk(istat, 'H2D (k+G)')
+    bec_npw = npw
+    bec_tpiba = tpiba
+    bec_dev = .TRUE.
+  END SUBROUTINE egc_becs_set
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_kgpsi(t, c, kg, ld, npw, nb, a, tp)
+    !! t(ig, n) = c(ig, n) * i tpiba (k+G)_a(ig)   (as the prolog's aux2)
+    INTEGER, VALUE :: ld, npw, nb, a
+    REAL(dp), VALUE :: tp
+    COMPLEX(dp), DEVICE :: t(ld, nb), c(ld, nb)
+    REAL(dp), DEVICE :: kg(ld, 3)
+    INTEGER :: ig, n
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    n = blockIdx%y
+    IF (ig <= npw) t(ig, n) = c(ig, n) * CMPLX(0.0_dp, tp * kg(ig, a), dp)
+  END SUBROUTINE k_kgpsi
+  !
   SUBROUTINE egc_nl_set(nkb_, nat3_, nv, dmat, atom, uq)
     !! Per ep_coarse_compute call: dense D (nkb x nkb, block-diagonal deff), the atom of each projector
     !! (1-based) and the perturbation patterns uq(3 nat, nv) exactly as vanilla uses them (conjugated
@@ -288,6 +427,8 @@ CONTAINS
     IF (nkbs > 0) THEN
       istat = cudaMemcpy2D(d_vkb, ldc, vkb, ldv, npwq, nkbs); CALL chk(istat, 'H2D vkb')
       istat = cudaMemcpy2D(d_kqg, ldc, kqg, ldv, npwq, 3); CALL chk(istat, 'H2D kqg')
+    ENDIF
+    IF (nkbs > 0 .AND. .NOT. bec_dev) THEN
       istat = cudaMemcpy2D(d_bp, nkbs, becp1, ldb, nkbs, nbnd); CALL chk(istat, 'H2D becp1')
       istat = cudaMemcpy2D(d_al(1, 1, 1), nkbs, al1, ldb, nkbs, nbnd); CALL chk(istat, 'H2D alphap')
       istat = cudaMemcpy2D(d_al(1, 1, 2), nkbs, al2, ldb, nkbs, nbnd); CALL chk(istat, 'H2D alphap')
@@ -296,8 +437,25 @@ CONTAINS
     IF (prof) THEN
       tb = egc_wall(.TRUE.); tp(1) = tp(1) + tb - ta
     ENDIF
-    CALL egc_local_dev(npw, indk, ck, npwq, indq, cq)
+    IF (egc_fdx_on()) THEN
+      CALL egc_local_fdx(npw, indk, ck, npwq, indq, cq)
+    ELSE
+      CALL egc_local_dev(npw, indk, ck, npwq, indq, cq)
+    ENDIF
     IF (prof) ta = egc_wall(.TRUE.)
+    IF (nkbs > 0 .AND. bec_dev) THEN
+      ! RTSC_EPW_BEC: becp1 = vkb_k^H psi_k, alphap_a = vkb_k^H [i tpiba (k+G)_a psi_k]   (d_ck = psi_k(G))
+      istat = cublasZgemm(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkbs, nbnd, bec_npw, one, d_vkbk, ldc, d_ck, ldc, zero, &
+                          d_bp, nkbs)
+      CALL chk(istat, 'cublasZgemm becp1')
+      DO a = 1, 3
+        CALL k_kgpsi<<<dim3((bec_npw + 255) / 256, nbnd, 1), 256>>>(d_ckt, d_ck, d_kgk, ldc, bec_npw, nbnd, a, bec_tpiba)
+        istat = cublasZgemm(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkbs, nbnd, bec_npw, one, d_vkbk, ldc, d_ckt, ldc, zero, &
+                            d_al(1, 1, a), nkbs)
+        CALL chk(istat, 'cublasZgemm alphap')
+      ENDDO
+      bec_dev = .FALSE.
+    ENDIF
     IF (nkbs > 0) THEN
       ! becq_0 = vkb^H psi_k+q ; becq_a = [vkb (k+q+G)_a]^H psi_k+q
       istat = cublasZgemm(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkbs, nbnd, npwq, one, d_vkb, ldc, d_cq, ldc, zero, &

@@ -648,6 +648,59 @@ int fdx_setup(const int* nr, const int* nrx, int nksq, int npwx, const int* npwq
 
 void fdx_info(int* nst, int* nxa, int* chunk) { *nst = g.nst; *nxa = g.nxa; *chunk = g.chunk; }
 
+// rtsc amdahl (EPW coarse g, RTSC_EPW_FDX): geometry of ONE sphere (nksq = 1), rebuilt per call with grow-only device
+// buffers (no cudaMalloc/cudaFree in the steady state). ncols = columns the stick buffer must hold. 0 = ok.
+static size_t gz_cap = 0, gs_cap = 0, gx_cap = 0;
+int fdx_geom1(const int* nr, const int* nrx, int npwq, const int* idxkq, int ncols) {
+  const int n1 = nr[0], n2 = nr[1], n3 = nr[2];
+  if (nrx[0] != n1 || nrx[1] != n2) return 1;
+  int gid = -1;
+#define X(id, a, b, c) if (n1 == a && n2 == b && n3 == c) gid = id;
+  FDX_GRIDS(X)
+#undef X
+  if (gid < 0) return 2;
+  static std::vector<int> smap, sx, sy, xa, zm;
+  static std::vector<char> on, xon;
+  static bool tw = false;
+  smap.assign(n1 * n2, 0); on.assign(n1 * n2, 0); xon.assign(n1, 0);
+  sx.clear(); sy.clear(); xa.clear();
+  for (int ig = 0; ig < npwq; ig++) {
+    int l = idxkq[ig] - 1;
+    on[(l % nrx[0]) + n1 * ((l / nrx[0]) % nrx[1])] = 1;
+  }
+  for (int i2 = 0; i2 < n2; i2++)
+    for (int i1 = 0; i1 < n1; i1++)
+      if (on[i1 + n1 * i2]) { sx.push_back(i1); sy.push_back(i2); smap[i1 + n1 * i2] = (int)sx.size(); xon[i1] = 1; }
+  for (int i1 = 0; i1 < n1; i1++) if (xon[i1]) xa.push_back(i1);
+  const int nst = (int)sx.size(), nzst = nst * n3;
+  zm.assign((size_t)nzst, 0);
+  for (int ig = 0; ig < npwq; ig++) {
+    int l = idxkq[ig] - 1;
+    int i1 = l % nrx[0], i2 = (l / nrx[0]) % nrx[1], i3 = l / (nrx[0] * nrx[1]);
+    zm[(smap[i1 + n1 * i2] - 1) + (size_t)nst * i3] = ig + 1;
+  }
+  if ((size_t)nzst > gz_cap) { cudaFree(g.zmap); gz_cap = (size_t)nzst * 5 / 4; if (cudaMalloc(&g.zmap, 4 * gz_cap)) return 3; }
+  if ((size_t)nst > gx_cap) {
+    cudaFree(g.sx); cudaFree(g.sy); cudaFree(g.xa); gx_cap = std::max<size_t>((size_t)nst * 5 / 4, n1);
+    if (cudaMalloc(&g.sx, 4 * gx_cap) || cudaMalloc(&g.sy, 4 * gx_cap) || cudaMalloc(&g.xa, 4 * gx_cap)) return 3;
+  }
+  const size_t sb = (size_t)16 * nzst * ncols;
+  if (sb > gs_cap) { cudaFree(g.S); gs_cap = sb * 5 / 4; if (cudaMalloc(&g.S, gs_cap)) return 3; }
+  cudaMemcpy(g.zmap, zm.data(), 4 * (size_t)nzst, cudaMemcpyHostToDevice);
+  cudaMemcpy(g.sx, sx.data(), 4 * (size_t)nst, cudaMemcpyHostToDevice);
+  cudaMemcpy(g.sy, sy.data(), 4 * (size_t)nst, cudaMemcpyHostToDevice);
+  cudaMemcpy(g.xa, xa.data(), 4 * xa.size(), cudaMemcpyHostToDevice);
+  if (!tw) {
+    double t54[27][2];
+    for (int k = 0; k < 27; k++) { t54[k][0] = cos(2 * M_PI * k / 54.0); t54[k][1] = sin(2 * M_PI * k / 54.0); }
+    cudaMemcpyToSymbol(c_tw54, t54, sizeof(t54));
+    tw = true;
+  }
+  g.n1 = n1; g.n2 = n2; g.n3 = n3; g.nst = nst; g.nxa = (int)xa.size(); g.nzst = nzst; g.nksq = 1; g.gid = gid;
+  g.split = 0; g.Sbytes = gs_cap; g.chunk = ncols;
+  return cudaGetLastError() == cudaSuccess ? 0 : 4;
+}
+
 // RTSC_STH_FDXDP (FP64). dpot: d(npwx, *) += scale * gather_kq(FFT_fwd(psir(:, b) * dv(:, p))) for the nb columns
 // list(s0+1 .. s0+nb); b = the column's (k, n) slot of the psi(r) cache (pj = 0) or the chunk column j (pj = 1).
 int fdx_dpot_d(void* d, const void* psir, const void* dv, const int* list, int s0, int nb, int nslot, int npert,
