@@ -10,7 +10,9 @@ phonon: phonopy finite displacements (0.01 A) in a supercell with every perpendi
 omega_min over the supercell's commensurate q (the 3 acoustic modes at Gamma excluded). If below -30 cm^-1,
 the parent is displaced along that mode (0.15 A max), the supercell re-relaxed and reduced to its
 primitive cell, and phonons recomputed: at most 2 rounds, the child replaces the parent. ZPE (T = 0
-phonopy free energy, 8^3 mesh) in eV per parent formula cell.
+phonopy free energy, 8^3 mesh) in eV per parent formula cell; zpe_gamma_eV: Gamma-point ZPE of the parent cell
+(sum hbar omega / 2 over the 3N - 3 non-acoustic Gamma modes, imaginary ones dropped and counted), the like-for-like
+partner of the DFT Gamma-ZPE (zpe.py) under the F0b ZPE-source rule (FUNNEL.md section 7).
 """
 import json
 import os
@@ -23,6 +25,7 @@ from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
 THZ_TO_CM = 33.35641
+CM_TO_EV = 1.239841984e-4
 KJMOL_TO_EV = 0.0103642688
 
 
@@ -115,7 +118,10 @@ def phonons(s, calc):
     ph.run_mesh([8, 8, 8])
     ph.run_thermal_properties(t_min=0, t_max=0, t_step=1)
     zpe = float(ph.get_thermal_properties_dict()["free_energy"][0]) * KJMOL_TO_EV
-    return ph, dim, wmin, qmin, imin, zpe, len(ph.supercells_with_displacements)
+    fg = np.sort(ph.get_frequencies([0, 0, 0]) * THZ_TO_CM)
+    opt = fg[np.argsort(np.abs(fg))[3:]] if len(fg) > 3 else np.array([])
+    zg = dict(zpe=float(0.5 * opt[opt > 0].sum() * CM_TO_EV), n_imag=int((opt < 0).sum()))
+    return ph, dim, wmin, qmin, imin, zpe, len(ph.supercells_with_displacements), zg
 
 
 def follow(s, ph, dim, q, band, calc, amp=0.15):
@@ -162,8 +168,9 @@ def cmd_phonon(model, src, ids, out):
             s = Structure.from_dict(recs[k]["structure"])
             rec = dict(id=k, model=model, nat=len(s), rounds=[])
             try:
-                ph, dim, wmin, q, j, zpe, ndisp = phonons(s, calc)
-                rec.update(dim=dim, ndisp=ndisp, wmin0=wmin, zpe_eV=zpe * 1.0)
+                ph, dim, wmin, q, j, zpe, ndisp, zg = phonons(s, calc)
+                rec.update(dim=dim, ndisp=ndisp, wmin0=wmin, zpe_eV=zpe * 1.0, zpe_gamma_eV=zg["zpe"],
+                           gamma_n_imag=zg["n_imag"])
                 rec["rounds"].append(dict(wmin=wmin, q=list(map(float, q)), nat=len(s)))
                 cur = s
                 for rnd in range(2):
@@ -173,7 +180,7 @@ def cmd_phonon(model, src, ids, out):
                     if len(child) > 4 * len(s):
                         rec["status"] = "fail:soft-large-child"; break
                     cur = child
-                    ph, dim, wmin, q, j, zpe_c, nd = phonons(cur, calc)
+                    ph, dim, wmin, q, j, zpe_c, nd, _ = phonons(cur, calc)
                     rec["rounds"].append(dict(wmin=wmin, q=list(map(float, q)), nat=len(cur), e_atom=e_child))
                 rec["wmin"] = wmin
                 rec["pass_T1b"] = bool(wmin >= -30.0)

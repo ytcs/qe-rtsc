@@ -3,6 +3,18 @@
     python analyze.py access <t1 ms.jsonl> <t1 mace.jsonl> <t1b ms.jsonl> <t2.jsonl> <out.json>
     python analyze.py hull   <all.json> <t1 ms.jsonl> <t1 mace.jsonl> <out.json>
 
+F0b (FUNNEL.md section 7, pre-registered before any F0b run):
+    python analyze.py hull1  <t1 ms.jsonl> <t1 mace.jsonl> <id> <ref ids,comma> <out.json>
+    python analyze.py t1b2   <t1b ms.jsonl> <t1b mace.jsonl> <out.json>
+    python analyze.py access2 <t1 ms> <t1 mace> <t1b ms> <t1b mace> <t2.jsonl> <dft-zpe.jsonl> <P> <out.json>
+t1b2 is the T1b two-model rule: reject only if BOTH MatterSim and MACE-MPA-0 end below -30 cm^-1 after soft-mode
+following (each model on its own relaxed geometry); one unstable model -> pass with flag t1b_split.
+access2 is the ZPE-source rule: a phase is 'stable' if both MLIPs give omega_min >= -30 cm^-1 on that phase's
+own (parent) cell; if every phase of every channel of P is stable, all solids use the MLIP Gamma-ZPE
+(MatterSim, the F0 source model); otherwise each unstable phase uses the DFT Gamma-ZPE (zpe.py) and the stable
+ones keep the MatterSim Gamma-ZPE. H2: 0.270 eV. The F0-convention values (MatterSim 8^3-mesh ZPE) are reported
+alongside for comparison only.
+
 Conventions: FUNNEL-LOG F0 pre-registration (hull channel; PASS <= 0.55 in both functionals, REJECT
 > 0.8 in both, else HOLD; T1a line 1.1 eV/H2 in either model; ZPE from MatterSim phonons + H2 0.270 eV).
 """
@@ -170,5 +182,79 @@ def cmd_t2db(hull, t1b, t2, out):
               "hull<=0.1", sum(1 for x in rs if x["dft_decomp"] is not None and x["dft_decomp"] <= 0.10))
 
 
+def cmd_hull1(ms, mace, pid, refs, out):
+    """T1a E_hull of one phase against named reference phases (+ itself), per MLIP; pass if <= 0.10 in either."""
+    from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
+    from pymatgen.core import Structure
+    res = dict(id=pid)
+    for model, p in (("mattersim", ms), ("mace", mace)):
+        rec = load(p)
+        ents = []
+        for k in [pid] + refs.split(","):
+            r = rec[k]
+            comp = Structure.from_dict(r["structure"]).composition
+            ents.append(PDEntry(comp, r["e_atom"] * r["nat"], name=k))
+        pd = PhaseDiagram(ents)
+        me = [e for e in ents if e.name == pid][0]
+        dec = pd.get_decomposition(me.composition)
+        res[model] = dict(ehull=float(pd.get_e_above_hull(me)), decomposition={e.name: float(a) for e, a in dec.items()})
+    res["pass_T1a_hull"] = any(res[m]["ehull"] <= 0.10 for m in ("mattersim", "mace"))
+    Path(out).write_text(json.dumps(res, indent=1))
+    print(json.dumps(res))
+
+
+def t1b_rule(a, b):
+    """Two-model T1b rule (FUNNEL.md section 7). a, b: T1b records (MatterSim, MACE)."""
+    ua = not a.get("pass_T1b", False)
+    ub = not b.get("pass_T1b", False)
+    return dict(ms_wmin=a.get("wmin"), mace_wmin=b.get("wmin"), ms_status=a.get("status"), mace_status=b.get("status"),
+                ms_unstable=ua, mace_unstable=ub, pass_T1b=not (ua and ub), t1b_split=ua != ub)
+
+
+def cmd_t1b2(ms, mace, out):
+    a, b = load(ms, key="pass_T1b"), load(mace, key="pass_T1b")
+    res = {k: t1b_rule(a[k], b[k]) for k in a if k in b}
+    Path(out).write_text(json.dumps(res, indent=1))
+    for k, r in res.items():
+        print(f"{k:10s} MS {r['ms_wmin']:9.1f}  MACE {r['mace_wmin']:9.1f}  pass {r['pass_T1b']}  split {r['t1b_split']}")
+
+
+def cmd_access2(ms, mace, t1bms, t1bmace, t2, dftzpe, P, out):
+    e = {"mattersim": {k: v["e_atom"] for k, v in load(ms).items()},
+         "mace": {k: v["e_atom"] for k, v in load(mace).items()}}
+    t2r = load(t2, by=("id", "xc"))
+    for xc in ("pbe", "pbesol"):
+        e[f"dft-{xc}"] = {k: r["e_atom"] for (k, x), r in t2r.items() if x == xc}
+    bm, bc = load(t1bms, key="zpe_eV"), load(t1bmace, key="zpe_eV")
+    dz = {k: v for k, v in load(dftzpe, key="zpe_eV").items() if v.get("status") == "ok"}
+    phases = sorted({P} | {p for prod, _ in RX[P] for p in prod})
+    stab = {p: dict(ms_wmin0=bm[p]["wmin0"], mace_wmin0=bc[p]["wmin0"],
+                    stable=bm[p]["wmin0"] >= -30.0 and bc[p]["wmin0"] >= -30.0) for p in phases}
+    all_stable = all(s["stable"] for s in stab.values())
+    zpe, src = {}, {}
+    for p in phases:
+        if all_stable or stab[p]["stable"]:
+            zpe[p], src[p] = bm[p]["zpe_gamma_eV"] / bm[p]["nat"], "MLIP Gamma (MatterSim)"
+        else:
+            zpe[p], src[p] = dz[p]["zpe_eV"] / dz[p]["nat"], "DFT Gamma (PBE, ph.x)"
+    zf0 = {p: bm[p]["zpe_eV"] / bm[p]["nat"] for p in phases}
+    row = dict(phases={p: dict(stab[p], zpe_source=src[p], zpe_cell_eV=zpe[p] * FORMULA_ATOMS[p],
+                               zpe_F0_mesh_cell_eV=zf0[p] * FORMULA_ATOMS[p]) for p in phases}, all_stable=all_stable)
+
+    for s, ea in e.items():
+        _, h = delta(ea, zpe, P)
+        _, h0 = delta(ea, zf0, P)
+        row[s] = dict(hull_channel=h and h["channel"], dE=h and h["dE"], dE_zpe=h and h["dE_zpe"],
+                      dE_zpe_F0mesh=h0 and h0["dE_zpe"])
+    v = lambda s: row[s]["dE_zpe"]
+    row["T1a_line_1.1"] = "pass" if any(v(s) is not None and v(s) <= 1.1 for s in ("mattersim", "mace")) else "reject"
+    row["T2_gate"] = gate([v("dft-pbe"), v("dft-pbesol")])
+    row["T2_gate_noZPE"] = gate([row["dft-pbe"]["dE"], row["dft-pbesol"]["dE"]])
+    row["T2_gate_F0mesh"] = gate([row["dft-pbe"]["dE_zpe_F0mesh"], row["dft-pbesol"]["dE_zpe_F0mesh"]])
+    Path(out).write_text(json.dumps(row, indent=1))
+    print(json.dumps(row, indent=1))
+
+
 if __name__ == "__main__":
-    {"access": cmd_access, "hull": cmd_hull, "t2db": cmd_t2db}[sys.argv[1]](*sys.argv[2:])
+    {"access": cmd_access, "hull": cmd_hull, "t2db": cmd_t2db, "hull1": cmd_hull1, "t1b2": cmd_t1b2,
+     "access2": cmd_access2}[sys.argv[1]](*sys.argv[2:])
