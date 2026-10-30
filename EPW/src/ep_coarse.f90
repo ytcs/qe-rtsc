@@ -31,6 +31,7 @@
   INTEGER, SAVE, PRIVATE :: star_nsc = 0, star_nfb = 0, star_nck = 0
   REAL(KIND = DP), SAVE, PRIVATE :: star_umax = 0.0_DP, star_cmax = 0.0_DP
   REAL(KIND = DP), PARAMETER, PRIVATE :: star_tol = 1.0E-8_DP
+  INTEGER, SAVE, PRIVATE :: star_iqirr = 0, star_nqcirr = 0
   !
   CONTAINS
     !
@@ -51,14 +52,25 @@
     END FUNCTION star_enabled
     !
     !-----------------------------------------------------------------------
-    SUBROUTINE star_begin(first, use_now)
+    SUBROUTINE star_begin(first, use_now, iq_irr, nqc_irr)
     !-----------------------------------------------------------------------
     !! before ep_coarse_compute of a star member: first = the base member (q0, identity op) of a new star;
-    !! use_now = the shortcut may be used in this call
+    !! use_now = the shortcut may be used in this call; iq_irr, nqc_irr: for a deferred dvscf_read
     LOGICAL, INTENT(IN) :: first, use_now
+    INTEGER, INTENT(IN) :: iq_irr, nqc_irr
     IF (first) star_have = .FALSE.
     star_now = use_now .AND. star_have
+    star_iqirr = iq_irr
+    star_nqcirr = nqc_irr
     END SUBROUTINE star_begin
+    !
+    !-----------------------------------------------------------------------
+    LOGICAL FUNCTION star_lazy()
+    !-----------------------------------------------------------------------
+    !! the member's dvscf is read (and the GPU potentials set up) only if some k needs the direct form
+    !! (RTSC_EPW_STAR_CHECK=1 computes 2 k directly, so it reads up front)
+    star_lazy = star_now .AND. .NOT. star_chk
+    END FUNCTION star_lazy
     !
     !-----------------------------------------------------------------------
     SUBROUTINE star_store(el_ph_mat, nm)
@@ -440,7 +452,7 @@
     USE kinds,            ONLY : DP
     USE mp_global,        ONLY : my_pool_id, nproc_pool, intra_pool_comm, &
                                  inter_pool_comm, inter_image_comm, world_comm
-    USE mp,               ONLY : mp_barrier, mp_bcast, mp_sum
+    USE mp,               ONLY : mp_barrier, mp_bcast, mp_sum, mp_max
     USE wavefunctions,    ONLY : evc
     USE io_files,         ONLY : diropn
     USE wvfct,            ONLY : npwx
@@ -511,7 +523,8 @@
     !! Current q-point index
     REAL(KIND = DP), INTENT(in) :: xq0(3)
     !! The first q-point in the star (cartesian coords.)
-    COMPLEX(KIND = DP), INTENT(in) :: dvscfins(dffts%nnr, nspin_mag, npe)
+    COMPLEX(KIND = DP), INTENT(inout) :: dvscfins(dffts%nnr, nspin_mag, npe)
+    !! rtsc epw3: inout, filled here when a RTSC_EPW_STAR member defers its read (star_lazy)
     !! Delta scf potential
     COMPLEX(KIND = DP), INTENT(in) :: eigv(ngxxf)
     !! $e^{iGv}$ for 1...nsym (v the fractional translation)
@@ -612,7 +625,9 @@
     REAL(KIND = DP), ALLOCATABLE :: deff(:, :, :)
     COMPLEX(KIND = DP), ALLOCATABLE :: vtot(:, :), becq(:, :, :), auxv(:, :), ps1(:, :), ps2(:, :, :)
     ! rtsc epw3: RTSC_EPW_STAR
-    LOGICAL :: star_done, star_cmp
+    LOGICAL :: star_done, star_cmp, lazy, use_star
+    LOGICAL, ALLOCATABLE :: kdefer(:)
+    INTEGER :: kpass, ndefer
     COMPLEX(KIND = DP), ALLOCATABLE :: gstar(:, :, :)
     !
     ALLOCATE(elphmat(nbndep, nbndep, npe), STAT = ierr)
@@ -685,60 +700,29 @@
     bec_gpu = .FALSE.
 #if defined (__CUDA)
     use_gpu = ep_coarse_gpu_ok()
-    IF (use_gpu) THEN
-      ! total local perturbing potential per perturbation: dvscf + dV_loc^bare (k-independent)
-      ALLOCATE(vtot(dffts%nnr, npe), deff(nhm, nhm, nat), becq(nkb, nbndep, 0:3), auxv(npwx, nkb), &
-               ps1(nkb, nbndep), ps2(nkb, nbndep, 3), indk(npwx), indq(npwx), STAT = ierr)
-      IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error allocating GPU-path arrays', 1)
-      xq_bak = xq
-      xq = xq0
-      DO ipert = 1, npe
-        mode = imode0 + ipert
-        IF (timerev) THEN
-          CALL compute_dvloc(CONJG(u(:, mode)), .FALSE., vtot(:, ipert))
-          vtot(:, ipert) = vtot(:, ipert) + CONJG(dvscfins(:, 1, ipert))
-        ELSE
-          CALL compute_dvloc(u(:, mode), .FALSE., vtot(:, ipert))
-          vtot(:, ipert) = vtot(:, ipert) + dvscfins(:, 1, ipert)
-        ENDIF
-      ENDDO
-      xq = xq_bak
-      CALL egc_init(dffts%nr1, dffts%nr2, dffts%nr3, dffts%nr1x, dffts%nr2x, dffts%nr3x, &
-                    dffts%nnr, nbndep, 3 * nat, npwx)
-      CALL egc_set_v(npe, vtot)
-      ! nonlocal part on the GPU too (RTSC_EPW_NL=0 keeps the host code below)
-      BLOCK
-        CHARACTER(LEN = 16) :: ev
-        CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_NL', ev)
-        nl_gpu = (TRIM(ev) /= '0') .AND. nkb > 0
-        CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_BEC', ev)
-        bec_gpu = nl_gpu .AND. TRIM(ev) == '1' .AND. .NOT. noncolin .AND. lower_band == 1 .AND. upper_band == nbndep
-        IF (bec_gpu) ALLOCATE(kgk(npwx, 3))
-      END BLOCK
-      IF (nl_gpu) THEN
-        ALLOCATE(kbatom(nkb), dmat(nkb, nkb), uqm(3 * nat, npe), kqg(npwx, 3))
-        ijkb0 = 0
-        DO nt = 1, ntyp
-          DO na = 1, nat
-            IF (ityp(na) == nt) THEN
-              kbatom(ijkb0 + 1:ijkb0 + nh(nt)) = na
-              ijkb0 = ijkb0 + nh(nt)
-            ENDIF
-          ENDDO
-        ENDDO
-        DO ipert = 1, npe
-          mode = imode0 + ipert
-          IF (timerev) THEN
-            uqm(:, ipert) = CONJG(u(:, mode))
-          ELSE
-            uqm(:, ipert) = u(:, mode)
-          ENDIF
-        ENDDO
-      ENDIF
-    ENDIF
 #endif
+    ! rtsc epw3 (RTSC_EPW_STAR): a member using the shortcut defers dvscf and the GPU potentials to pass 2,
+    ! which runs only if some k of some pool needs the direct form
+    lazy = star_lazy()
+    IF (.NOT. lazy) CALL gpu_setup()
+    ALLOCATE(kdefer(nk_loc))
+    kdefer(:) = .FALSE.
+    !
+    pass_loop: DO kpass = 1, 2
+    IF (kpass == 2) THEN
+      IF (.NOT. lazy) EXIT pass_loop
+      ndefer = COUNT(kdefer)
+      CALL mp_max(ndefer, inter_pool_comm)
+      IF (ndefer == 0) EXIT pass_loop
+      CALL dvscf_read(imode0, star_iqirr, star_nqcirr, npe, xq0, dvscfins, timerev)
+      CALL gpu_setup()
+    ENDIF
+    use_star = star_now .AND. kpass == 1
     !
     DO ik = 1, nk_loc
+      IF (kpass == 2) THEN
+        IF (.NOT. kdefer(ik)) CYCLE
+      ENDIF
       !
       etq(:, :) = zero
       elphmat(:, :, :) = czero
@@ -911,7 +895,7 @@
       ! rtsc epw3 (RTSC_EPW_STAR=1): g from the base member of the star and the band overlaps D (module header)
       star_done = .FALSE.
       star_cmp = .FALSE.
-      IF (star_now) THEN
+      IF (use_star) THEN
         CALL stop_clock('ep_prolog')
         CALL start_clock('ep_star')
         IF (.NOT. ALLOCATED(gstar)) ALLOCATE(gstar(nbndep, nbndep, npe))
@@ -926,6 +910,12 @@
           ENDIF
         ELSE
           star_nfb = star_nfb + 1
+          IF (lazy) THEN
+            ! direct form in pass 2, after the deferred dvscf read
+            kdefer(ik) = .TRUE.
+            DEALLOCATE(igk, igkq)
+            CYCLE
+          ENDIF
         ENDIF
         IF (.NOT. star_done) CALL start_clock('ep_prolog')
       ENDIF
@@ -1094,6 +1084,8 @@
       IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error deallocating igkq', 1)
       !
     ENDDO ! ik
+    END DO pass_loop
+    DEALLOCATE(kdefer)
     !
     ! When all irr perturbations have been done, rotate from pattern to Cartesian basis
     IF (irr == nirr) THEN
@@ -1145,7 +1137,7 @@
          &" computed directly (D not unitary), max |D^H D - 1| ", ES9.2, "; check: ", I0, " k, max |dg|/max|g| ", &
          &ES9.2)') star_nsc, star_nfb, star_umax, star_nck, star_cmax
     IF (ALLOCATED(gstar)) DEALLOCATE(gstar)
-    IF (use_gpu) DEALLOCATE(vtot, deff, becq, auxv, ps1, ps2, indk, indq)
+    IF (ALLOCATED(vtot)) DEALLOCATE(vtot, deff, becq, auxv, ps1, ps2, indk, indq)
     IF (ALLOCATED(kbatom)) DEALLOCATE(kbatom, dmat, uqm, kqg)
     IF (ALLOCATED(kgk)) DEALLOCATE(kgk)
     DEALLOCATE(elphmat, STAT = ierr)
@@ -1178,6 +1170,63 @@
     ENDIF
     !
     CONTAINS
+      !
+      SUBROUTINE gpu_setup()
+      !! rtsc: GPU-path setup of ep_coarse_compute (total local potentials, device buffers, nonlocal data)
+#if defined (__CUDA)
+      IF (use_gpu) THEN
+        ! total local perturbing potential per perturbation: dvscf + dV_loc^bare (k-independent)
+        ALLOCATE(vtot(dffts%nnr, npe), deff(nhm, nhm, nat), becq(nkb, nbndep, 0:3), auxv(npwx, nkb), &
+                 ps1(nkb, nbndep), ps2(nkb, nbndep, 3), indk(npwx), indq(npwx), STAT = ierr)
+        IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error allocating GPU-path arrays', 1)
+        xq_bak = xq
+        xq = xq0
+        DO ipert = 1, npe
+          mode = imode0 + ipert
+          IF (timerev) THEN
+            CALL compute_dvloc(CONJG(u(:, mode)), .FALSE., vtot(:, ipert))
+            vtot(:, ipert) = vtot(:, ipert) + CONJG(dvscfins(:, 1, ipert))
+          ELSE
+            CALL compute_dvloc(u(:, mode), .FALSE., vtot(:, ipert))
+            vtot(:, ipert) = vtot(:, ipert) + dvscfins(:, 1, ipert)
+          ENDIF
+        ENDDO
+        xq = xq_bak
+        CALL egc_init(dffts%nr1, dffts%nr2, dffts%nr3, dffts%nr1x, dffts%nr2x, dffts%nr3x, &
+                      dffts%nnr, nbndep, 3 * nat, npwx)
+        CALL egc_set_v(npe, vtot)
+        ! nonlocal part on the GPU too (RTSC_EPW_NL=0 keeps the host code below)
+        BLOCK
+          CHARACTER(LEN = 16) :: ev
+          CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_NL', ev)
+          nl_gpu = (TRIM(ev) /= '0') .AND. nkb > 0
+          CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_BEC', ev)
+          bec_gpu = nl_gpu .AND. TRIM(ev) == '1' .AND. .NOT. noncolin .AND. lower_band == 1 .AND. upper_band == nbndep
+          IF (bec_gpu) ALLOCATE(kgk(npwx, 3))
+        END BLOCK
+        IF (nl_gpu) THEN
+          ALLOCATE(kbatom(nkb), dmat(nkb, nkb), uqm(3 * nat, npe), kqg(npwx, 3))
+          ijkb0 = 0
+          DO nt = 1, ntyp
+            DO na = 1, nat
+              IF (ityp(na) == nt) THEN
+                kbatom(ijkb0 + 1:ijkb0 + nh(nt)) = na
+                ijkb0 = ijkb0 + nh(nt)
+              ENDIF
+            ENDDO
+          ENDDO
+          DO ipert = 1, npe
+            mode = imode0 + ipert
+            IF (timerev) THEN
+              uqm(:, ipert) = CONJG(u(:, mode))
+            ELSE
+              uqm(:, ipert) = u(:, mode)
+            ENDIF
+          ENDDO
+        ENDIF
+      ENDIF
+#endif
+      END SUBROUTINE gpu_setup
       !
       SUBROUTINE ep_gpu_k()
       !! rtsc: elphmat(:, :, 1:npe) for the current k, all perturbations of this irrep at once.
