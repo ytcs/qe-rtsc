@@ -1438,10 +1438,12 @@ CONTAINS
       dmax = MAX(dmax, MAXVAL(ABS(a(:, c) - b(:, c)))); ymax = MAX(ymax, MAXVAL(ABS(a(:, c))))
       d2 = d2 + SUM(ABS(a(:, c) - b(:, c))**2); y2 = y2 + SUM(ABS(a(:, c))**2)
     ENDDO
-    WRITE(*, '(A,I8,A,ES10.3,A,ES10.3)') '     rtsc pfft check: columns', nl, ', max|dy|/max|y| ', dmax / ymax, &
-         ', rel L2 ', SQRT(d2 / MAX(y2, TINY(1.0_dp)))
+    IF (ymax > 0.0_dp) THEN
+      WRITE(*, '(A,I8,A,ES10.3,A,ES10.3)') '     rtsc pfft check: columns', nl, ', max|dy|/max|y| ', dmax / ymax, &
+           ', rel L2 ', SQRT(d2 / y2)
+      pfft_checked = .TRUE.     ! (a zero input, e.g. dpsi = 0 at the first iteration, is not a test)
+    ENDIF
     DEALLOCATE(yp, a, b, hl)
-    pfft_checked = .TRUE.
   END SUBROUTINE pfft_compare
   !
   !=================================================================================================
