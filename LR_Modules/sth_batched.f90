@@ -185,7 +185,7 @@ CONTAINS
     USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready, &
                                  sth_xp_m, sth_engine_xp_set, sth_eta, sth_timing, sth_prof, sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, &
                                  sth_nsteps, sth_ncolapp, sth_nvalid, sth_nact0, sth_r0hist, sth_r0med, &
-                                 sth_t_gemm, sth_t_fft
+                                 sth_t_gemm, sth_t_fft, sth_stband
     USE qpoint,           ONLY : xq
 #endif
     !
@@ -275,6 +275,7 @@ CONTAINS
       WRITE(stdout, '(5x,"rtsc solve: thr ",ES9.2," ncol ",I0," act0 ",I0," steps ",I0," colapp ",I0, &
            &" r0med ",ES9.2," r0hist ",12(1x,I0))') thresh, sth_nvalid, sth_nact0, sth_nsteps, sth_ncolapp, &
            sth_r0med, sth_r0hist
+      WRITE(stdout, '(5x,"rtsc solve bands: tests per column by nock-n = 0..5,6+:",7(1x,F6.2))') sth_stband
       IF (xp_m > 0) WRITE(stdout, '(5x,"rtsc xp: fit residual ",F7.4," coef",8(1x,F8.4))') xp_rho, &
            (ABS(xp_cprint(i)), i = 1, xp_ncprint)
       WRITE(stdout, '(5x,"rtsc solve t: dpot ",F8.3," ortho ",F8.3," cg ",F8.3," drho ",F8.3, &

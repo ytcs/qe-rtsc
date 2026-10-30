@@ -68,6 +68,9 @@ MODULE sth_engine
   ! 10**0, last bin open), and the time of the apply_op parts (projector GEMMs vs FFT loop)
   INTEGER, PUBLIC, SAVE :: sth_nvalid = 0, sth_nact0 = 0
   INTEGER, PUBLIC, SAVE :: sth_r0hist(0:11) = 0
+  ! CG tests per column by distance of the band from the top occupied band of its k (0..5, 6 = more)
+  REAL(dp), PUBLIC, SAVE :: sth_stband(0:6) = 0
+  INTEGER, DEVICE, ALLOCATABLE :: d_nst(:)
   REAL(dp), PUBLIC, SAVE :: sth_r0med = 0, sth_t_gemm = 0, sth_t_fft = 0
   LOGICAL, PUBLIC, SAVE :: sth_prof = .FALSE.      ! sync inside apply_op to time GEMMs vs FFTs
   !
@@ -363,13 +366,13 @@ CONTAINS
   END SUBROUTINE k_scale_wg1
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_check(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
-                                        cnt, ethr, first, eta, r0)
+                                        cnt, ethr, first, eta, r0, nst)
     ! cgsolve_all, per active column: h = h_diag*g ; rho = <h|g> ; converged if sqrt(rho) < ethr;
     ! otherwise h = -h + (rho/rhoold) hold  (hold is the previous h, kept in place).
     ! cnt(group) counts the columns that were active at this test (kter_eff).
     INTEGER, VALUE :: nslot, npert, npwx, nksq, first
     REAL(dp), VALUE :: ethr, eta
-    INTEGER :: list(*), npwq(nksq), conv(*), cnt(*)
+    INTEGER :: list(*), npwq(nksq), conv(*), cnt(*), nst(*)
     REAL(dp) :: hd(npwx, nslot, nksq), rho(*), r0(*)
     COMPLEX(dp) :: g(npwx, *), h(npwx, *)
     REAL(dp), SHARED :: red(RB)
@@ -400,6 +403,11 @@ CONTAINS
       rn = red(1)
       istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
       IF (first == 1) r0(s) = SQRT(rn)
+      IF (first == 1) THEN
+        nst(s) = 1
+      ELSE
+        nst(s) = nst(s) + 1
+      ENDIF
       IF (SQRT(rn) < MAX(ethr, eta * r0(s))) THEN
         conv(s) = 1
         cvd = 1
@@ -879,6 +887,30 @@ CONTAINS
     DEALLOCATE(rh, cv, hv, v)
   END SUBROUTINE r0_profile
   !
+  SUBROUTINE band_profile()
+    ! mean CG tests per column by distance of band n from the top occupied band nock(k)
+    INTEGER, ALLOCATABLE :: ns(:), hv(:)
+    REAL(dp) :: cnt(0:6)
+    INTEGER :: i, s, k, n, b
+    ALLOCATE(ns(nsl), hv(nvalid))
+    ns = d_nst
+    hv = d_valid
+    sth_stband = 0
+    cnt = 0
+    DO i = 1, nvalid
+      s = hv(i)
+      k = (s - 1) / (nslot * npert) + 1
+      n = MOD(s - 1, nslot) + 1
+      b = MIN(6, h_nock(k) - n)
+      sth_stband(b) = sth_stband(b) + ns(s)
+      cnt(b) = cnt(b) + 1
+    ENDDO
+    DO b = 0, 6
+      IF (cnt(b) > 0) sth_stband(b) = sth_stband(b) / cnt(b)
+    ENDDO
+    DEALLOCATE(ns, hv)
+  END SUBROUTINE band_profile
+  !
   SUBROUTINE sort_r(a, n)
     ! in-place heapsort (ascending)
     INTEGER, INTENT(IN) :: n
@@ -1206,7 +1238,7 @@ CONTAINS
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
-                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0)
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0, d_nst)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
   END SUBROUTINE irrep_free
   !
@@ -1247,7 +1279,7 @@ CONTAINS
     INTEGER(8) :: need, freeb, totb
     ierr = 0
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
-                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0)
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0, d_nst)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
@@ -1263,7 +1295,7 @@ CONTAINS
     ENDIF
     ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
     ALLOCATE(d_t(npwx, nsl), d_cf(nproj, nsl), d_cf2(nproj, nsl), d_ps(nbnd, nsl))
-    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl), d_r0(nsl))
+    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl), d_r0(nsl), d_nst(nsl))
     ALLOCATE(d_dv(nnr, npert), d_drho(nnr, npert))
     ALLOCATE(h_dpsi(npwx, nsl))
     h_dpsi_valid = .FALSE.
@@ -1406,7 +1438,7 @@ CONTAINS
       first = 0
       IF (iter == 1) first = 1
       CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
-           d_conv, d_cnt, thresh, first, sth_eta, d_r0)
+           d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst)
       CALL kerr('check')
       CALL k_kter<<<nblk(ngrp, TPB), TPB, 0, strm>>>(ngrp, npert, nksq, d_nock, d_cnt, d_kter)
       CALL kerr('kter')
@@ -1427,6 +1459,7 @@ CONTAINS
       CALL kerr('update')
       IF (sth_debug_slot > 0) CALL debug_step(iter)
     ENDDO
+    IF (sth_timing) CALL band_profile()
     ! dpsi extrapolation: delta = dpsi(k) - dpsi(k-1) into history slot xp_rec (d_g is free after CG)
     IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
       CALL k_copy<<<4096, TPB, 0, strm>>>(d_g, d_dpsi, INT(npwx, 8) * nsl)
