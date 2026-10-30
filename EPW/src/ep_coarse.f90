@@ -295,7 +295,8 @@
     USE epw_onemkl
 #endif
 #if defined (__CUDA)
-    USE epw_gpu_coarse,   ONLY : egc_init, egc_set_v, egc_local, egc_nl_set, egc_local_nl
+    USE epw_gpu_coarse,   ONLY : egc_init, egc_set_v, egc_local, egc_nl_set, egc_local_nl, egc_prof_on, &
+                                 egc_prof_add, egc_prof_print, egc_wall
 #endif
     USE ions_base,        ONLY : ityp, ntyp => nsp
     USE uspp_param,       ONLY : nh, nhm
@@ -896,6 +897,7 @@
       ENDIF
     ENDIF
     !
+    IF (use_gpu) CALL egc_prof_print()
     IF (use_gpu) DEALLOCATE(vtot, deff, becq, auxv, ps1, ps2, indk, indq)
     IF (ALLOCATED(kbatom)) DEALLOCATE(kbatom, dmat, uqm, kqg)
     DEALLOCATE(elphmat, STAT = ierr)
@@ -936,7 +938,9 @@
       !! dvpsi_nl = vkb ps1 + sum_a [(k+q+G)_a vkb] ps2_a; projecting on aux4 gives
       !! becq0^H ps1 + sum_a becq_a^H ps2_a with becq computed once per k (NC, no US terms).
       INTEGER :: ipol_, ib
+      REAL(DP) :: tpa
 #if defined (__CUDA)
+      IF (egc_prof_on()) tpa = egc_wall(.FALSE.)
       DO ig = 1, npw
         indk(ig) = dffts%nl(igk(ig))
       ENDDO
@@ -966,6 +970,7 @@
             kqg(ig, ipol_) = xkqtmp(ipol_) + g(ipol_, igkq(ig))
           ENDDO
         ENDDO
+        IF (egc_prof_on()) CALL egc_prof_add(6, egc_wall(.FALSE.) - tpa)
         CALL egc_local_nl(npw, indk, aux5, npwq, indq, aux4, vkb, npwx, kqg, becp1(ik)%k, nkb, &
                           alphap(1, ik)%k, alphap(2, ik)%k, alphap(3, ik)%k, tpiba, elphmat)
         RETURN

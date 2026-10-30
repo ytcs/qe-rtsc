@@ -43,6 +43,14 @@ MODULE epw_gpu_coarse
   !
   PUBLIC :: egc_init, egc_set_v, egc_local, egc_finalize, egc_ready, egc_nl_set, egc_local_nl
   !
+  ! rtsc amdahl profile (RTSC_EPW_PROF=1; groups/compute/AMDAHL-LOG.md): synchronising wall clocks per part of
+  ! egc_local_nl, cumulative; tp(1) uploads, (2) FFTs of psi_k / psi_k+q, (3) V*psi + ZGEMM, (4) nonlocal, (5) D2H,
+  ! (6) host prep in ep_gpu_k (set by the caller through egc_prof_add)
+  LOGICAL, SAVE :: prof = .FALSE., prof_read = .FALSE.
+  REAL(dp), SAVE :: tp(6) = 0.0_dp
+  INTEGER, SAVE :: np_calls = 0
+  PUBLIC :: egc_prof_on, egc_prof_add, egc_prof_print, egc_wall
+  !
 CONTAINS
   !
   LOGICAL FUNCTION egc_ready()
@@ -57,6 +65,36 @@ CONTAINS
       STOP 1
     ENDIF
   END SUBROUTINE chk
+  !
+  LOGICAL FUNCTION egc_prof_on()
+    CHARACTER(LEN=8) :: ev
+    IF (.NOT. prof_read) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_PROF', ev)
+      prof = TRIM(ev) == '1'
+      prof_read = .TRUE.
+    ENDIF
+    egc_prof_on = prof
+  END FUNCTION egc_prof_on
+  !
+  REAL(dp) FUNCTION egc_wall(sync)
+    LOGICAL, INTENT(IN) :: sync
+    INTEGER(8) :: c, r
+    INTEGER :: istat
+    IF (sync) istat = cudaDeviceSynchronize()
+    CALL SYSTEM_CLOCK(c, r)
+    egc_wall = REAL(c, dp) / REAL(r, dp)
+  END FUNCTION egc_wall
+  !
+  SUBROUTINE egc_prof_add(i, t)
+    INTEGER, INTENT(IN) :: i
+    REAL(dp), INTENT(IN) :: t
+    tp(i) = tp(i) + t
+  END SUBROUTINE egc_prof_add
+  !
+  SUBROUTINE egc_prof_print()
+    IF (.NOT. prof) RETURN
+    WRITE(*, '(A,I7,A,6F9.3)') '     rtsc epw prof: calls', np_calls, ' s: upload fft mulv+gemm nl d2h hostprep', tp
+  END SUBROUTINE egc_prof_print
   !
   SUBROUTINE egc_init(nr1, nr2, nr3, nr1x, nr2x, nr3x, nnr_, nbnd_, nvmax_, npwx)
     !! Allocate device buffers and the batched FFT plan. Idempotent for unchanged sizes.
@@ -144,8 +182,9 @@ CONTAINS
     COMPLEX(dp), INTENT(IN) :: ck(ldc, nbnd), cq(ldc, nbnd)
     INTEGER :: istat, j0, nm
     TYPE(dim3) :: grd, blk
-    REAL(dp) :: fac
+    REAL(dp) :: fac, ta, tb
     !
+    IF (prof) ta = egc_wall(.TRUE.)
     istat = cudaMemcpy(d_ik, indk, npw);       CALL chk(istat, 'H2D indk')
     istat = cudaMemcpy(d_iq, indq, npwq);      CALL chk(istat, 'H2D indq')
     istat = cudaMemcpy(d_ck, ck, ldc * nbnd);  CALL chk(istat, 'H2D ck')
@@ -154,12 +193,18 @@ CONTAINS
     d_psq = (0.0_dp, 0.0_dp)
     blk = dim3(256, 1, 1)
     grd = dim3((npw + 255) / 256, nbnd, 1)
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(1) = tp(1) + tb - ta; ta = tb
+    ENDIF
     CALL k_scatter<<<grd, blk>>>(npw, nbnd, ldc, d_ik, d_ck, nnr, d_psi)
     grd = dim3((npwq + 255) / 256, nbnd, 1)
     CALL k_scatter<<<grd, blk>>>(npwq, nbnd, ldc, d_iq, d_cq, nnr, d_psq)
     istat = cufftExecZ2Z(plan, d_psi, d_psi, CUFFT_INVERSE); CALL chk(istat, 'cufft psi')
     istat = cufftExecZ2Z(plan, d_psq, d_psq, CUFFT_INVERSE); CALL chk(istat, 'cufft psq')
     fac = 1.0_dp / DBLE(nr(1) * nr(2) * nr(3))
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(2) = tp(2) + tb - ta; ta = tb
+    ENDIF
     DO j0 = 1, nvset, nmc
       nm = MIN(nmc, nvset - j0 + 1)
       grd = dim3((nnr + 255) / 256, nbnd * nm, 1)
@@ -169,6 +214,9 @@ CONTAINS
                           d_g(1, nbnd * (j0 - 1) + 1), nbnd)
       CALL chk(istat, 'cublasZgemm')
     ENDDO
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(3) = tp(3) + tb - ta
+    ENDIF
   END SUBROUTINE egc_local_dev
   !
   SUBROUTINE egc_nl_set(nkb_, nat3_, nv, dmat, atom, uq)
@@ -231,7 +279,11 @@ CONTAINS
     COMPLEX(dp), INTENT(IN) :: becp1(ldb, nbnd), al1(ldb, nbnd), al2(ldb, nbnd), al3(ldb, nbnd)
     COMPLEX(dp), INTENT(OUT) :: g(nbnd, nbnd, nvset)
     INTEGER :: istat, a
+    REAL(dp) :: ta, tb
     COMPLEX(dp), PARAMETER :: one = (1.0_dp, 0.0_dp), zero = (0.0_dp, 0.0_dp)
+    IF (prof) THEN
+      ta = egc_wall(.TRUE.); np_calls = np_calls + 1
+    ENDIF
     ! all uploads first (synchronous copies), so that only the final D2H waits for the GPU work
     IF (nkbs > 0) THEN
       istat = cudaMemcpy2D(d_vkb, ldc, vkb, ldv, npwq, nkbs); CALL chk(istat, 'H2D vkb')
@@ -241,7 +293,11 @@ CONTAINS
       istat = cudaMemcpy2D(d_al(1, 1, 2), nkbs, al2, ldb, nkbs, nbnd); CALL chk(istat, 'H2D alphap')
       istat = cudaMemcpy2D(d_al(1, 1, 3), nkbs, al3, ldb, nkbs, nbnd); CALL chk(istat, 'H2D alphap')
     ENDIF
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(1) = tp(1) + tb - ta
+    ENDIF
     CALL egc_local_dev(npw, indk, ck, npwq, indq, cq)
+    IF (prof) ta = egc_wall(.TRUE.)
     IF (nkbs > 0) THEN
       ! becq_0 = vkb^H psi_k+q ; becq_a = [vkb (k+q+G)_a]^H psi_k+q
       istat = cublasZgemm(hblas, CUBLAS_OP_C, CUBLAS_OP_N, nkbs, nbnd, npwq, one, d_vkb, ldc, d_cq, ldc, zero, &
@@ -264,7 +320,13 @@ CONTAINS
            nat3s, nvs, CMPLX(0.0_dp, -tpiba, dp))
       istat = cudaGetLastError(); CALL chk(istat, 'k_nlc')
     ENDIF
+    IF (prof) THEN
+      tb = egc_wall(.TRUE.); tp(4) = tp(4) + tb - ta; ta = tb
+    ENDIF
     istat = cudaMemcpy(g, d_g, nbnd * nbnd * nvset); CALL chk(istat, 'D2H g')
+    IF (prof) THEN
+      tb = egc_wall(.FALSE.); tp(5) = tp(5) + tb - ta
+    ENDIF
   END SUBROUTINE egc_local_nl
   !
 END MODULE epw_gpu_coarse

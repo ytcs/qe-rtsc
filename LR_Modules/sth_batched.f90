@@ -612,6 +612,7 @@ CONTAINS
                                  sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup, &
                                  sth_mp, sth_mp_eta, sth_mp_safe, sth_pfft_req, sth_pfft_check, sth_dvb_req, &
                                  sth_fftdx_req, sth_fftdx_check, &
+                                 sth_fdxdp_req, sth_fdxdp_check, sth_obatch, sth_timing, &
                                  sth_engine_set_nlk
     USE lrus,             ONLY : becp1
     !
@@ -625,14 +626,20 @@ CONTAINS
     COMPLEX(DP), ALLOCATABLE :: dmat(:,:)
     REAL(DP) :: w0g, wgp, deltae, theta
     REAL(DP), EXTERNAL :: wgauss, w0gauss
+    INTEGER(8) :: c0, c1, c2, crate
     !
     CALL start_clock('sth_init')
+    CALL SYSTEM_CLOCK(c0)
     ! mixed precision (per q; the FP32 copies are built by sth_engine_setup)
     sth_mp = sth_env_flag('RTSC_STH_MP')
     sth_pfft_req = sth_env_flag('RTSC_STH_PFFT')
     sth_pfft_check = sth_env_flag('RTSC_STH_PFFT_CHECK')
     sth_fftdx_req = sth_env_flag('RTSC_STH_FFTDX')
     sth_fftdx_check = sth_env_flag('RTSC_STH_FFTDX_CHECK')
+    sth_fdxdp_req = sth_env_flag('RTSC_STH_FDXDP')          ! rtsc amdahl (groups/compute/AMDAHL-LOG.md)
+    sth_fdxdp_check = sth_env_flag('RTSC_STH_FDXDP_CHECK')
+    sth_obatch = sth_env_flag('RTSC_STH_OBATCH')
+    sth_timing = sth_env_flag('RTSC_STH_TIME')
     sth_dvb_req = dvb_on
     CALL env_real('RTSC_MP_ETA', sth_mp_eta)
     CALL env_real('RTSC_MP_SAFE', sth_mp_safe)
@@ -724,8 +731,16 @@ CONTAINS
     ELSE
       !$acc update device(evc, evq)
     ENDIF
+    IF (sth_timing) THEN
+      CALL SYSTEM_CLOCK(c1, crate)
+      WRITE(*, '(A,F8.3,A)') '     rtsc sth_init: host per-k loop ', REAL(c1 - c0, DP) / REAL(crate, DP), ' s'
+    ENDIF
     CALL sth_engine_setup(ierr)
     IF (ierr == 0 .AND. dvb_on) CALL dvb_build(npert, lrdvpsi, iudvpsi)
+    IF (sth_timing) THEN
+      CALL SYSTEM_CLOCK(c2)
+      WRITE(*, '(A,F8.3,A)') '     rtsc sth_init: setup + dvb ', REAL(c2 - c1, DP) / REAL(crate, DP), ' s'
+    ENDIF
     CALL stop_clock('sth_init')
   END SUBROUTINE sth_batched_init
   !

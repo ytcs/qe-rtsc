@@ -345,14 +345,172 @@ __global__ void kxy2(cplx<T>* __restrict__ S, const T* __restrict__ vr, int nst,
   for (int p = tid; p < nst; p += nt) Sj[p] = P[sy[p] * LD + sx[p]];
 }
 
+template <class T, int N1, int N2> constexpr int plane_bytes() {
+  return ((N1 % 2 == 0) ? N1 + 1 : N1) * N2 * (int)sizeof(cplx<T>);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// apply_dpot / incdrhoscf on the pruned path (RTSC_STH_FDXDP; groups/compute/AMDAHL-LOG.md), FP64.
+//   dpot: kxy_fwd  one block per (z-plane, column): plane of psi_kn(r) * dv(r, p) (read once, coalesced), forward x
+//                  on every row, forward y on the occupied x-columns, write the k+q sticks;
+//         kz_fwd_add one thread per (stick, column): forward z, d(ig) += scale * v on the k+q sphere (k_gather_add).
+//   drho: kz_inv (above) on dpsi, then kxy_inv: inverse y on the occupied x-columns, inverse x on every row, write the
+//         full plane into box(:, j); the engine's k_drho then forms conj(psi) * box as before.
+// Box layout as the engine's: box(nnr, *) with nnr = n1 n2 n3 (checked by the caller), plane z at n1 n2 z.
+// ---------------------------------------------------------------------------------------------------------------
+template <class T, int N1, int N2>
+__global__ void kxy_fwd(cplx<T>* __restrict__ S, const cplx<T>* __restrict__ psir, const cplx<T>* __restrict__ dv,
+                        const int* __restrict__ list, int s0, int nslot, int npert, int nnr, int pj, int jb, int nst,
+                        int nzst, const int* __restrict__ sx, const int* __restrict__ sy, const int* __restrict__ xa,
+                        int nxa) {
+  constexpr int LD = (N1 % 2 == 0) ? N1 + 1 : N1;
+  extern __shared__ __align__(16) unsigned char smraw[];
+  cplx<T>* P = reinterpret_cast<cplx<T>*>(smraw);
+  const int z = blockIdx.x, j = blockIdx.y, tid = threadIdx.x, nt = blockDim.x;
+  const int col = list[s0 + j] - 1;
+  const int k = col / (nslot * npert), n = col % nslot, p = (col / nslot) % npert;
+  const size_t b = pj ? (size_t)(jb + j) : (size_t)n + (size_t)nslot * k;
+  const cplx<T>* ps = psir + (size_t)nnr * b + (size_t)N1 * N2 * z;
+  const cplx<T>* dz = dv + (size_t)nnr * p + (size_t)N1 * N2 * z;
+  for (int q = tid; q < N1 * N2; q += nt) P[(q / N1) * LD + (q % N1)] = cmul(ps[q], dz[q]);
+  __syncthreads();
+  for (int r = tid; r < N2; r += nt) {            // forward x on every row
+    cplx<T> v[N1];
+#pragma unroll
+    for (int xx = 0; xx < N1; xx++) v[xx] = P[r * LD + xx];
+    Line<T, N1, false>::run(v);
+#pragma unroll
+    for (int xx = 0; xx < N1; xx++) P[r * LD + xx] = v[xx];
+  }
+  __syncthreads();
+  for (int c = tid; c < nxa; c += nt) {           // forward y on occupied x-columns
+    const int xx = xa[c];
+    cplx<T> v[N2];
+#pragma unroll
+    for (int y = 0; y < N2; y++) v[y] = P[y * LD + xx];
+    Line<T, N2, false>::run(v);
+#pragma unroll
+    for (int y = 0; y < N2; y++) P[y * LD + xx] = v[y];
+  }
+  __syncthreads();
+  cplx<T>* Sj = S + (size_t)nzst * j + (size_t)nst * z;
+  for (int q = tid; q < nst; q += nt) Sj[q] = P[sy[q] * LD + sx[q]];
+}
+
+template <class T, int N3>
+__global__ void __launch_bounds__(TPB_Z) kz_fwd_add(cplx<T>* __restrict__ d, const cplx<T>* __restrict__ S,
+                                                    const int* __restrict__ list, int s0, int nslot, int npert,
+                                                    int npwx, int nst, const int* __restrict__ zmap, int nzst,
+                                                    T scale) {
+  const int j = blockIdx.y;
+  const int s = blockIdx.x * TPB_Z + threadIdx.x;
+  if (s >= nst) return;
+  const int col = list[s0 + j] - 1;
+  const int k = col / (nslot * npert);
+  const cplx<T>* Sj = S + (size_t)nzst * j + s;
+  cplx<T> v[N3];
+#pragma unroll
+  for (int z = 0; z < N3; z++) v[z] = Sj[(size_t)nst * z];
+  Line<T, N3, false>::run(v);
+  const int* zm = zmap + (size_t)nzst * k + s;
+  cplx<T>* dc = d + (size_t)npwx * col;
+#pragma unroll
+  for (int z = 0; z < N3; z++) {
+    int ig = __ldg(zm + (size_t)nst * z);
+    if (ig > 0) {
+      cplx<T> a = dc[ig - 1];
+      dc[ig - 1] = {a.x + v[z].x * scale, a.y + v[z].y * scale};
+    }
+  }
+}
+
+template <class T, int N1, int N2>
+__global__ void kxy_inv(const cplx<T>* __restrict__ S, cplx<T>* __restrict__ box, int nnr, int jb, int nst, int nzst,
+                        const int* __restrict__ sx, const int* __restrict__ sy, const int* __restrict__ xa, int nxa) {
+  constexpr int LD = (N1 % 2 == 0) ? N1 + 1 : N1;
+  extern __shared__ __align__(16) unsigned char smraw[];
+  cplx<T>* P = reinterpret_cast<cplx<T>*>(smraw);
+  const int z = blockIdx.x, j = blockIdx.y, tid = threadIdx.x, nt = blockDim.x;
+  const cplx<T>* Sj = S + (size_t)nzst * j + (size_t)nst * z;
+  for (int q = tid; q < LD * N2; q += nt) P[q] = cplx<T>{0, 0};
+  __syncthreads();
+  for (int q = tid; q < nst; q += nt) P[sy[q] * LD + sx[q]] = Sj[q];
+  __syncthreads();
+  for (int c = tid; c < nxa; c += nt) {           // inverse y on occupied x-columns
+    const int xx = xa[c];
+    cplx<T> v[N2];
+#pragma unroll
+    for (int y = 0; y < N2; y++) v[y] = P[y * LD + xx];
+    Line<T, N2, true>::run(v);
+#pragma unroll
+    for (int y = 0; y < N2; y++) P[y * LD + xx] = v[y];
+  }
+  __syncthreads();
+  for (int r = tid; r < N2; r += nt) {            // inverse x on every row
+    cplx<T> v[N1];
+#pragma unroll
+    for (int xx = 0; xx < N1; xx++) v[xx] = P[r * LD + xx];
+    Line<T, N1, true>::run(v);
+#pragma unroll
+    for (int xx = 0; xx < N1; xx++) P[r * LD + xx] = v[xx];
+  }
+  __syncthreads();
+  cplx<T>* bz = box + (size_t)nnr * (jb + j) + (size_t)N1 * N2 * z;
+  for (int q = tid; q < N1 * N2; q += nt) bz[q] = P[(q / N1) * LD + (q % N1)];
+}
+
+template <int N1, int N2, int N3>
+static int run_dpot(cplx<double>* d, const cplx<double>* psir, const cplx<double>* dv, const int* list, int s0, int nb,
+                    int nslot, int npert, int npwx, int nnr, int pj, double scale, cudaStream_t st, int tpb) {
+  static bool attr = false;
+  constexpr int shm = plane_bytes<double, N1, N2>();
+  if (!attr) {
+    if (cudaFuncSetAttribute(kxy_fwd<double, N1, N2>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm) != cudaSuccess)
+      return 5;
+    attr = true;
+  }
+  cplx<double>* S = reinterpret_cast<cplx<double>*>(g.S);
+  const int chunk = (int)std::min<size_t>(g.chunk, g.Sbytes / (sizeof(cplx<double>) * (size_t)g.nzst));
+  for (int c0 = 0; c0 < nb; c0 += chunk) {
+    int m = std::min(chunk, nb - c0);
+    kxy_fwd<double, N1, N2><<<dim3(N3, m), tpb, shm, st>>>(S, psir, dv, list, s0 + c0, nslot, npert, nnr, pj, c0,
+                                                          g.nst, g.nzst, g.sx, g.sy, g.xa, g.nxa);
+    kz_fwd_add<double, N3><<<dim3((g.nst + TPB_Z - 1) / TPB_Z, m), TPB_Z, 0, st>>>(d, S, list, s0 + c0, nslot, npert,
+                                                                                 npwx, g.nst, g.zmap, g.nzst, scale);
+  }
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) { fprintf(stderr, "fdx dpot: launch failed: %s\n", cudaGetErrorString(e)); return 6; }
+  return 0;
+}
+
+template <int N1, int N2, int N3>
+static int run_inv(cplx<double>* box, const cplx<double>* x, const int* list, int s0, int nb, int nslot, int npert,
+                   int npwx, int nnr, cudaStream_t st, int tpb) {
+  static bool attr = false;
+  constexpr int shm = plane_bytes<double, N1, N2>();
+  if (!attr) {
+    if (cudaFuncSetAttribute(kxy_inv<double, N1, N2>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm) != cudaSuccess)
+      return 5;
+    attr = true;
+  }
+  cplx<double>* S = reinterpret_cast<cplx<double>*>(g.S);
+  const int chunk = (int)std::min<size_t>(g.chunk, g.Sbytes / (sizeof(cplx<double>) * (size_t)g.nzst));
+  for (int c0 = 0; c0 < nb; c0 += chunk) {
+    int m = std::min(chunk, nb - c0);
+    kz_inv<double, N3><<<dim3((g.nst + TPB_Z - 1) / TPB_Z, m), TPB_Z, 0, st>>>(S, x, list, s0 + c0, nslot, npert, npwx,
+                                                                             g.nst, g.zmap, g.nzst);
+    kxy_inv<double, N1, N2><<<dim3(N3, m), tpb, shm, st>>>(S, box, nnr, c0, g.nst, g.nzst, g.sx, g.sy, g.xa, g.nxa);
+  }
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) { fprintf(stderr, "fdx inv: launch failed: %s\n", cudaGetErrorString(e)); return 6; }
+  return 0;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // supported grids and dispatch
 // ---------------------------------------------------------------------------------------------------------------
 #define FDX_GRIDS(X) X(0, 30, 30, 36) X(1, 54, 54, 54)
 
-template <class T, int N1, int N2> constexpr int plane_bytes() {
-  return ((N1 % 2 == 0) ? N1 + 1 : N1) * N2 * (int)sizeof(cplx<T>);
-}
 
 template <class T, class TG, int N1, int N2, int N3>
 static int run_local(const cplx<T>* x, cplx<T>* y, const int* list, int nl, int nslot, int npert, int npwx,
@@ -489,6 +647,37 @@ int fdx_setup(const int* nr, const int* nrx, int nksq, int npwx, const int* npwq
 }
 
 void fdx_info(int* nst, int* nxa, int* chunk) { *nst = g.nst; *nxa = g.nxa; *chunk = g.chunk; }
+
+// RTSC_STH_FDXDP (FP64). dpot: d(npwx, *) += scale * gather_kq(FFT_fwd(psir(:, b) * dv(:, p))) for the nb columns
+// list(s0+1 .. s0+nb); b = the column's (k, n) slot of the psi(r) cache (pj = 0) or the chunk column j (pj = 1).
+int fdx_dpot_d(void* d, const void* psir, const void* dv, const int* list, int s0, int nb, int nslot, int npert,
+               int npwx, int nnr, int pj, double scale, cudaStream_t st) {
+  if (nnr != g.n1 * g.n2 * g.n3) return 8;
+  int tpb = tpb_xy_default();
+  switch (g.gid) {
+#define X(id, a, b, c) \
+  case id: return run_dpot<a, b, c>((cplx<double>*)d, (const cplx<double>*)psir, (const cplx<double>*)dv, list, s0, nb, \
+                                    nslot, npert, npwx, nnr, pj, scale, st, tpb);
+    FDX_GRIDS(X)
+#undef X
+  }
+  return 7;
+}
+
+// drho: box(:, j) = FFT_inv(x on the k+q sphere) for the nb columns list(s0+1 .. s0+nb), j = 1..nb (full plane)
+int fdx_inv_d(void* box, const void* x, const int* list, int s0, int nb, int nslot, int npert, int npwx, int nnr,
+              cudaStream_t st) {
+  if (nnr != g.n1 * g.n2 * g.n3) return 8;
+  int tpb = tpb_xy_default();
+  switch (g.gid) {
+#define X(id, a, b, c) \
+  case id: return run_inv<a, b, c>((cplx<double>*)box, (const cplx<double>*)x, list, s0, nb, nslot, npert, npwx, nnr, \
+                                   st, tpb);
+    FDX_GRIDS(X)
+#undef X
+  }
+  return 7;
+}
 
 // FP64: x, y complex(npwx, *); vrs(nnr); g2(npwx, nksq); etk(nbnd, nksq); list 1-based columns
 int fdx_local_d(const void* x, void* y, const int* list, int nl, int nslot, int npert, int npwx, int nksq, int nbnd,

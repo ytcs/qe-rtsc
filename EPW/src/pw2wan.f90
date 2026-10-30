@@ -54,6 +54,7 @@
     !! Determine the spin case
     CHARACTER(LEN = 256) :: outdir
     !! Name of the output directory
+    INTEGER(KIND = 8) :: rc0, rc1, rc2, rc3, rc4, rcr
     !
     outdir = './'
     seedname2 = prefix
@@ -113,13 +114,16 @@
       CALL check_ahc_bands(excluded_band)
     ENDIF
     !
+    CALL SYSTEM_CLOCK(rc0, rcr)   ! rtsc amdahl: stage walls (groups/compute/AMDAHL-LOG.md)
     CALL ylm_expansion()
     IF (scdm_proj) THEN
       CALL compute_amn_with_scdm()
     ELSE
       CALL compute_amn_para()
     ENDIF
+    CALL SYSTEM_CLOCK(rc1)
     CALL compute_mmn_para()
+    CALL SYSTEM_CLOCK(rc2)
     ! calling of phases_a_m removed because now we don't call setphases_wrap.
 !    CALL phases_a_m()
     CALL write_band()
@@ -127,7 +131,12 @@
     WRITE(stdout, *)
     WRITE(stdout, *) '    Running Wannier90'
     !
+    CALL SYSTEM_CLOCK(rc3)
     CALL run_wannier()
+    CALL SYSTEM_CLOCK(rc4)
+    WRITE(stdout, '(5x,a,4f10.3)') 'rtsc wannier walls (s): amn mmn write_band run_wannier ', &
+      REAL(rc1 - rc0, KIND = 8) / rcr, REAL(rc2 - rc1, KIND = 8) / rcr, REAL(rc3 - rc2, KIND = 8) / rcr, &
+      REAL(rc4 - rc3, KIND = 8) / rcr
     !
     IF (wannier_plot) CALL write_plot()
     !

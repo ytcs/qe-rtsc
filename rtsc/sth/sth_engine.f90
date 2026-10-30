@@ -97,6 +97,24 @@ MODULE sth_engine
       REAL(c_float), VALUE :: scale
       INTEGER(cuda_stream_kind), VALUE :: strm
     END FUNCTION fdx_local_s
+    ! RTSC_STH_FDXDP (groups/compute/AMDAHL-LOG.md): apply_dpot and the inverse transform of incdrhoscf on the
+    ! pruned path (FP64)
+    INTEGER(c_int) FUNCTION fdx_dpot_d(d, psir, dv, list, s0, nb, nslot, npert, npwx, nnr, pj, scale, strm) &
+                                       BIND(C, name='fdx_dpot_d')
+      IMPORT :: c_int, c_double, cuda_stream_kind
+      COMPLEX(c_double), DEVICE :: d(*), psir(*), dv(*)
+      INTEGER(c_int), DEVICE :: list(*)
+      INTEGER(c_int), VALUE :: s0, nb, nslot, npert, npwx, nnr, pj
+      REAL(c_double), VALUE :: scale
+      INTEGER(cuda_stream_kind), VALUE :: strm
+    END FUNCTION fdx_dpot_d
+    INTEGER(c_int) FUNCTION fdx_inv_d(box, x, list, s0, nb, nslot, npert, npwx, nnr, strm) BIND(C, name='fdx_inv_d')
+      IMPORT :: c_int, c_double, cuda_stream_kind
+      COMPLEX(c_double), DEVICE :: box(*), x(*)
+      INTEGER(c_int), DEVICE :: list(*)
+      INTEGER(c_int), VALUE :: s0, nb, nslot, npert, npwx, nnr
+      INTEGER(cuda_stream_kind), VALUE :: strm
+    END FUNCTION fdx_inv_d
   END INTERFACE
   INTEGER(8), SAVE :: mem_hw = 0
   !
@@ -152,6 +170,13 @@ MODULE sth_engine
   ! sth_fftdx_check: as sth_pfft_check, for fftdx against the cuFFT path
   LOGICAL, PUBLIC, SAVE :: sth_fftdx_req = .FALSE., sth_fftdx_check = .FALSE.
   LOGICAL, SAVE :: fdx_on = .FALSE.
+  ! rtsc amdahl (groups/compute/AMDAHL-LOG.md), set before setup (per q):
+  ! sth_fdxdp_req (RTSC_STH_FDXDP): apply_dpot, the DVB local part and incdrhoscf's inverse FFT on the pruned fftdx path
+  !   (needs fdx_on); sth_fdxdp_check: at the first non-trivial call of each q, run the box path too and print the
+  !   differences; sth_obatch (RTSC_STH_OBATCH): orthogonalize with two strided-batched ZGEMMs (ortho_batched) in FP64
+  LOGICAL, PUBLIC, SAVE :: sth_fdxdp_req = .FALSE., sth_fdxdp_check = .FALSE., sth_obatch = .FALSE.
+  LOGICAL, SAVE :: dp_on = .FALSE., dp_checked = .FALSE., dr_checked = .FALSE.
+  REAL(dp), PUBLIC, SAVE :: sth_t_fdxsetup = 0
   ! dV_bare psi built in the engine (KERNEL-LOG lever 4; RTSC_STH_DVB=1), set before init (per q):
   ! becp1 / alphap of every k (staged by sth_engine_set_nlk), D becp1 and D alphap on the device
   LOGICAL, PUBLIC, SAVE :: sth_dvb_req = .FALSE.
@@ -1778,6 +1803,110 @@ CONTAINS
     ENDDO
   END SUBROUTINE sort_r
   !
+  SUBROUTINE dpot_fdx(d, s0, nb, ip, scale)
+    ! RTSC_STH_FDXDP: d(:, list(s0+1 .. s0+nb)) += scale gather_kq(FFT(psi_kn(r) d_dv(r, p))) on the pruned path
+    COMPLEX(dp), DEVICE :: d(npwx, *)
+    INTEGER, INTENT(IN) :: s0, nb, ip
+    REAL(dp), INTENT(IN) :: scale
+    INTEGER :: istat
+    IF (psir_cached) THEN
+      istat = fdx_dpot_d(d, d_psir, d_dv, d_valid, s0, nb, nslot, npert, npwx, nnr, 0, scale, strm)
+    ELSE
+      CALL psir_chunk(s0, nb, ip)
+      istat = fdx_dpot_d(d, d_box2, d_dv, d_valid, s0, nb, nslot, npert, npwx, nnr, 1, scale, strm)
+    ENDIF
+    IF (istat /= 0) CALL errore_stop('fdx_dpot_d', istat)
+  END SUBROUTINE dpot_fdx
+  !
+  SUBROUTINE dp_compare(tgt, base, zbase, scale, what)
+    ! diagnostic (RTSC_STH_FDXDP_CHECK=1): tgt = base + (pruned dpot of d_dv); rebuild base + (box dpot) in d_t and
+    ! print max|diff| / max|box dpot| and the relative L2 over all slots. zbase: base is zero.
+    COMPLEX(dp), DEVICE :: tgt(npwx, *), base(npwx, *)
+    LOGICAL, INTENT(IN) :: zbase
+    REAL(dp), INTENT(IN) :: scale
+    CHARACTER(LEN=*), INTENT(IN) :: what
+    COMPLEX(dp), ALLOCATABLE :: a(:,:), b(:,:), c(:,:)
+    INTEGER :: s0, nb, ip
+    REAL(dp) :: dmax, ymax, d2, y2
+    IF (zbase) THEN
+      CALL zero_c(d_t, INT(npwx, 8) * nsl)
+    ELSE
+      CALL k_copy<<<4096, TPB, 0, strm>>>(d_t, base, INT(npwx, 8) * nsl)
+    ENDIF
+    s0 = 0
+    DO WHILE (s0 < nvalid)
+      nb = MIN(sth_bmax, nvalid - s0)
+      ip = plan_for(nb)
+      nb = 2**ip
+      IF (psir_cached) THEN
+        CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
+             nnr, nslot, npert, 0)
+      ELSE
+        CALL psir_chunk(s0, nb, ip)
+        CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_box2, d_dv, d_valid, s0, &
+             nnr, nslot, npert, 1)
+      ENDIF
+      CALL fft_exec(ip, d_box, CUFFT_FORWARD)
+      CALL k_gather_add<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_t, d_box, d_valid, s0, nnr, &
+           npwx, nslot, npert, nksq, d_npwq, d_idxkq, scale)
+      s0 = s0 + nb
+    ENDDO
+    CALL kerr('dp_compare')
+    CALL tsync()
+    ALLOCATE(a(npwx, nsl), b(npwx, nsl), c(npwx, nsl))
+    a = tgt(:, 1:nsl)
+    b = d_t(:, 1:nsl)
+    IF (zbase) THEN
+      c = (0.0_dp, 0.0_dp)
+    ELSE
+      c = base(:, 1:nsl)
+    ENDIF
+    dmax = MAXVAL(ABS(a - b)); ymax = MAXVAL(ABS(b - c))
+    d2 = SUM(ABS(a - b)**2); y2 = SUM(ABS(b - c)**2)
+    IF (ymax > 0.0_dp) WRITE(*, '(A,A,A,I8,A,ES10.3,A,ES10.3)') '     rtsc fdxdp check (', what, '): columns', nvalid, &
+         ', max|d|/max ', dmax / ymax, ', rel L2 ', SQRT(d2 / y2)
+    DEALLOCATE(a, b, c)
+    CALL zero_c(d_t, INT(npwx, 8) * nsl)
+  END SUBROUTINE dp_compare
+  !
+  SUBROUTINE dr_compare(drho0)
+    ! diagnostic (RTSC_STH_FDXDP_CHECK=1): d_drho = drho0 + (pruned drho); rebuild drho0 + (box drho) and compare
+    COMPLEX(dp), INTENT(IN) :: drho0(nnr, npert)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: d_r2(:,:)
+    COMPLEX(dp), ALLOCATABLE :: a(:,:), b(:,:)
+    INTEGER :: s0, nb, ip
+    REAL(dp) :: dmax, ymax, d2, y2
+    ALLOCATE(d_r2(nnr, npert), a(nnr, npert), b(nnr, npert))
+    d_r2 = drho0
+    s0 = 0
+    DO WHILE (s0 < nvalid)
+      nb = MIN(sth_bmax, nvalid - s0)
+      ip = plan_for(nb)
+      nb = 2**ip
+      CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_dpsi, d_valid, s0, nnr, &
+           npwx, nslot, npert, nksq, d_inv)
+      CALL fft_exec(ip, d_box, CUFFT_INVERSE)
+      IF (psir_cached) THEN
+        CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_r2, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
+             npert, d_wgt, 0)
+      ELSE
+        CALL psir_chunk(s0, nb, ip)
+        CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_r2, d_box, d_box2, d_valid, s0, nb, nnr, nslot, &
+             npert, d_wgt, 1)
+      ENDIF
+      s0 = s0 + nb
+    ENDDO
+    CALL kerr('dr_compare')
+    CALL tsync()
+    a = d_drho
+    b = d_r2
+    dmax = MAXVAL(ABS(a - b)); ymax = MAXVAL(ABS(b - drho0))
+    d2 = SUM(ABS(a - b)**2); y2 = SUM(ABS(b - drho0)**2)
+    IF (ymax > 0.0_dp) WRITE(*, '(A,I8,A,ES10.3,A,ES10.3)') '     rtsc fdxdp check (drho): columns', nvalid, &
+         ', max|d|/max ', dmax / ymax, ', rel L2 ', SQRT(d2 / y2)
+    DEALLOCATE(d_r2, a, b)
+  END SUBROUTINE dr_compare
+  !
   SUBROUTINE apply_op(x, y, list, nl)
     ! y = (H_kq - e_n + alpha_pv P_v) x on the nl columns list(1:nl); other slots of y are garbage
     COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
@@ -2046,6 +2175,9 @@ CONTAINS
       nb = MIN(sth_bmax, nvalid - s0)
       ip = plan_for(nb)
       nb = 2**ip
+      IF (dp_on) THEN
+        CALL dpot_fdx(d_dvb, s0, nb, ip, scale)
+      ELSE
       IF (psir_cached) THEN
         CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
              nnr, nslot, npert, 0)
@@ -2059,8 +2191,10 @@ CONTAINS
       CALL k_gather_add<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_dvb, d_box, d_valid, s0, nnr, &
            npwx, nslot, npert, nksq, d_npwq, d_idxkq, scale)
       CALL kerr('gather_add (dvb)')
+      ENDIF
       s0 = s0 + nb
     ENDDO
+    IF (dp_on .AND. sth_fdxdp_check) CALL dp_compare(d_dvb, d_dvb, .TRUE., scale, 'dvb local')
     IF (nkb > 0) THEN
       ALLOCATE(d_u(nat3, npert), d_at(nkb), d_kqg(npwx, 3, nksq))
       d_u = uq
@@ -2117,8 +2251,9 @@ CONTAINS
     INTEGER, INTENT(OUT) :: ierr
     INTEGER :: istat, ik, n, ip, nb, b0
     INTEGER(8) :: need, freeb, totb
-    REAL(dp) :: t0
+    REAL(dp) :: t0, tq(0:7)
     t0 = wtime()
+    tq = 0; tq(0) = t0
     ierr = 0
     ! clear a pending (non-sticky) error left by other code, so that kerr reports only the
     ! engine's own launches; it is printed, not hidden
@@ -2184,6 +2319,9 @@ CONTAINS
     d_etkq = h_etkq
     d_wgt = 2.0_dp * h_wk / omega
     d_W = h_W
+    IF (sth_timing) THEN
+      CALL tsync(); tq(1) = wtime()
+    ENDIF
     BLOCK
       INTEGER, ALLOCATABLE :: hinv(:,:)
       INTEGER :: ig
@@ -2200,6 +2338,9 @@ CONTAINS
       DEALLOCATE(hinv)
     END BLOCK
     !
+    IF (sth_timing) THEN
+      CALL tsync(); tq(2) = wtime()
+    ENDIF
     ALLOCATE(d_box(nnr, sth_bmax))
     IF (psir_cached) THEN
       ALLOCATE(d_psir(nnr, nbox))
@@ -2233,6 +2374,9 @@ CONTAINS
       CALL sth_mem_sample()
     ENDIF
     !
+    IF (sth_timing) THEN
+      CALL tsync(); tq(3) = wtime()
+    ENDIF
     ! psi_k(r) for n <= nocc_k: scatter evc at k+G, inverse FFT in place (no cache: keep evc only)
     ALLOCATE(d_evc(npwx, nbox))
     d_evc = h_evc
@@ -2256,6 +2400,9 @@ CONTAINS
       DEALLOCATE(d_evc)
     ENDIF
     DEALLOCATE(h_evc, h_W)
+    IF (sth_timing) THEN
+      CALL tsync(); tq(4) = wtime()
+    ENDIF
     dvb_q = sth_dvb_req .AND. ALLOCATED(h_bp)
     IF (dvb_q .AND. nkb > 0) CALL nl_setup()
     IF (ALLOCATED(h_bp)) DEALLOCATE(h_bp, h_al)
@@ -2264,7 +2411,9 @@ CONTAINS
     IF (sth_fftdx_req) THEN
       BLOCK
         INTEGER :: ier, ns_, nx_, pc_
+        sth_t_fdxsetup = wtime()
         ier = fdx_setup(nr, nrx, nksq, npwx, h_npwq, h_idxkq, 1024)
+        sth_t_fdxsetup = wtime() - sth_t_fdxsetup
         IF (ier == 0) THEN
           fdx_on = .TRUE.
           CALL fdx_info(ns_, nx_, pc_)
@@ -2273,8 +2422,13 @@ CONTAINS
         ELSE
           WRITE(*, '(A,I3,A)') '     rtsc fftdx: unsupported grid/box or not built (', ier, '), pfft/cuFFT path kept'
         ENDIF
+        IF (sth_timing) WRITE(*, '(A,F8.3,A)') '     rtsc fftdx: fdx_setup ', sth_t_fdxsetup, ' s'
       END BLOCK
     ENDIF
+    dp_on = fdx_on .AND. sth_fdxdp_req .AND. nnr == nr(1) * nr(2) * nr(3)
+    dp_checked = .FALSE.
+    dr_checked = .FALSE.
+    IF (sth_fdxdp_req) WRITE(*, '(A,L2)') '     rtsc fdxdp: dpot/drho/DVB-local on the pruned path:', dp_on
     IF (sth_pfft_req .AND. .NOT. fdx_on) THEN
       BLOCK
         INTEGER :: ier, ns_, nx_, pc_
@@ -2294,9 +2448,12 @@ CONTAINS
     ENDIF
     istat = cudaDeviceSynchronize()
     CALL chk(istat, 'setup')
+    tq(5) = wtime()
     qready = .TRUE.
     CALL sth_engine_irrep_commit(ierr)
     sth_t_setup = wtime() - t0
+    IF (sth_timing) WRITE(*, '(A,7F8.3)') '     rtsc setup t: upload/W, d_inv, plans+hd, psi(r), nl+fdx, commit, total', &
+         tq(1) - tq(0), tq(2) - tq(1), tq(3) - tq(2), tq(4) - tq(3), tq(5) - tq(4), wtime() - tq(5), sth_t_setup
   END SUBROUTINE sth_engine_setup
   !
   SUBROUTINE irrep_free()
@@ -2467,6 +2624,9 @@ CONTAINS
         nb = MIN(sth_bmax, nvalid - s0)
         ip = plan_for(nb)
         nb = 2**ip
+        IF (dp_on) THEN
+          CALL dpot_fdx(d_d0, s0, nb, ip, scale)
+        ELSE
         IF (psir_cached) THEN
           CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
                nnr, nslot, npert, 0)
@@ -2480,8 +2640,13 @@ CONTAINS
         CALL k_gather_add<<<dim3(nblk(npwx, TPB), nb, 1), TPB, 0, strm>>>(d_d0, d_box, d_valid, s0, nnr, &
              npwx, nslot, npert, nksq, d_npwq, d_idxkq, scale)
         CALL kerr('gather_add')
+        ENDIF
         s0 = s0 + nb
       ENDDO
+      IF (dp_on .AND. sth_fdxdp_check .AND. .NOT. dp_checked) THEN
+        CALL dp_compare(d_d0, d_dvb, .FALSE., scale, 'dpot')
+        dp_checked = .TRUE.
+      ENDIF
     ENDIF
     IF (sth_timing) THEN
       CALL tsync(); t1 = wtime(); sth_t_dpot = t1 - t0; t0 = t1
@@ -2491,7 +2656,7 @@ CONTAINS
     ! One ZGEMM pair per (k, pert) with exactly the shapes of orthogonalize.f90 (m = nbnd, n = nocc_k,
     ! k = npwq), so that the right-hand side matches vanilla's rounding as closely as possible: the
     ! screened, projected dvpsi can be a strong cancellation, and its rounding feeds every CG step.
-    IF (mp_q) THEN
+    IF (mp_q .OR. sth_obatch) THEN
       CALL ortho_batched()
     ELSE
       CALL ortho_exact()
@@ -2586,10 +2751,15 @@ CONTAINS
       ip = plan_for(nb)
       nb = 2**ip
       np = 2**ip
+      IF (dp_on) THEN
+        istat = fdx_inv_d(d_box, d_dpsi, d_valid, s0, nb, nslot, npert, npwx, nnr, strm)
+        IF (istat /= 0) CALL errore_stop('fdx_inv_d', istat)
+      ELSE
       CALL k_scatter_full<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_dpsi, d_valid, s0, nnr, &
            npwx, nslot, npert, nksq, d_inv)
       CALL kerr('scatter (drho)')
       CALL fft_exec(ip, d_box, CUFFT_INVERSE)
+      ENDIF
       IF (psir_cached) THEN
         CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
              npert, d_wgt, 0)
@@ -2602,6 +2772,10 @@ CONTAINS
       s0 = s0 + nb
     ENDDO
     CALL tsync()
+    IF (dp_on .AND. sth_fdxdp_check .AND. .NOT. dr_checked .AND. .NOT. first_iter) THEN
+      CALL dr_compare(drho)
+      dr_checked = .TRUE.
+    ENDIF
     drho = d_drho
     !
     ! iteration count, exactly as sternheimer_kernel: sum over (k, pert) of INT(kter_eff)

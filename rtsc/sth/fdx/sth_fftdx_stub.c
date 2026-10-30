@@ -9,3 +9,5 @@ void fdx_free(void) {}
 void fdx_info(int* nst, int* nxa, int* chunk) { *nst = 0; *nxa = 0; *chunk = 0; }
 int fdx_local_d(void) { return 99; }
 int fdx_local_s(void) { return 99; }
+int fdx_dpot_d(void) { return 99; }
+int fdx_inv_d(void) { return 99; }
