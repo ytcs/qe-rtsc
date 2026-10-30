@@ -2479,10 +2479,10 @@ CONTAINS
   !
   SUBROUTINE cbsr_build()
     !! CBSR canary: dense A~ per k+q of this q, host zheevd, U and Lambda (FP64); see the module header.
-    INTEGER :: ik, nq, i, j, ig, jg, m, nocc, info, lwork, lrwork, liwork, istat, a1, a2, a3, b1, b2, b3, kc
+    INTEGER :: ik, nq, i, j, ig, jg, m, nocc, info, lwork, lrwork, liwork, istat, a1, a2, a3, b1, b2, b3, kc, nfail
     INTEGER(8) :: freeb, totb, ubytes, avail
     REAL(dp) :: t0, te, teig, de, demax, eexp, gmin
-    COMPLEX(dp), ALLOCATABLE :: vg(:), a(:,:), x(:,:), cw(:), hu(:,:), dm(:,:)
+    COMPLEX(dp), ALLOCATABLE :: vg(:), a(:,:), x(:,:), cw(:), hu(:,:), dm(:,:), hul(:,:)
     REAL(dp), ALLOCATABLE :: lam(:), rw(:), hlam(:,:)
     INTEGER, ALLOCATABLE :: m3(:,:), iw(:)
     LOGICAL :: w_staged
@@ -2537,7 +2537,14 @@ CONTAINS
     hlam = 1.0e30_dp
     demax = 0.0_dp
     gmin = HUGE(1.0_dp)
+    ! k+q points in parallel (OpenMP; each zheevd runs on one thread), device copies serialised
+    nfail = 0
+    te = wtime()
+    !$omp parallel do schedule(dynamic, 1) default(shared) &
+    !$omp& private(ik, nq, nocc, a, lam, x, cw, rw, iw, lwork, lrwork, liwork, info, j, ig, a1, a2, a3, b1, b2, b3, m, &
+    !$omp&         eexp, de, i, hul) reduction(max: demax) reduction(min: gmin)
     DO ik = 1, nksq
+      IF (nfail > 0) CYCLE
       nq = h_npwq(ik)
       nocc = h_nockq(ik)
       ALLOCATE(a(nq, nq), lam(nq))
@@ -2560,7 +2567,6 @@ CONTAINS
       IF (nocc > 0) CALL zgemm('N', 'C', nq, nq, nocc, CMPLX(alpha_pv, 0.0_dp, KIND=dp), h_W(1, nkb + 1, ik), npwx, &
                                h_W(1, nkb + 1, ik), npwx, (1.0_dp, 0.0_dp), a, nq)
       a = 0.5_dp * (a + TRANSPOSE(CONJG(a)))
-      te = wtime()
       ALLOCATE(cw(1), rw(1), iw(1))
       CALL zheevd('V', 'U', nq, a, nq, lam, cw, -1, rw, -1, iw, -1, info)
       lwork = INT(REAL(cw(1))); lrwork = INT(rw(1)); liwork = iw(1)
@@ -2568,13 +2574,11 @@ CONTAINS
       ALLOCATE(cw(lwork), rw(lrwork), iw(liwork))
       CALL zheevd('V', 'U', nq, a, nq, lam, cw, lwork, rw, lrwork, iw, liwork, info)
       DEALLOCATE(cw, rw, iw)
-      teig = teig + wtime() - te
       IF (info /= 0) THEN
-        WRITE(*, '(A,I6,A,I6,A)') '     rtsc cbsr: zheevd info ', info, ' at k+q ', ik, '; CG kept'
-        DEALLOCATE(a, lam, vg, m3, dm, hlam, hu)
-        IF (w_staged) DEALLOCATE(h_W)
-        CALL cbsr_free()
-        RETURN
+        !$omp atomic write
+        nfail = ik
+        DEALLOCATE(a, lam)
+        CYCLE
       ENDIF
       ! assembly check: every computed band m <= nbnd at k+q has an eigenvalue of A~ at e_m + alpha [m <= nocc]
       DO m = 1, nbnd
@@ -2586,16 +2590,28 @@ CONTAINS
       DO i = 1, h_nock(ik)
         gmin = MIN(gmin, lam(1) - (h_etk(i, ik) - cbsr_v0))
       ENDDO
-      hu = (0.0_dp, 0.0_dp)
-      hu(1:nq, 1:nq) = a
+      ALLOCATE(hul(npwx, npwx))
+      hul = (0.0_dp, 0.0_dp)
+      hul(1:nq, 1:nq) = a
       hlam(1:nq, ik) = lam
+      !$omp critical (cbsr_copy)
       IF (cbsr_stream) THEN
-        h_cu(:, :, ik) = hu
+        h_cu(:, :, ik) = hul
       ELSE
-        d_cu(:, :, ik) = hu
+        d_cu(:, :, ik) = hul
       ENDIF
-      DEALLOCATE(a, lam)
+      !$omp end critical (cbsr_copy)
+      DEALLOCATE(a, lam, hul)
     ENDDO
+    !$omp end parallel do
+    teig = wtime() - te
+    IF (nfail > 0) THEN
+      WRITE(*, '(A,I6,A)') '     rtsc cbsr: zheevd failed at k+q ', nfail, '; CG kept'
+      DEALLOCATE(vg, m3, dm, hlam, hu)
+      IF (w_staged) DEALLOCATE(h_W)
+      CALL cbsr_free()
+      RETURN
+    ENDIF
     ALLOCATE(d_clam(npwx, nksq))
     d_clam = hlam
     DEALLOCATE(vg, m3, dm, hlam, hu)
@@ -2605,7 +2621,7 @@ CONTAINS
     cbsr_q = .TRUE.
     WRITE(*, '(A,I6,A,I6,A,ES10.3,A,F9.4,A,F9.2,A,F9.2,A,I5,A,L1)') '     rtsc cbsr: k+q ', nksq, ', npwx ', npwx, &
          ', assembly check max|dE| ', demax, ' Ry, min(Lambda1 - e~_n) ', gmin, ' Ry, build ', sth_t_cbuild, &
-         ' s (zheevd ', teig, ' s), k chunk ', cbsr_kc, ', streamed ', cbsr_stream
+         ' s (assembly + zheevd loop, OpenMP over k+q: ', teig, ' s), k chunk ', cbsr_kc, ', streamed ', cbsr_stream
   END SUBROUTINE cbsr_build
   !
   SUBROUTINE cbsr_solve()
