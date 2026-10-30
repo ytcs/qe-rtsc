@@ -632,7 +632,7 @@ CONTAINS
                                  sth_fftdx_req, sth_fftdx_check, &
                                  sth_fdxdp_req, sth_fdxdp_check, sth_obatch, sth_timing, &
                                  sth_engine_set_nlk, sth_qcache, sth_engine_wdev, sth_engine_set_wdev, &
-                                 sth_lift, sth_lift_kchunk, sth_lift_fb
+                                 sth_lift, sth_lift_kchunk, sth_lift_fb, sth_cbsr
     USE lrus,             ONLY : becp1
     !
     LOGICAL, INTENT(IN) :: first_iter
@@ -671,6 +671,7 @@ CONTAINS
     CALL env_real('RTSC_STH_LIFT', sth_lift)
     sth_lift_kchunk = sth_env_int('RTSC_STH_LIFT_KCHUNK')
     sth_lift_fb = sth_env_int('RTSC_STH_LIFT_FB')            ! LIFT-F v2 per-column TPA fallback (SOLVE-LOG "LIFT-F v2")
+    sth_cbsr = sth_env_flag('RTSC_STH_CBSR')                 ! CBSR canary: exact spectral solve (SOLVE-LOG "CBSR canary")
     nslot = 0
     DO ik = 1, nksq
       nslot = MAX(nslot, nbnd_occ(ikks(ik)))

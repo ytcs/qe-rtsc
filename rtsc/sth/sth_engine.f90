@@ -276,6 +276,19 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_lift_fb = 0
   INTEGER, PUBLIC, SAVE :: sth_lift_nfb(4) = 0
   INTEGER, DEVICE, ALLOCATABLE :: d_lok(:,:)
+  !
+  ! rtsc CBSR canary (RTSC_STH_CBSR=1; SOLVE-LOG.md "CBSR canary"): per k+q the full dense A~ = H_kq + alpha_pv P_v
+  ! (nscf evq, energy zero V0) is diagonalised once per q (host zheevd, FP64): A~ - V0 = U Lambda U^H. Each SCF call then
+  ! replaces the CG by dpsi_n = U diag(1/(Lambda - e~_n)) U^H b_n, b_n = the engine's orthogonalised right-hand side:
+  ! QE's linear system solved exactly. U is device-resident when it fits, else pinned host chunks streamed per call.
+  LOGICAL, PUBLIC, SAVE :: sth_cbsr = .FALSE.
+  REAL(dp), PUBLIC, SAVE :: sth_t_cbuild = 0, sth_t_csolve = 0
+  LOGICAL, SAVE :: cbsr_q = .FALSE., cbsr_stream = .FALSE.
+  INTEGER, SAVE :: cbsr_kc = 0
+  REAL(dp), SAVE :: cbsr_v0 = 0.0_dp
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_cu(:,:,:), d_cc(:,:)
+  COMPLEX(dp), PINNED, ALLOCATABLE, SAVE :: h_cu(:,:,:)
+  REAL(dp), DEVICE, ALLOCATABLE :: d_clam(:,:)
   LOGICAL, SAVE :: lift_q = .FALSE., lift_stream = .FALSE.
   INTEGER, SAVE :: lift_nm = 0, lift_kc = 0
   REAL(dp), SAVE :: lift_v0 = 0.0_dp
@@ -841,6 +854,29 @@ CONTAINS
       i = i + INT(blockDim%x, 8) * gridDim%x
     ENDDO
   END SUBROUTINE k_lift_scale
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cbsr_scale(c, lam, etk, nm, nbnd, nslot, ncolk, k0, ntot, v0)
+    ! CBSR: c(j, sc) /= (Lambda_j(k) - (e_n(k) - V0)) on the chunk's columns (padding rows: Lambda = 1e30 -> 0)
+    INTEGER, VALUE :: nm, nbnd, nslot, ncolk, k0
+    INTEGER(8), VALUE :: ntot
+    REAL(dp), VALUE :: v0
+    COMPLEX(dp) :: c(nm, *)
+    REAL(dp) :: lam(nm, *), etk(nbnd, *)
+    INTEGER(8) :: i
+    INTEGER :: j, sc, k, n
+    REAL(dp) :: d
+    i = INT(blockIdx%x - 1, 8) * blockDim%x + threadIdx%x
+    DO WHILE (i <= ntot)
+      j = INT(MOD(i - 1, INT(nm, 8))) + 1
+      sc = INT((i - 1) / nm) + 1 + k0 * ncolk
+      k = (sc - 1) / ncolk + 1
+      n = MOD(sc - 1, nslot) + 1
+      d = lam(j, k) - (etk(n, k) - v0)
+      IF (ABS(d) < 1.0e-12_dp) d = SIGN(1.0e-12_dp, d)
+      c(j, sc) = c(j, sc) / d
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_cbsr_scale
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_r2c(a, b, n)
     ! a (complex) = b (real)
@@ -2432,6 +2468,191 @@ CONTAINS
     ENDIF
   END SUBROUTINE lift_apply
   !
+  SUBROUTINE cbsr_free()
+    IF (ALLOCATED(d_cu)) DEALLOCATE(d_cu)
+    IF (ALLOCATED(h_cu)) DEALLOCATE(h_cu)
+    IF (ALLOCATED(d_clam)) DEALLOCATE(d_clam)
+    IF (ALLOCATED(d_cc)) DEALLOCATE(d_cc)
+    cbsr_q = .FALSE.
+    cbsr_stream = .FALSE.
+  END SUBROUTINE cbsr_free
+  !
+  SUBROUTINE cbsr_build()
+    !! CBSR canary: dense A~ per k+q of this q, host zheevd, U and Lambda (FP64); see the module header.
+    INTEGER :: ik, nq, i, j, ig, jg, m, nocc, info, lwork, lrwork, liwork, istat, a1, a2, a3, b1, b2, b3, kc
+    INTEGER(8) :: freeb, totb, ubytes, avail
+    REAL(dp) :: t0, te, teig, de, demax, eexp, gmin
+    COMPLEX(dp), ALLOCATABLE :: vg(:), a(:,:), x(:,:), cw(:), hu(:,:), dm(:,:)
+    REAL(dp), ALLOCATABLE :: lam(:), rw(:), hlam(:,:)
+    INTEGER, ALLOCATABLE :: m3(:,:), iw(:)
+    LOGICAL :: w_staged
+    EXTERNAL :: zgemm, zheevd
+    t0 = wtime()
+    teig = 0.0_dp
+    CALL cbsr_free()
+    IF (ANY(nrx /= nr)) THEN
+      WRITE(*, '(A)') '     rtsc cbsr: padded FFT box (nrx /= nr) not supported; CG kept'
+      RETURN
+    ENDIF
+    w_staged = .FALSE.
+    IF (.NOT. ALLOCATED(h_W)) THEN
+      ALLOCATE(h_W(npwx, nproj, nksq))
+      CALL tsync()
+      h_W = d_W
+      w_staged = .TRUE.
+    ENDIF
+    ! V(G) on the box, exactly as LIFT (the matrix elements of apply_op's local part)
+    CALL k_r2c<<<4096, TPB, 0, strm>>>(d_box, d_vrs, INT(nnr, 8))
+    CALL kerr('r2c (cbsr)')
+    CALL fft_exec(0, d_box, CUFFT_FORWARD)
+    ALLOCATE(vg(nnr))
+    CALL tsync()
+    vg = d_box(:, 1)
+    vg = vg / REAL(nr(1) * nr(2) * nr(3), dp)
+    CALL zero_c(d_box, INT(nnr, 8))
+    cbsr_v0 = REAL(vg(1), dp)
+    ALLOCATE(m3(3, nnr))
+    DO i = 1, nnr
+      m3(1, i) = MOD(i - 1, nr(1))
+      m3(2, i) = MOD((i - 1) / nr(1), nr(2))
+      m3(3, i) = (i - 1) / (nr(1) * nr(2))
+    ENDDO
+    ALLOCATE(dm(MAX(nkb, 1), MAX(nkb, 1)))
+    IF (nkb > 0) dm = d_dmat
+    ! storage: device if it fits (with 3 GiB and the per-call coefficient array spare), else streamed chunks
+    CALL sth_mem_trim()
+    istat = cudaMemGetInfo(freeb, totb)
+    ubytes = 16_8 * npwx * npwx * nksq
+    avail = freeb - 3_8 * 1024_8**3 - 16_8 * npwx * nslot * MAXPERT * nksq
+    kc = nksq
+    IF (ubytes > avail) kc = INT(MAX(1_8, avail / (16_8 * npwx * npwx)))
+    cbsr_kc = MIN(kc, nksq)
+    cbsr_stream = cbsr_kc < nksq
+    IF (cbsr_stream) THEN
+      ALLOCATE(h_cu(npwx, npwx, nksq), d_cu(npwx, npwx, cbsr_kc))
+    ELSE
+      ALLOCATE(d_cu(npwx, npwx, nksq))
+    ENDIF
+    ALLOCATE(hlam(npwx, nksq), hu(npwx, npwx))
+    hlam = 1.0e30_dp
+    demax = 0.0_dp
+    gmin = HUGE(1.0_dp)
+    DO ik = 1, nksq
+      nq = h_npwq(ik)
+      nocc = h_nockq(ik)
+      ALLOCATE(a(nq, nq), lam(nq))
+      DO j = 1, nq
+        b1 = m3(1, h_idxkq(j, ik)); b2 = m3(2, h_idxkq(j, ik)); b3 = m3(3, h_idxkq(j, ik))
+        DO ig = 1, nq
+          a1 = MODULO(m3(1, h_idxkq(ig, ik)) - b1, nr(1))
+          a2 = MODULO(m3(2, h_idxkq(ig, ik)) - b2, nr(2))
+          a3 = MODULO(m3(3, h_idxkq(ig, ik)) - b3, nr(3))
+          a(ig, j) = vg(1 + a1 + nr(1) * (a2 + nr(2) * a3))
+        ENDDO
+        a(j, j) = a(j, j) + h_g2(j, ik) - cbsr_v0
+      ENDDO
+      IF (nkb > 0) THEN
+        ALLOCATE(x(nkb, nq))
+        CALL zgemm('N', 'C', nkb, nq, nkb, (1.0_dp, 0.0_dp), dm, nkb, h_W(1, 1, ik), npwx, (0.0_dp, 0.0_dp), x, nkb)
+        CALL zgemm('N', 'N', nq, nq, nkb, (1.0_dp, 0.0_dp), h_W(1, 1, ik), npwx, x, nkb, (1.0_dp, 0.0_dp), a, nq)
+        DEALLOCATE(x)
+      ENDIF
+      IF (nocc > 0) CALL zgemm('N', 'C', nq, nq, nocc, CMPLX(alpha_pv, 0.0_dp, KIND=dp), h_W(1, nkb + 1, ik), npwx, &
+                               h_W(1, nkb + 1, ik), npwx, (1.0_dp, 0.0_dp), a, nq)
+      a = 0.5_dp * (a + TRANSPOSE(CONJG(a)))
+      te = wtime()
+      ALLOCATE(cw(1), rw(1), iw(1))
+      CALL zheevd('V', 'U', nq, a, nq, lam, cw, -1, rw, -1, iw, -1, info)
+      lwork = INT(REAL(cw(1))); lrwork = INT(rw(1)); liwork = iw(1)
+      DEALLOCATE(cw, rw, iw)
+      ALLOCATE(cw(lwork), rw(lrwork), iw(liwork))
+      CALL zheevd('V', 'U', nq, a, nq, lam, cw, lwork, rw, lrwork, iw, liwork, info)
+      DEALLOCATE(cw, rw, iw)
+      teig = teig + wtime() - te
+      IF (info /= 0) THEN
+        WRITE(*, '(A,I6,A,I6,A)') '     rtsc cbsr: zheevd info ', info, ' at k+q ', ik, '; CG kept'
+        DEALLOCATE(a, lam, vg, m3, dm, hlam, hu)
+        IF (w_staged) DEALLOCATE(h_W)
+        CALL cbsr_free()
+        RETURN
+      ENDIF
+      ! assembly check: every computed band m <= nbnd at k+q has an eigenvalue of A~ at e_m + alpha [m <= nocc]
+      DO m = 1, nbnd
+        eexp = h_etkq(m, ik) - cbsr_v0
+        IF (m <= nocc) eexp = eexp + alpha_pv
+        de = MINVAL(ABS(lam - eexp))
+        demax = MAX(demax, de)
+      ENDDO
+      DO i = 1, h_nock(ik)
+        gmin = MIN(gmin, lam(1) - (h_etk(i, ik) - cbsr_v0))
+      ENDDO
+      hu = (0.0_dp, 0.0_dp)
+      hu(1:nq, 1:nq) = a
+      hlam(1:nq, ik) = lam
+      IF (cbsr_stream) THEN
+        h_cu(:, :, ik) = hu
+      ELSE
+        d_cu(:, :, ik) = hu
+      ENDIF
+      DEALLOCATE(a, lam)
+    ENDDO
+    ALLOCATE(d_clam(npwx, nksq))
+    d_clam = hlam
+    DEALLOCATE(vg, m3, dm, hlam, hu)
+    IF (w_staged) DEALLOCATE(h_W)
+    CALL tsync()
+    sth_t_cbuild = wtime() - t0
+    cbsr_q = .TRUE.
+    WRITE(*, '(A,I6,A,I6,A,ES10.3,A,F9.4,A,F9.2,A,F9.2,A,I5,A,L1)') '     rtsc cbsr: k+q ', nksq, ', npwx ', npwx, &
+         ', assembly check max|dE| ', demax, ' Ry, min(Lambda1 - e~_n) ', gmin, ' Ry, build ', sth_t_cbuild, &
+         ' s (zheevd ', teig, ' s), k chunk ', cbsr_kc, ', streamed ', cbsr_stream
+  END SUBROUTINE cbsr_build
+  !
+  SUBROUTINE cbsr_solve()
+    !! d_dpsi(:, s) = U_k diag(1/(Lambda - e~_n)) U_k^H d_d0(:, s) for every slot (FP64 batched GEMMs per k chunk)
+    INTEGER :: c0, nk, istat, ncolk
+    INTEGER(8) :: off
+    REAL(dp) :: ta
+    CALL tsync(); ta = wtime()
+    ncolk = nslot * npert
+    IF (ALLOCATED(d_cc)) THEN
+      IF (SIZE(d_cc, 2) /= nsl) DEALLOCATE(d_cc)
+    ENDIF
+    IF (.NOT. ALLOCATED(d_cc)) ALLOCATE(d_cc(npwx, nsl))
+    DO c0 = 0, nksq - 1, cbsr_kc
+      nk = MIN(cbsr_kc, nksq - c0)
+      off = INT(c0, 8) * ncolk + 1
+      IF (cbsr_stream) THEN
+        istat = cudaMemcpyAsync(d_cu, h_cu(:, :, c0 + 1:c0 + nk), INT(npwx, 8) * npwx * nk, strm)
+        CALL chk(istat, 'cudaMemcpyAsync (cbsr chunk)')
+        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
+             d_cu, npwx, INT(npwx, 8) * npwx, d_d0(1, off), npwx, INT(npwx, 8) * ncolk, (0.0_dp, 0.0_dp), &
+             d_cc(1, off), npwx, INT(npwx, 8) * ncolk, nk)
+      ELSE
+        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
+             d_cu(1, 1, c0 + 1), npwx, INT(npwx, 8) * npwx, d_d0(1, off), npwx, INT(npwx, 8) * ncolk, &
+             (0.0_dp, 0.0_dp), d_cc(1, off), npwx, INT(npwx, 8) * ncolk, nk)
+      ENDIF
+      CALL chk(istat, 'cublasZgemmStridedBatched (cbsr UHb)')
+      CALL k_cbsr_scale<<<4096, TPB, 0, strm>>>(d_cc, d_clam, d_etk, npwx, nbnd, nslot, ncolk, c0, &
+           INT(npwx, 8) * ncolk * nk, cbsr_v0)
+      CALL kerr('cbsr_scale')
+      IF (cbsr_stream) THEN
+        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
+             d_cu, npwx, INT(npwx, 8) * npwx, d_cc(1, off), npwx, INT(npwx, 8) * ncolk, (0.0_dp, 0.0_dp), &
+             d_dpsi(1, off), npwx, INT(npwx, 8) * ncolk, nk)
+      ELSE
+        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
+             d_cu(1, 1, c0 + 1), npwx, INT(npwx, 8) * npwx, d_cc(1, off), npwx, INT(npwx, 8) * ncolk, &
+             (0.0_dp, 0.0_dp), d_dpsi(1, off), npwx, INT(npwx, 8) * ncolk, nk)
+      ENDIF
+      CALL chk(istat, 'cublasZgemmStridedBatched (cbsr Uc)')
+    ENDDO
+    CALL tsync()
+    sth_t_csolve = wtime() - ta
+    IF (sth_timing) WRITE(*, '(A,F9.3,A,I8,A)') '     rtsc cbsr solve ', sth_t_csolve, ' s, ', nvalid, ' valid columns'
+  END SUBROUTINE cbsr_solve
+  !
   SUBROUTINE apply_op(x, y, list, nl)
     ! y = (H_kq - e_n + alpha_pv P_v) x on the nl columns list(1:nl); other slots of y are garbage
     COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
@@ -3051,6 +3272,13 @@ CONTAINS
       CALL lift_free()
       IF (sth_lift > 0.0_dp) WRITE(*, '(A)') '     rtsc lift: ignored under RTSC_STH_MP (FP64 CG path only)'
     ENDIF
+    ! CBSR canary (needs W; the box is free here); exclusive with LIFT-F and MP
+    IF (sth_cbsr .AND. .NOT. mp_q .AND. .NOT. lift_q) THEN
+      CALL cbsr_build()
+    ELSE
+      CALL cbsr_free()
+      IF (sth_cbsr) WRITE(*, '(A)') '     rtsc cbsr: ignored (RTSC_STH_MP or LIFT-F on)'
+    ENDIF
     IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
     IF (ALLOCATED(h_W)) DEALLOCATE(h_W)
     IF (sth_timing) THEN
@@ -3409,6 +3637,13 @@ CONTAINS
     ! CG (cgsolve_all), all columns at once
     IF (mp_q) THEN
       CALL mp_solve(first_iter, thresh)
+    ELSEIF (cbsr_q) THEN
+      ! CBSR canary: exact spectral solve of the engine's system (no CG, no thresh)
+      CALL cbsr_solve()
+      d_conv = 1
+      d_kter = 0.0_dp
+      sth_nsteps = 0; sth_ncolapp = 0; sth_nact0 = 0
+      sth_n64 = 0; sth_n32 = 0; sth_nround = 0
     ELSE
     ax_valid = .FALSE.
     IF (first_iter) CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
@@ -3678,6 +3913,7 @@ CONTAINS
     IF (ALLOCATED(h_xh)) DEALLOCATE(h_xh)
     CALL pfft_free()
     CALL lift_free()
+    CALL cbsr_free()
     CALL pfs_free()
     IF (fdx_on) CALL fdx_free()
     fdx_on = .FALSE.
