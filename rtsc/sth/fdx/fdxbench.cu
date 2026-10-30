@@ -276,6 +276,10 @@ int main(int argc, char** argv) {
   for (auto& w : hv) w = U(rng);
   for (auto& w : hg2) w = 5 * (U(rng) + 0.5);
   for (auto& w : het) w = U(rng) + 0.5;
+  if (getenv("FDX_VONLY")) {   // potential part alone (g2 = e = 0): the undiluted error of the transforms
+    std::fill(hg2.begin(), hg2.end(), 0.0); std::fill(het.begin(), het.end(), 0.0);
+    printf("g2 = e = 0: y = (1/N) FFT[V FFT^-1 x] only\n");
+  }
   // geometry for pfft and fftdx
   int nst = 0, nxa = 0, pc = 0;
   int ier = fdx_setup(G.n, G.n, G.nksq, G.npwx, G.npwq.data(), G.idx.data(), 1024);
