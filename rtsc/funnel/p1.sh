@@ -34,7 +34,7 @@ python3 "$F/p1gate.py" compare gate/engine gate/vanilla gate/gate.json >> queue.
 mark GATE_END
 fi
 [ "$PART" = gate ] && { mark P1_GATE_ONLY_DONE; exit 0; }
-if ! python3 -c "import json,sys; sys.exit(0 if json.load(open('gate/gate.json'))['pass_gate'] else 1)"; then
+if ! python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))['pass_gate'] else 1)" "${GATE_JSON:-gate/gate.json}"; then
   mark P1_GATE_FAIL; mark P1_DONE; exit 0
 fi
 # 2. SG15 arm extras, 3. SPMS arm
