@@ -54,7 +54,7 @@ MODULE sth_nscf_symrot
   END TYPE htab
   TYPE(htab), SAVE :: tc, tl
   REAL(DP), SAVE :: t_plan = 0, t_after = 0
-  LOGICAL, SAVE :: prefer_ft = .FALSE.
+  LOGICAL, SAVE :: prefer_ft = .FALSE., rev_ops = .FALSE.
   INTEGER, SAVE :: nft = 0     ! rotations that used an op with a fractional translation (cumulative)
   !
 CONTAINS
@@ -299,7 +299,7 @@ CONTAINS
     TYPE(htab), INTENT(INOUT) :: t
     REAL(DP), INTENT(IN) :: xs(3)
     INTEGER, INTENT(IN) :: id
-    INTEGER :: is, itr, tr, j, ipass
+    INTEGER :: is, js, itr, tr, j, ipass
     INTEGER(8) :: key
     REAL(DP) :: kr(3)
     LOGICAL :: hasft
@@ -309,7 +309,11 @@ CONTAINS
     DO itr = 1, 2
       tr = 3 - 2 * itr
       IF (tr == -1 .AND. .NOT. time_reversal) EXIT
-      DO is = 1, nsym
+      DO js = 1, nsym
+        ! RTSC_NSCF_SYMROT_REVOPS=1 (diagnostic): reversed op order, so images with a non-trivial stabilizer are
+        ! reached by another op (a pure gauge change of the rotated set)
+        is = js
+        IF (rev_ops) is = nsym + 1 - js
         hasft = ANY(ABS(ft(:, is)) > 1.d-12)
         IF (prefer_ft) THEN
           IF ((ipass == 1) .NEQV. hasft) CYCLE
@@ -370,6 +374,8 @@ CONTAINS
       CALL h_reset(tc)
       CALL get_environment_variable('RTSC_NSCF_SYMROT_PREFER_FT', sv, STATUS=ios)
       prefer_ft = (ios == 0 .AND. TRIM(sv) == '1')
+      CALL get_environment_variable('RTSC_NSCF_SYMROT_REVOPS', sv, STATUS=ios)
+      rev_ops = (ios == 0 .AND. TRIM(sv) == '1')
     ENDIF
     IF (npos /= dfftp%nr1 * dfftp%nr2 * dfftp%nr3) THEN
       IF (ALLOCATED(pos)) DEALLOCATE(pos)
