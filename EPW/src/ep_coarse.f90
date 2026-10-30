@@ -32,6 +32,7 @@
   REAL(KIND = DP), SAVE, PRIVATE :: star_umax = 0.0_DP, star_cmax = 0.0_DP
   REAL(KIND = DP), PARAMETER, PRIVATE :: star_tol = 1.0E-8_DP
   INTEGER, SAVE, PRIVATE :: star_iqirr = 0, star_nqcirr = 0
+  INTEGER, SAVE, PRIVATE :: star_fbk = 0   ! RTSC_EPW_STAR_FB=n (diagnostic): local k n always takes the fallback
   !
   CONTAINS
     !
@@ -45,6 +46,9 @@
       star_req = TRIM(ev) == '1'
       CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_STAR_CHECK', ev)
       star_chk = star_req .AND. TRIM(ev) == '1'
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_STAR_FB', ev)
+      IF (LEN_TRIM(ev) > 0) READ(ev, *, ERR = 10) star_fbk
+10    CONTINUE
       star_read = .TRUE.
     ENDIF
     star_enabled = star_req
@@ -900,6 +904,7 @@
         CALL start_clock('ep_star')
         IF (.NOT. ALLOCATED(gstar)) ALLOCATE(gstar(nbndep, nbndep, npe))
         CALL star_g(sxk, sxk + xq0, npw, igk, aux5, npwq, igkq, aux4, npe, gstar, star_done)
+        IF (ik == star_fbk) star_done = .FALSE.
         CALL stop_clock('ep_star')
         IF (star_done) THEN
           star_nsc = star_nsc + 1
