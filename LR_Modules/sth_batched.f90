@@ -631,7 +631,8 @@ CONTAINS
                                  sth_mp, sth_mp_eta, sth_mp_safe, sth_pfft_req, sth_pfft_check, sth_dvb_req, &
                                  sth_fftdx_req, sth_fftdx_check, &
                                  sth_fdxdp_req, sth_fdxdp_check, sth_obatch, sth_timing, &
-                                 sth_engine_set_nlk, sth_qcache, sth_engine_wdev, sth_engine_set_wdev
+                                 sth_engine_set_nlk, sth_qcache, sth_engine_wdev, sth_engine_set_wdev, &
+                                 sth_lift, sth_lift_kchunk, sth_lift_fb
     USE lrus,             ONLY : becp1
     !
     LOGICAL, INTENT(IN) :: first_iter
@@ -665,6 +666,11 @@ CONTAINS
     sth_dvb_req = dvb_on
     CALL env_real('RTSC_MP_ETA', sth_mp_eta)
     CALL env_real('RTSC_MP_SAFE', sth_mp_safe)
+    ! LIFT-F preconditioner (RTSC_STH_LIFT = E_c' in Ry; FP64 CG path; SOLVE-LOG.md "LIFT-F canary")
+    sth_lift = 0.d0
+    CALL env_real('RTSC_STH_LIFT', sth_lift)
+    sth_lift_kchunk = sth_env_int('RTSC_STH_LIFT_KCHUNK')
+    sth_lift_fb = sth_env_int('RTSC_STH_LIFT_FB')            ! LIFT-F v2 per-column TPA fallback (SOLVE-LOG "LIFT-F v2")
     nslot = 0
     DO ik = 1, nksq
       nslot = MAX(nslot, nbnd_occ(ikks(ik)))
