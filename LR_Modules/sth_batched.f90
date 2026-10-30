@@ -183,7 +183,7 @@ CONTAINS
     USE eqv,              ONLY : dpsi, dvpsi
 #if defined(__CUDA)
     USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready, &
-                                 sth_xp_m, sth_engine_xp_set, sth_eta, sth_timing, sth_prof, sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, &
+                                 sth_xp_m, sth_engine_xp_set, sth_eta, sth_defl, sth_timing, sth_prof, sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, &
                                  sth_nsteps, sth_ncolapp, sth_nvalid, sth_nact0, sth_r0hist, sth_r0med, &
                                  sth_t_gemm, sth_t_fft, sth_stband, sth_r0band, sth_gapst, sth_gapdec, sth_gapn
     USE qpoint,           ONLY : xq
@@ -267,6 +267,8 @@ CONTAINS
     sth_timing = sth_env_flag('RTSC_STH_TIME')
     sth_prof = sth_env_flag('RTSC_STH_PROF')
     sth_eta = sth_call_eta
+    sth_defl = 0
+    IF (sth_env_flag('RTSC_STH_DEFL')) sth_defl = 1
     CALL sth_engine_solve(first_iter, thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
     drhoout(:, 1, :) = dr(:, :)
     DEALLOCATE(dv, dr)

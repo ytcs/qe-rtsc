@@ -34,7 +34,8 @@ MODULE sth_engine
   INTEGER, PARAMETER :: TPB = 256      ! threads per block, element-wise kernels
   INTEGER, PARAMETER :: RB = 256       ! max threads per block, per-column reductions (power of 2)
   INTEGER, PARAMETER :: MAXPERT = 6
-  INTEGER, PARAMETER :: MAXPLAN = 12   ! FFT batch sizes 2**0 .. 2**(MAXPLAN-1)
+  INTEGER, PARAMETER :: MAXPLAN = 12
+  INTEGER, PARAMETER :: MAXE = 16      ! RTSC_STH_DEFL: at most this many known empty bands per k   ! FFT batch sizes 2**0 .. 2**(MAXPLAN-1)
   INTEGER, PARAMETER :: maxter = 400   ! as cgsolve_all
   !
   PUBLIC :: sth_engine_init, sth_engine_set_global, sth_engine_set_k, sth_engine_set_dvbare, &
@@ -87,6 +88,10 @@ MODULE sth_engine
   ! also stops when its residual has fallen below sth_eta x its residual at the first test; 0 = off
   REAL(dp), PUBLIC, SAVE :: sth_eta = 0.0_dp
   REAL(dp), DEVICE, ALLOCATABLE :: d_r0(:)
+  ! RTSC_STH_DEFL: additive spectral preconditioner with the known empty bands at k+q (k_check_defl)
+  INTEGER, PUBLIC, SAVE :: sth_defl = 0
+  REAL(dp), PUBLIC, SAVE :: sth_dfloor = 1.0e-4_dp
+  REAL(dp), DEVICE, ALLOCATABLE :: d_etkq(:,:)
   INTEGER, PUBLIC, SAVE :: sth_xp_m = 0            ! history slots; 0 = off (set before irrep commit)
   INTEGER, SAVE :: xp_nc = 0, xp_rec = 0, xp_slot(16) = 0
   COMPLEX(dp), SAVE :: xp_c(16) = (0.0_dp, 0.0_dp)
@@ -437,6 +442,122 @@ CONTAINS
       ENDIF
     ENDIF
   END SUBROUTINE k_check
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_check_defl(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
+                                             cnt, ethr, first, eta, r0, nst, W, nproj, nkb, nbnd, nockq, &
+                                             etk, etkq, dfloor)
+    ! k_check with the additive spectral preconditioner (RTSC_STH_DEFL): M^-1 = h_diag +
+    ! sum_m |evq_m><evq_m| / (e_m(k+q) - e_n(k)) over the known empty bands m = nockq(k)+1 .. nbnd at
+    ! k+q, which are exact eigenvectors of the column operator (eigenvalue e_m - e_n, the smallest
+    ! ones). The stopping test is unchanged (sqrt(<g|h_diag|g>) < thresh); the CG recurrence uses
+    ! rho = <g|M^-1|g> and h = -M^-1 g + gam h_old.
+    INTEGER, VALUE :: nslot, npert, npwx, nksq, first, nproj, nkb, nbnd
+    REAL(dp), VALUE :: ethr, eta, dfloor
+    INTEGER :: list(*), npwq(nksq), conv(*), cnt(*), nst(*), nockq(nksq)
+    REAL(dp) :: hd(npwx, nslot, nksq), rho(*), r0(*), etk(nbnd, nksq), etkq(nbnd, nksq)
+    COMPLEX(dp) :: g(npwx, *), h(npwx, *), W(npwx, nproj, nksq)
+    REAL(dp), SHARED :: red(RB), red2(RB)
+    REAL(dp), SHARED :: gam, rn, cre(MAXE), cim(MAXE), dm(MAXE)
+    INTEGER, SHARED :: cvd
+    INTEGER :: s, k, n, ig, nq, tid, st, istat, m, ne, m0
+    REAL(dp) :: acc, acc2, rc
+    COMPLEX(dp) :: gv, wv, hv
+    tid = threadIdx%x
+    s = list(blockIdx%x)
+    k = (s - 1) / (nslot * npert) + 1
+    n = MOD(s - 1, nslot) + 1
+    nq = npwq(k)
+    m0 = nockq(k)
+    ne = MIN(MAXE, nbnd - m0)
+    acc = 0.0_dp
+    DO ig = tid, nq, blockDim%x
+      gv = g(ig, s)
+      acc = acc + hd(ig, n, k) * (REAL(gv, dp)**2 + AIMAG(gv)**2)
+    ENDDO
+    red(tid) = acc
+    CALL syncthreads()
+    st = blockDim%x / 2
+    DO WHILE (st > 0)
+      IF (tid <= st) red(tid) = red(tid) + red(tid + st)
+      CALL syncthreads()
+      st = st / 2
+    ENDDO
+    IF (tid == 1) THEN
+      rn = red(1)
+      istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
+      IF (first == 1) r0(s) = SQRT(rn)
+      IF (first == 1) THEN
+        nst(s) = 1
+      ELSE
+        nst(s) = nst(s) + 1
+      ENDIF
+      IF (SQRT(rn) < MAX(ethr, eta * r0(s))) THEN
+        conv(s) = 1
+        cvd = 1
+      ELSE
+        cvd = 0
+      ENDIF
+    ENDIF
+    CALL syncthreads()
+    IF (cvd == 1) RETURN
+    ! c_m = <evq_m | g>
+    DO m = 1, ne
+      acc = 0.0_dp
+      acc2 = 0.0_dp
+      DO ig = tid, nq, blockDim%x
+        wv = W(ig, nkb + m0 + m, k)
+        gv = g(ig, s)
+        acc = acc + REAL(wv, dp) * REAL(gv, dp) + AIMAG(wv) * AIMAG(gv)
+        acc2 = acc2 + REAL(wv, dp) * AIMAG(gv) - AIMAG(wv) * REAL(gv, dp)
+      ENDDO
+      red(tid) = acc
+      red2(tid) = acc2
+      CALL syncthreads()
+      st = blockDim%x / 2
+      DO WHILE (st > 0)
+        IF (tid <= st) THEN
+          red(tid) = red(tid) + red(tid + st)
+          red2(tid) = red2(tid) + red2(tid + st)
+        ENDIF
+        CALL syncthreads()
+        st = st / 2
+      ENDDO
+      IF (tid == 1) THEN
+        cre(m) = red(1)
+        cim(m) = red2(1)
+        dm(m) = MAX(etkq(m0 + m, k) - etk(n, k), dfloor)
+      ENDIF
+      CALL syncthreads()
+    ENDDO
+    IF (tid == 1) THEN
+      rc = rn
+      DO m = 1, ne
+        rc = rc + (cre(m)**2 + cim(m)**2) / dm(m)
+      ENDDO
+      IF (first == 1) THEN
+        gam = 0.0_dp
+      ELSE
+        gam = rc / rho(s)
+      ENDIF
+      rho(s) = rc
+      DO m = 1, ne
+        cre(m) = cre(m) / dm(m)
+        cim(m) = cim(m) / dm(m)
+      ENDDO
+    ENDIF
+    CALL syncthreads()
+    DO ig = tid, nq, blockDim%x
+      hv = g(ig, s) * hd(ig, n, k)
+      DO m = 1, ne
+        hv = hv + W(ig, nkb + m0 + m, k) * CMPLX(cre(m), cim(m), dp)
+      ENDDO
+      IF (first == 1) THEN
+        h(ig, s) = -hv
+      ELSE
+        h(ig, s) = -hv + gam * h(ig, s)
+      ENDIF
+    ENDDO
+  END SUBROUTINE k_check_defl
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_kter(ngrp, npert, nksq, nock, cnt, kter)
     ! kter_eff = kter_eff + DBLE(lbnd) / DBLE(nbnd_occ(ikk)), once per CG step of each solve
@@ -1201,6 +1322,9 @@ CONTAINS
     ALLOCATE(d_wg1(nslot, nksq), d_wgt(nksq), d_W(npwx, nproj, nksq))
     d_npw = h_npw; d_npwq = h_npwq; d_nock = h_nock; d_nockq = h_nockq
     d_idxk = h_idxk; d_idxkq = h_idxkq; d_g2 = h_g2; d_etk = h_etk; d_wwg = h_wwg; d_wg1 = h_wg1
+    IF (ALLOCATED(d_etkq)) DEALLOCATE(d_etkq)
+    ALLOCATE(d_etkq(nbnd, nksq))
+    d_etkq = h_etkq
     d_wgt = 2.0_dp * h_wk / omega
     d_W = h_W
     BLOCK
@@ -1471,8 +1595,14 @@ CONTAINS
     DO iter = 1, maxter
       first = 0
       IF (iter == 1) first = 1
-      CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
-           d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst)
+      IF (sth_defl > 0) THEN
+        CALL k_check_defl<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, &
+             d_rho, d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst, d_W, nproj, nkb, nbnd, d_nockq, d_etk, &
+             d_etkq, sth_dfloor)
+      ELSE
+        CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
+             d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst)
+      ENDIF
       CALL kerr('check')
       CALL k_kter<<<nblk(ngrp, TPB), TPB, 0, strm>>>(ngrp, npert, nksq, d_nock, d_cnt, d_kter)
       CALL kerr('kter')
@@ -1666,6 +1796,7 @@ CONTAINS
     IF (ALLOCATED(d_box2)) DEALLOCATE(d_box2)
     IF (ALLOCATED(d_evc)) DEALLOCATE(d_evc)
     IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
+    IF (ALLOCATED(d_etkq)) DEALLOCATE(d_etkq)
     IF (ALLOCATED(h_xh)) DEALLOCATE(h_xh)
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
