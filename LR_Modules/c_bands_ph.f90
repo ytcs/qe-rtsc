@@ -84,9 +84,6 @@ SUBROUTINE c_bands_nscf_ph( )
   ! ... For each k point (except those already calculated if restarting)
   ! ... diagonalizes the hamiltonian
   !
-  ! rtsc: rotated scf wavefunctions as Davidson starting vectors (RTSC_NSCF_ROT=1)
-  CALL nscf_start_prepare()
-  !
   ! rtsc: batched Davidson over all k on the GPU (RTSC_STH=1); the loop below handles the rest
   ALLOCATE(kdone(nks), kskip(nks))
   kdone(:) = .FALSE.
@@ -98,6 +95,9 @@ SUBROUTINE c_bands_nscf_ph( )
      ethr = ethr * symrot_tight()
      CALL symrot_plan(kdone, kskip)
   ENDIF
+  ! rtsc: rotated scf wavefunctions as Davidson starting vectors (RTSC_NSCF_ROT=1); with RTSC_NSCF_SYMROT, only
+  ! when some k-point is left to diagonalize (the start vectors are read from the scf restart files)
+  IF (.NOT. symrot .OR. ANY(.NOT. kdone .AND. .NOT. kskip)) CALL nscf_start_prepare()
   CALL nscf_batched_run(ik_, kdone, avg_iter, kskip)
   !
   ! rtsc: pass 1 diagonalizes what the batched run left (except the k-points waiting for a rotation);
