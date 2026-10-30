@@ -81,9 +81,13 @@ def child(jobs, jid, root, cid, cjob, nt, ne, cap):
 
 def main(jobs, jid, root, nt="8", ne="8"):
     root = str(Path(root).resolve())
+    jobs = str(Path(jobs).resolve())          # run_chain chdirs into the job directory
     job = json.loads(Path(jobs).read_text())[jid]
-    res = run_chain(jobs, jid, root, nt, ne)
     W = Path(root) / jid
+    if os.environ.get("T3A_POST_ONLY") and (W / "result.json").exists():
+        res = json.loads((W / "result.json").read_text())   # resume S1 / routing on a finished chain
+    else:
+        res = run_chain(jobs, jid, root, nt, ne)
     if res["status"] == "s1_rerelax":                    # S1: one re-relax along the unstable mode, then a rerun
         import s1
         stc, ncell = s1.displaced(W, res["relaxed"], res["s1"]["worst"])
