@@ -20,6 +20,20 @@
   CONTAINS
     !
     !--------------------------------------------------------------------------
+    LOGICAL FUNCTION b2w_gemm()
+    !--------------------------------------------------------------------------
+    !! rtsc epw3: RTSC_EPW_B2W=1 (ephbloch2wane step 2 by ZGEMM; groups/compute/EPW3-LOG.md)
+    LOGICAL, SAVE :: rd = .FALSE., on = .FALSE.
+    CHARACTER(LEN = 16) :: ev
+    IF (.NOT. rd) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_B2W', ev)
+      on = TRIM(ev) == '1'
+      rd = .TRUE.
+    ENDIF
+    b2w_gemm = on
+    END FUNCTION b2w_gemm
+    !
+    !--------------------------------------------------------------------------
     SUBROUTINE hambloch2wan(nbnd, nbndsub, nks, nkstot, et, xk, cu, &
        lwin, exband, nrr, irvec, wslen, chw)
     !--------------------------------------------------------------------------
@@ -1405,6 +1419,8 @@
     !!  e-p matrix, temporary
     COMPLEX(KIND = DP), ALLOCATABLE :: epmats(:, :, :, :)
     !!  e-p matrix  in smooth Bloch basis, coarse mesh
+    COMPLEX(KIND = DP), ALLOCATABLE :: cf(:, :)
+    !! rtsc epw3: e^{-i k R} / nkstot (RTSC_EPW_B2W)
     CHARACTER(LEN = 256) :: fnm
     !! Buffer file name
     !
@@ -1470,6 +1486,24 @@
     !
     CALL cryst_to_cart(nks, xk, at, -1)
     !
+    ! rtsc epw3 (RTSC_EPW_B2W=1; groups/compute/EPW3-LOG.md): the same sum as one ZGEMM per mode,
+    ! epmatw(:, :, :, imode) = epmats(:, :, :, imode) x cf(nks, nrr), and one reduction for all modes. Default off.
+    IF (b2w_gemm()) THEN
+      ALLOCATE(cf(nks, nrr), STAT = ierr)
+      IF (ierr /= 0) CALL errore('ephbloch2wane', 'Error allocating cf', 1)
+      DO ir = 1, nrr
+        DO ik = 1, nks
+          rdotk = twopi * DOT_PRODUCT(xk(:, ik), DBLE(irvec(:, ir)))
+          cf(ik, ir) = EXP(-ci * rdotk) / DBLE(nkstot)
+        ENDDO
+      ENDDO
+      DO imode = 1, nmodes
+        CALL ZGEMM('n', 'n', nbndsub * nbndsub, nrr, nks, cone, epmats(1, 1, 1, imode), nbndsub * nbndsub, &
+                   cf, nks, czero, epmatw(1, 1, 1, imode), nbndsub * nbndsub)
+      ENDDO
+      DEALLOCATE(cf)
+      CALL mp_sum(epmatw, inter_pool_comm)
+    ELSE
     DO imode = 1, nmodes
       DO ir = 1, nrr
         DO ik = 1, nks
@@ -1485,6 +1519,7 @@
     DO imode = 1, nmodes
       CALL mp_sum(epmatw(:, :, :, imode), inter_pool_comm)
     ENDDO
+    ENDIF ! rtsc epw3
     !
     ! bring xk back into cart coord
     !
@@ -1531,7 +1566,7 @@
     USE kinds,         ONLY : DP
     USE cell_base,     ONLY : at, bg, alat
     USE global_var,    ONLY : epmatwp, irg_start, irg_stop, irn_start, irn_stop
-    USE ep_constants,  ONLY : bohr2ang, twopi, ci, czero
+    USE ep_constants,  ONLY : bohr2ang, twopi, ci, czero, cone
     USE io_var,        ONLY : iuwanep, iuwane
     USE mp,            ONLY : mp_max
     USE mp_pools,      ONLY : inter_pool_comm
@@ -1592,6 +1627,12 @@
     INTEGER :: irn
     !! Global counter on the combined WS*mode index
 
+    INTEGER :: irg_lo, irg_hi
+    !! rtsc epw3: R_p range of one mode in this pool (RTSC_EPW_B2W)
+    INTEGER :: ld
+    !! rtsc epw3: leading dimension of epmatwe / epmatwp per mode slab
+    COMPLEX(KIND = DP), ALLOCATABLE :: cf(:, :)
+    !! rtsc epw3: e^{-i q R_p} / nq
     INTEGER :: imode
     !! Phonon mode index
     CHARACTER(LEN = 256) :: fnm
@@ -1610,6 +1651,28 @@
     !
     epmatwp = czero
     !
+    ! rtsc epw3 (RTSC_EPW_B2W=1): for each mode, the pool's R_p range in one ZGEMM over q,
+    ! epmatwp(:, :, :, imode, irg_lo:irg_hi) = epmatwe(:, :, :, imode, :) x cf(:, irg_lo:irg_hi)
+    IF (b2w_gemm()) THEN
+      ALLOCATE(cf(nq, irg_start:irg_stop))
+      DO irg = irg_start, irg_stop
+        DO iq = 1, nq
+          rdotk = twopi * DOT_PRODUCT(xk(:, iq), DBLE(irvec_g(:, irg)))
+          cf(iq, irg) = EXP(-ci * rdotk) / DBLE(nq)
+        ENDDO
+      ENDDO
+      ld = nbnd * nbnd * nrr_k * nmodes
+      DO imode = 1, nmodes
+        ! irg with (irg - 1) * nmodes + imode in [irn_start, irn_stop]
+        IF (irn_stop < imode) CYCLE
+        irg_lo = (irn_start - imode + nmodes - 1) / nmodes + 1
+        irg_hi = (irn_stop - imode) / nmodes + 1
+        IF (irg_hi < irg_lo) CYCLE
+        CALL ZGEMM('n', 'n', nbnd * nbnd * nrr_k, irg_hi - irg_lo + 1, nq, cone, epmatwe(1, 1, 1, imode, 1), ld, &
+                   cf(1, irg_lo), nq, czero, epmatwp(1, 1, 1, imode, irg_lo - irg_start + 1), ld)
+      ENDDO
+      DEALLOCATE(cf)
+    ELSE
     DO irn = irn_start, irn_stop
       !
       irg = (irn - 1) / nmodes + 1
@@ -1625,6 +1688,7 @@
         !
       ENDDO
     ENDDO
+    ENDIF ! rtsc epw3
     !
     tmp = 0.0_DP
     !

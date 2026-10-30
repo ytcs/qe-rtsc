@@ -19,6 +19,20 @@
   !
   CONTAINS
     !
+    !------------------------------------------------------------
+    LOGICAL FUNCTION rtsc_nowrite()
+    !------------------------------------------------------------
+    !! rtsc epw3: RTSC_EPW_NOWRITE=1 skips the epmatwp file and the .epb files (outputs this run never reads)
+    LOGICAL, SAVE :: rd = .FALSE., on = .FALSE.
+    CHARACTER(LEN = 16) :: ev
+    IF (.NOT. rd) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_NOWRITE', ev)
+      on = TRIM(ev) == '1'
+      rd = .TRUE.
+    ENDIF
+    rtsc_nowrite = on
+    END FUNCTION rtsc_nowrite
+    !
     !-----------------------------------------------------------------
     SUBROUTINE rwepmatw(epmatw, nbnd, np, nmodes, nrec, iun, iop)
     !-----------------------------------------------------------------
@@ -297,7 +311,9 @@
       !
     ENDIF ! meta_ionode
     !
-    IF (etf_mem == 0) THEN
+    ! rtsc epw3 (RTSC_EPW_NOWRITE=1; groups/compute/EPW3-LOG.md): etf_mem = 0 keeps epmatwp in memory and this run
+    ! never reads the file back, so its write (~10 GB at frozen B2) is skipped
+    IF (etf_mem == 0 .AND. .NOT. rtsc_nowrite()) THEN
       filint   = TRIM(tmp_dir) // TRIM(prefix)//'.epmatwp'
       IF (TRIM(lsda) == 'down') filint = TRIM(tmp_dir) // TRIM(prefix) //'.down.epmatwp'
       !

@@ -76,13 +76,14 @@
   USE kfold,         ONLY : createkmap_pw2, createkmap
   USE low_lvl,       ONLY : set_ndnmbr, eqvect_strict, copy_sym_epw, fix_sym
   USE ph_restart,    ONLY : read_disp_pattern_only
-  USE io,            ONLY : read_ifc_epw, readgmap, dynmat_asr, loadumat, readdnsbare
+  USE io,            ONLY : read_ifc_epw, readgmap, dynmat_asr, loadumat, readdnsbare, rtsc_nowrite
   USE parallelism,   ONLY : poolgather
   USE symmetry,      ONLY : rotate_epmat, rotate_eigenm, star_q2, gmap_sym, &
                             setup_rotate_wavefunction, write_qmap,          &
                             calc_rotation_gauge, rotate_wfn_deallocate
   USE pw2wan,        ONLY : compute_pmn_para
-  USE ep_coarse,     ONLY : ep_coarse_compute, dvscf_read, ep_coarse_gpu_ok
+  USE ep_coarse,     ONLY : ep_coarse_compute, dvscf_read, ep_coarse_gpu_ok, star_enabled, star_begin, &
+                            star_store, star_end, star_lazy
   USE noncollin_module, ONLY : m_loc, npol, noncolin, lspinorb, nspin_mag
   USE ldaU,          ONLY : lda_plus_u, Hubbard_lmax, lda_plus_u_kind
   USE ldaU_ph,       ONLY : dnsbare
@@ -1030,11 +1031,18 @@
           ! the irrep split), so the per-k work (wfc read, projectors, FFTs) is done once per q
           ALLOCATE(dvscfins(dffts%nnr, nspin_mag, 3 * nat), STAT = ierr)
           IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating dvscfins', 1)
-          CALL dvscf_read(0, iq_irr, nqc_irr, 3 * nat, xq0, dvscfins, timerev)
+          ! rtsc epw3 (RTSC_EPW_STAR=1): members after the first use the first one's g (ep_coarse.f90 header);
+          ! their dvscf is read only if some k needs the direct form (star_lazy)
+          IF (star_enabled()) CALL star_begin(iq == 1, iq > 1, iq_irr, nqc_irr)
+          IF (.NOT. star_lazy()) CALL dvscf_read(0, iq_irr, nqc_irr, 3 * nat, xq0, dvscfins, timerev)
           CALL start_clock('ep_coarse_c')
           CALL ep_coarse_compute(nirr, 3 * nat, 0, dvscfins, gmapsym(:, isym1), eigv(:, isym1), &
                                  isym, xq0, nqc, el_ph_mat, epmatq, timerev)
           CALL stop_clock('ep_coarse_c')
+          IF (star_enabled()) THEN
+            CALL star_end()
+            IF (iq == 1 .AND. isym == 1) CALL star_store(el_ph_mat, 3 * nat)
+          ENDIF
           DEALLOCATE(dvscfins, STAT = ierr)
           IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error deallocating dvscfins', 1)
         ELSE
@@ -1333,7 +1341,8 @@
         WRITE(stdout, '(/5x, "The .epb files have been correctly read"/)')
       ENDIF
       !
-      IF (epbwrite) THEN
+      ! rtsc epw3: RTSC_EPW_NOWRITE=1 skips the .epb restart files (never read in this run)
+      IF (epbwrite .AND. .NOT. rtsc_nowrite()) THEN
         OPEN(iuepb, FILE = tempfile, FORM = 'unformatted')
         WRITE(stdout, '(/5x, "Writing epmatq on .epb files"/)')
         WRITE(iuepb) nqc, xqc, et_loc, dynq, epmatq, zstar, epsi

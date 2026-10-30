@@ -30,6 +30,10 @@ MODULE sth_nscf_symrot
   IMPLICIT NONE
   PRIVATE
   PUBLIC :: symrot_on, symrot_plan, symrot_after_solve, symrot_report, symrot_tight, symrot_check_on, symrot_resid
+  ! rtsc epw3 (RTSC_PW_SYMROT=1; groups/compute/EPW3-LOG.md): the same rotation in pw.x's nscf (c_bands_nscf), the
+  ! Wannier k grid read by EPW. The module lives in PW/src so that both pw.x and ph.x use it.
+  PUBLIC :: symrot_pw_on, symrot_pw_tight, symrot_pw_check_on, symrot_note_notconv, symrot_rep_guard
+  INTEGER, SAVE :: last_notconv = 0, nbadrep = 0
   !
   ! cache of representatives (persists across q)
   INTEGER, SAVE :: nc = 0, ncmax = 0, npwc = 0, nbc = 0
@@ -81,6 +85,70 @@ CONTAINS
     IF (okvan) RETURN   ! NC only (the overlap S = 1 is assumed in the residual check; USPP untested)
     symrot_on = .TRUE.
   END FUNCTION symrot_on
+  !
+  SUBROUTINE symrot_note_notconv(n)
+    !! diag_bands reports its count of unconverged eigenvalues (stored only; no effect on the eigensolve)
+    INTEGER, INTENT(IN) :: n
+    last_notconv = n
+  END SUBROUTINE symrot_note_notconv
+  !
+  LOGICAL FUNCTION symrot_rep_guard(ik)
+    !! RTSC_PW_SYMROT: a representative whose eigensolve left unconverged eigenvalues is not a rotation source;
+    !! the k-points waiting for it are diagonalized themselves (as the switch-off build does for every k).
+    !! .TRUE. = ik was such a representative (the caller re-diagonalizes it at pw.x's own ethr)
+    USE io_global, ONLY : stdout
+    INTEGER, INTENT(IN) :: ik
+    symrot_rep_guard = .FALSE.
+    IF (last_notconv > 0 .AND. ALLOCATED(kind_)) THEN
+      IF (kind_(ik) == 2) THEN
+        kind_(ik) = 0
+        nbadrep = nbadrep + 1
+        symrot_rep_guard = .TRUE.
+        WRITE(stdout, '(5x,"rtsc nscf symrot: representative ",I0," has ",I0, &
+             &" unconverged eigenvalues: its orbit is diagonalized instead (",I0," such reps)")') ik, last_notconv, nbadrep
+      ENDIF
+    ENDIF
+    last_notconv = 0
+  END FUNCTION symrot_rep_guard
+  !
+  LOGICAL FUNCTION symrot_pw_on()
+    !! RTSC_PW_SYMROT=1, with the same declines as RTSC_NSCF_SYMROT
+    CHARACTER(LEN=16) :: s
+    INTEGER :: ios
+    symrot_pw_on = .FALSE.
+    CALL get_environment_variable('RTSC_PW_SYMROT', s, STATUS=ios)
+    IF (.NOT. (ios == 0 .AND. TRIM(s) == '1')) RETURN
+    symrot_pw_on = symrot_ok()
+  END FUNCTION symrot_pw_on
+  !
+  LOGICAL FUNCTION symrot_ok()
+    USE noncollin_module, ONLY : noncolin
+    USE control_flags,    ONLY : gamma_only
+    USE lsda_mod,         ONLY : lsda
+    USE mp_bands,         ONLY : nproc_bgrp
+    USE mp_pools,         ONLY : npool
+    USE ldaU,             ONLY : lda_plus_u
+    USE uspp,             ONLY : okvan
+    symrot_ok = .NOT. (noncolin .OR. gamma_only .OR. lsda .OR. nproc_bgrp /= 1 .OR. npool /= 1 .OR. lda_plus_u &
+                       .OR. okvan)
+  END FUNCTION symrot_ok
+  !
+  REAL(DP) FUNCTION symrot_pw_tight()
+    !! RTSC_PW_SYMROT_TIGHT: factor on pw.x's nscf ethr for the representatives (default 1: pw.x's own ethr)
+    CHARACTER(LEN=32) :: s
+    INTEGER :: ios
+    symrot_pw_tight = 1.0_DP
+    CALL get_environment_variable('RTSC_PW_SYMROT_TIGHT', s, STATUS=ios)
+    IF (ios == 0 .AND. LEN_TRIM(s) > 0) READ(s, *, IOSTAT=ios) symrot_pw_tight
+    IF (ios /= 0 .OR. symrot_pw_tight <= 0) symrot_pw_tight = 1.0_DP
+  END FUNCTION symrot_pw_tight
+  !
+  LOGICAL FUNCTION symrot_pw_check_on()
+    CHARACTER(LEN=16) :: s
+    INTEGER :: ios
+    CALL get_environment_variable('RTSC_PW_SYMROT_CHECK', s, STATUS=ios)
+    symrot_pw_check_on = (ios == 0 .AND. TRIM(s) == '1')
+  END FUNCTION symrot_pw_check_on
   !
   REAL(DP) FUNCTION symrot_tight()
     CHARACTER(LEN=32) :: s

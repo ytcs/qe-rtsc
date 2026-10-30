@@ -19,6 +19,47 @@
   !
   CONTAINS
     !
+    !-----------------------------------------------------------------------
+    LOGICAL FUNCTION rtsc_idlewait()
+    !-----------------------------------------------------------------------
+    !! rtsc epw3: RTSC_EPW_IDLEWAIT=1
+    LOGICAL, SAVE :: rd = .FALSE., on = .FALSE.
+    CHARACTER(LEN = 16) :: ev
+    IF (.NOT. rd) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_IDLEWAIT', ev)
+      on = TRIM(ev) == '1'
+      rd = .TRUE.
+    ENDIF
+    rtsc_idlewait = on
+    END FUNCTION rtsc_idlewait
+    !
+    !-----------------------------------------------------------------------
+    SUBROUTINE rtsc_sleepy_barrier(comm)
+    !-----------------------------------------------------------------------
+    !! rtsc epw3: a barrier whose waiting ranks sleep 0.5 ms between tests (no arithmetic, no data)
+    USE iso_c_binding, ONLY : c_int
+#if defined(__MPI)
+    USE parallel_include
+#endif
+    INTEGER, INTENT(IN) :: comm
+#if defined(__MPI)
+    INTERFACE
+      INTEGER(c_int) FUNCTION usleep(us) BIND(C, name = 'usleep')
+        IMPORT :: c_int
+        INTEGER(c_int), VALUE :: us
+      END FUNCTION usleep
+    END INTERFACE
+    INTEGER :: req, ierr, rc
+    LOGICAL :: done
+    CALL MPI_Ibarrier(comm, req, ierr)
+    DO
+      CALL MPI_Test(req, done, MPI_STATUS_IGNORE, ierr)
+      IF (done) EXIT
+      rc = usleep(500_c_int)
+    ENDDO
+#endif
+    END SUBROUTINE rtsc_sleepy_barrier
+    !
     !------------------------------------------------------------------------
     SUBROUTINE pw2wan90epw
     !------------------------------------------------------------------------
@@ -891,6 +932,9 @@
                        wann_spreads, spreads)                      ! output
     ENDIF
     !
+    ! rtsc epw3 (RTSC_EPW_IDLEWAIT=1; groups/compute/EPW3-LOG.md): the ranks that wait for wannier90 sleep
+    ! instead of busy-polling in mp_bcast, so the wannier90 threads on the ionode get the cores
+    IF (rtsc_idlewait()) CALL rtsc_sleepy_barrier(world_comm)
     CALL mp_bcast(u_mat,        meta_ionode_id, world_comm)
     CALL mp_bcast(u_mat_opt,    meta_ionode_id, world_comm)
     CALL mp_bcast(lwindow,      meta_ionode_id, world_comm)

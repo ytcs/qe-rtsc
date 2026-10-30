@@ -190,6 +190,7 @@ SUBROUTINE diag_bands( iter, ik, avg_iter )
   !!                                (complex Hamiltonian);
   !! * \(\textrm{test_exit_cond}\)(): the test on the iterative diagonalization.
   !
+  USE sth_nscf_symrot,      ONLY : symrot_note_notconv
   USE kinds,                ONLY : DP
   USE buffers,              ONLY : get_buffer
   USE io_global,            ONLY : stdout
@@ -328,6 +329,7 @@ SUBROUTINE diag_bands( iter, ik, avg_iter )
      WRITE( stdout, '(5X,"c_bands: ",I2, " eigenvalues not converged")' ) notconv
      !
   ENDIF
+  CALL symrot_note_notconv( notconv )   ! rtsc epw3: stored for RTSC_PW_SYMROT's guard only
   !
   RETURN
   !
@@ -894,6 +896,8 @@ SUBROUTINE c_bands_nscf( )
   USE mp,                   ONLY : mp_sum
   USE check_stop,           ONLY : check_stop_now
   USE uspp_init,            ONLY : init_us_2
+  USE sth_nscf_symrot,      ONLY : symrot_pw_on, symrot_pw_tight, symrot_pw_check_on, symrot_plan, &
+                                   symrot_after_solve, symrot_resid, symrot_rep_guard
   IMPLICIT NONE
   !
   ! ... local variables
@@ -904,6 +908,11 @@ SUBROUTINE c_bands_nscf( )
   ! ik_: k-point already done in a previous run
   ! ik : counter on k points
   LOGICAL :: exst
+  ! rtsc epw3: RTSC_PW_SYMROT (k-points rotated from an orbit representative instead of diagonalized)
+  LOGICAL :: symrot
+  LOGICAL, ALLOCATABLE :: kdone(:), kskip(:)
+  INTEGER :: ipass
+  REAL(DP) :: ethr_save
   !
   REAL(DP), EXTERNAL :: get_clock
   !
@@ -937,7 +946,31 @@ SUBROUTINE c_bands_nscf( )
   ! ... For each k point (except those already calculated if restarting)
   ! ... diagonalizes the hamiltonian
   !
+  ! rtsc epw3 (RTSC_PW_SYMROT=1, groups/compute/EPW3-LOG.md): one representative per orbit is diagonalized
+  ! (pass 1), every other k-point is an exact G-space rotation of it (symrot_after_solve); pass 2 diagonalizes
+  ! any k-point whose rotation could not be done. Off: the vanilla single pass.
+  symrot = .FALSE.
+  IF (ik_ == 0 .AND. TRIM(starting_wfc) /= 'file') symrot = symrot_pw_on()
+  ethr_save = ethr
+  IF (symrot) THEN
+     ALLOCATE(kdone(nks), kskip(nks))
+     kdone(:) = .FALSE.
+     kskip(:) = .FALSE.
+     ethr = ethr * symrot_pw_tight()
+     CALL symrot_plan(kdone, kskip)
+  ENDIF
+  pass_loop: DO ipass = 1, 2
+  IF (ipass == 2) THEN
+     IF (.NOT. symrot) EXIT pass_loop
+     CALL symrot_after_solve(kdone, kskip)
+     ! fallbacks (and representatives rejected by the guard) at pw.x's own ethr, as the switch-off build
+     ethr = ethr_save
+  ENDIF
   k_loop: DO ik = ik_+1, nks
+     !
+     IF (symrot) THEN
+        IF (kdone(ik) .OR. kskip(ik)) CYCLE
+     ENDIF
      !
      ! ... Set k-point, spin, kinetic energy, needed by Hpsi
      !
@@ -986,6 +1019,11 @@ SUBROUTINE c_bands_nscf( )
      ! ... save wave-functions (unless disabled in input)
      !
      IF ( io_level > -1 ) CALL save_buffer( evc, nwordwfc, iunwfc, ik )
+     IF (symrot) THEN
+        kdone(ik) = .TRUE.
+        ! a rejected representative is diagonalized again in pass 2 at pw.x's own ethr
+        IF (ipass == 1 .AND. symrot_rep_guard(ik)) kdone(ik) = .FALSE.
+     ENDIF
      !
      ! ... beware: with pools, if the number of k-points on different
      ! ... pools differs, make sure that all processors are still in
@@ -1012,6 +1050,13 @@ SUBROUTINE c_bands_nscf( )
      ENDIF
      !
   ENDDO k_loop
+  END DO pass_loop
+  !
+  IF (symrot) THEN
+     ethr = ethr_save
+     IF (symrot_pw_check_on()) CALL symrot_resid()
+     DEALLOCATE(kdone, kskip)
+  ENDIF
   !
   CALL mp_sum( avg_iter, inter_pool_comm )
   avg_iter = avg_iter / nkstot
