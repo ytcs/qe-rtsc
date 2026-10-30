@@ -12,6 +12,9 @@ cp "$IN"/*.in .
 PSEUDO_DIR=$(realpath "${PSEUDO_DIR:-$HERE/../pseudo/sg15}")
 sed -i "s|@PSEUDO@|$PSEUDO_DIR|" *.in
 export RTSC_STH=1 RTSC_STRICT=1   # strict: an engine decline stops ph.x (no silent vanilla path)
+# kernel branch (groups/compute/KERNEL-LOG.md): dV_bare psi built in the engine (class E, gated on the B1/B2 smoke
+# chains), and wannier90's disentanglement over NE OpenMP threads on EPW's ionode (bitwise identical)
+export RTSC_STH_DVB=${RTSC_STH_DVB:-1} RTSC_W90_NT=${RTSC_W90_NT:-$NE}
 prefix=$(grep -oP "prefix\s*=\s*'\K[^']+" scf.in)
 : > timings.tsv
 stage() { local name=$1; shift; local t0=$(date +%s.%N); "$@"; local t1=$(date +%s.%N)
