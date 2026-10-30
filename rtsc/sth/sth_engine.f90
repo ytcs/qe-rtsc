@@ -35,7 +35,7 @@ MODULE sth_engine
   INTEGER, PARAMETER :: RB = 256       ! max threads per block, per-column reductions (power of 2)
   INTEGER, PARAMETER :: MAXPERT = 6
   INTEGER, PARAMETER :: MAXPLAN = 12
-  INTEGER, PARAMETER :: MAXE = 16      ! RTSC_STH_DEFL: at most this many known empty bands per k   ! FFT batch sizes 2**0 .. 2**(MAXPLAN-1)
+  INTEGER, PARAMETER :: MAXE = 64      ! RTSC_STH_DEFL: at most this many known empty bands per k   ! FFT batch sizes 2**0 .. 2**(MAXPLAN-1)
   INTEGER, PARAMETER :: maxter = 400   ! as cgsolve_all
   !
   PUBLIC :: sth_engine_init, sth_engine_set_global, sth_engine_set_k, sth_engine_set_dvbare, &
