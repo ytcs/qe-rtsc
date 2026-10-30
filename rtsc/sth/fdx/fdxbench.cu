@@ -24,6 +24,7 @@ extern "C" {
 int fdx_setup(const int*, const int*, int, int, const int*, const int*, int);
 void fdx_info(int*, int*, int*);
 void fdx_occupancy(int, int*);
+
 int fdx_local_d(const void*, void*, const int*, int, int, int, int, int, int, const double*, const int*,
                 const double*, const double*, double, cudaStream_t);
 int fdx_local_s(const void*, void*, const int*, int, int, int, int, int, int, const float*, const int*, const float*,
@@ -36,6 +37,9 @@ void pfw_local_s(const void*, void*, const int*, int, int, int, int, int, int, c
                  const double*, float, cudaStream_t);
 }
 
+#ifdef FDX_EMU
+extern "C" void fdx_set_emu(int);
+#endif
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { printf("CUDA %s at %d\n", cudaGetErrorString(e_), __LINE__); exit(1); } } while (0)
 
 template <class T> struct C2 { T x, y; };
@@ -276,6 +280,9 @@ int main(int argc, char** argv) {
   int nst = 0, nxa = 0, pc = 0;
   int ier = fdx_setup(G.n, G.n, G.nksq, G.npwx, G.npwq.data(), G.idx.data(), 1024);
   if (ier) { printf("fdx_setup ierr %d\n", ier); return 1; }
+#ifdef FDX_EMU
+  if (getenv("FDX_EMU")) { fdx_set_emu(atoi(getenv("FDX_EMU"))); printf("FP32 instance emulates mode %s (1 TF32 dense DFT, 2 FP16, 3 BF16)\n", getenv("FDX_EMU")); }
+#endif
   fdx_info(&nst, &nxa, &pc);
   int nsph = 0;
   for (int k = 0; k < G.nksq; k++) nsph += G.npwq[k];

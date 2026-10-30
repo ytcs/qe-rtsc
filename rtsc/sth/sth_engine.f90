@@ -1868,7 +1868,7 @@ CONTAINS
       d2 = d2 + SUM(ABS(a(:, c) - b(:, c))**2); y2 = y2 + SUM(ABS(a(:, c))**2)
     ENDDO
     IF (ymax > 0.0_dp) THEN
-      WRITE(*, '(A,A,I8,A,ES10.3,A,ES10.3)') '     rtsc ', MERGE('fftdx', 'pfft ', use_f), ' check: columns', nl, &
+      WRITE(*, '(A,A,A,I8,A,ES10.3,A,ES10.3)') '     rtsc ', MERGE('fftdx', 'pfft ', use_f), ' check: columns', nl, &
            ', max|dy|/max|y| ', dmax / ymax, &
            ', rel L2 ', SQRT(d2 / y2)
       pfft_checked = .TRUE.     ! (a zero input, e.g. dpsi = 0 at the first iteration, is not a test)

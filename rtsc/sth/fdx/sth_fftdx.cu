@@ -18,6 +18,8 @@
 //   fdx_setup(nr, nrx, nksq, npwx, npwq, idxkq, chunk) -> 0 ok, > 0 unsupported
 //   fdx_local_d / fdx_local_s (device pointers, Fortran 1-based list/idx contents), fdx_free, fdx_info
 #include <cufftdx.hpp>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +42,22 @@ template <class T> __device__ __forceinline__ cplx<T> cmul(cplx<T> a, cplx<T> b)
 // ---------------------------------------------------------------------------------------------------------------
 // 1D line FFT in registers, natural order in and out, unnormalised. INV = exp(+i...) (cuFFT inverse).
 // ---------------------------------------------------------------------------------------------------------------
+#ifdef FDX_EMU
+// Harness-only precision emulation of the FP32 instance (FFT-LOG scope items 2 and 3): d_emu = 1: each 1D transform
+// is a dense DFT with TF32-rounded operands (inputs and DFT matrix) and FP32 accumulation, as a TF32 tensor-core GEMM
+// would do it; 2 / 3: native FFT, data rounded to FP16 / BF16 at every transform input and output (storage in half
+// precision with ideal scaling; FP32 arithmetic, so a lower bound on the error of a real half-precision FFT).
+__device__ int d_emu = 0;
+__constant__ double c_twE[540][2];
+__device__ __forceinline__ float tf32r(float f) {
+  unsigned u = __float_as_uint(f); u += 0x1000u; u &= 0xFFFFE000u; return __uint_as_float(u);
+}
+__device__ __forceinline__ float rnd_emu(float f, int m) {
+  if (m == 2) return __half2float(__float2half_rn(f));
+  if (m == 3) return __bfloat162float(__float2bfloat16_rn(f));
+  return f;
+}
+#endif
 template <class T, int N, bool INV> struct Line {
   using FFT = decltype(cufftdx::Size<N>() + cufftdx::Precision<T>() + cufftdx::Type<cufftdx::fft_type::c2c>() +
                        cufftdx::Direction<INV ? cufftdx::fft_direction::inverse : cufftdx::fft_direction::forward>() +
@@ -47,6 +65,37 @@ template <class T, int N, bool INV> struct Line {
   using V = typename FFT::value_type;
   static_assert(FFT::storage_size == N, "thread FFT storage must equal N");
   __device__ __forceinline__ static void run(cplx<T> (&v)[N]) {
+#ifdef FDX_EMU
+    if constexpr (sizeof(T) == 4) {
+      const int m = d_emu;
+      if (m == 1) {
+        static_assert(540 % N == 0, "emulation table");
+        cplx<T> in[N];
+#pragma unroll
+        for (int j = 0; j < N; j++) in[j] = {tf32r(v[j].x), tf32r(v[j].y)};
+        for (int k = 0; k < N; k++) {
+          float ax = 0, ay = 0;
+#pragma unroll
+          for (int j = 0; j < N; j++) {
+            int e = (j * k) % N;
+            float wx = tf32r((float)c_twE[e * (540 / N)][0]), wy = tf32r((float)c_twE[e * (540 / N)][1]);
+            if (!INV) wy = -wy;
+            ax += in[j].x * wx - in[j].y * wy; ay += in[j].x * wy + in[j].y * wx;
+          }
+          v[k] = {ax, ay};   // dynamic index: local memory, acceptable for an accuracy-only mode
+        }
+        return;
+      }
+      if (m >= 2) {
+#pragma unroll
+        for (int j = 0; j < N; j++) v[j] = {rnd_emu(v[j].x, m), rnd_emu(v[j].y, m)};
+        FFT().execute(reinterpret_cast<V*>(&v[0]));
+#pragma unroll
+        for (int j = 0; j < N; j++) v[j] = {rnd_emu(v[j].x, m), rnd_emu(v[j].y, m)};
+        return;
+      }
+    }
+#endif
     V* p = reinterpret_cast<V*>(&v[0]);
     FFT().execute(p);
   }
@@ -456,6 +505,15 @@ int fdx_local_s(const void* x, void* y, const int* list, int nl, int nslot, int 
   return dispatch<float, float>((const cplx<float>*)x, (cplx<float>*)y, list, nl, nslot, npert, npwx, nbnd, vrs, npwq,
                                 g2, etk, scale, st);
 }
+
+#ifdef FDX_EMU
+void fdx_set_emu(int m) {
+  static double t[540][2];
+  for (int i = 0; i < 540; i++) { t[i][0] = cos(2 * M_PI * i / 540); t[i][1] = sin(2 * M_PI * i / 540); }
+  cudaMemcpyToSymbol(c_twE, t, sizeof(t));
+  cudaMemcpyToSymbol(d_emu, &m, sizeof(int));
+}
+#endif
 
 // occupancy: out[0..5] = (warps/SM, regs) of kz_inv, kxy, kz_fwd for the current grid; prec 8 or 4
 void fdx_occupancy(int prec, int out[6]) {
