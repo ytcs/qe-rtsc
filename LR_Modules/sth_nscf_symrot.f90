@@ -55,6 +55,10 @@ MODULE sth_nscf_symrot
   TYPE(htab), SAVE :: tc, tl
   REAL(DP), SAVE :: t_plan = 0, t_after = 0
   LOGICAL, SAVE :: prefer_ft = .FALSE., rev_ops = .FALSE.
+  ! the full crystal group, captured once: ph.x reorders symm_base's s/ft at every q (copy_sym puts the small group
+  ! of q first), so op indices stored in the cache must refer to this fixed copy
+  INTEGER, SAVE :: sr(3, 3, 48), nsr = 0
+  REAL(DP), SAVE :: ftr(3, 48)
   INTEGER, SAVE :: nft = 0     ! rotations that used an op with a fractional translation (cumulative)
   !
 CONTAINS
@@ -105,7 +109,7 @@ CONTAINS
   !
   LOGICAL FUNCTION find_op(xs, xt, isym, tr, g0)
     !! xt = tr S xs + g0 for some op of the full crystal group (and time reversal)?
-    USE symm_base, ONLY : s, nsym, time_reversal
+    USE symm_base, ONLY : time_reversal
     REAL(DP), INTENT(IN) :: xs(3), xt(3)
     INTEGER, INTENT(OUT) :: isym, tr, g0(3)
     INTEGER :: is, itr, j
@@ -114,9 +118,9 @@ CONTAINS
     DO itr = 1, 2
       tr = 3 - 2 * itr
       IF (tr == -1 .AND. .NOT. time_reversal) EXIT
-      DO is = 1, nsym
+      DO is = 1, nsr
         DO j = 1, 3
-          kr(j) = tr * (s(j, 1, is) * xs(1) + s(j, 2, is) * xs(2) + s(j, 3, is) * xs(3))
+          kr(j) = tr * (sr(j, 1, is) * xs(1) + sr(j, 2, is) * xs(2) + sr(j, 3, is) * xs(3))
         ENDDO
         d = xt - kr
         IF (ALL(ABS(d - NINT(d)) < 1.d-6)) THEN
@@ -149,14 +153,13 @@ CONTAINS
   LOGICAL FUNCTION map_ok(ngs, ms, ik, isym, tr, g0)
     !! does the source sphere (ngs Miller indices ms) map exactly onto the k+G list of ik? (pos set for ik)
     USE klist,     ONLY : ngk
-    USE symm_base, ONLY : s
     INTEGER, INTENT(IN) :: ngs, ms(3, ngs), ik, isym, tr, g0(3)
     INTEGER :: ig, j, mr(3), ir
     map_ok = .FALSE.
     IF (ngs /= ngk(ik)) RETURN
     DO ig = 1, ngs
       DO j = 1, 3
-        mr(j) = tr * (s(j, 1, isym) * ms(1, ig) + s(j, 2, isym) * ms(2, ig) + s(j, 3, isym) * ms(3, ig)) - g0(j)
+        mr(j) = tr * (sr(j, 1, isym) * ms(1, ig) + sr(j, 2, isym) * ms(2, ig) + sr(j, 3, isym) * ms(3, ig)) - g0(j)
       ENDDO
       ir = pos(lin(mr))
       IF (ir == 0) RETURN
@@ -167,7 +170,6 @@ CONTAINS
   SUBROUTINE rotate(ngs, ms, xs, ws, ik, isym, tr, g0, evc)
     !! evc(:, 1:nbnd) of ik from the source (Miller ms, crystal k xs, coefficients ws); pos set for ik
     USE wvfct,     ONLY : nbnd, npwx
-    USE symm_base, ONLY : s, ft
     USE constants, ONLY : tpi
     INTEGER, INTENT(IN) :: ngs, ms(3, ngs), ik, isym, tr, g0(3)
     REAL(DP), INTENT(IN) :: xs(3)
@@ -178,18 +180,18 @@ CONTAINS
     LOGICAL :: hasft
     INTEGER, ALLOCATABLE :: imap(:)
     COMPLEX(DP), ALLOCATABLE :: ph(:)
-    hasft = ANY(ABS(ft(:, isym)) > 1.d-12)
+    hasft = ANY(ABS(ftr(:, isym)) > 1.d-12)
     IF (hasft) nft = nft + 1
     ALLOCATE(imap(ngs))
     IF (hasft) ALLOCATE(ph(ngs))
     DO ig = 1, ngs
       DO j = 1, 3
-        mr(j) = tr * (s(j, 1, isym) * ms(1, ig) + s(j, 2, isym) * ms(2, ig) + s(j, 3, isym) * ms(3, ig)) - g0(j)
+        mr(j) = tr * (sr(j, 1, isym) * ms(1, ig) + sr(j, 2, isym) * ms(2, ig) + sr(j, 3, isym) * ms(3, ig)) - g0(j)
       ENDDO
       imap(ig) = pos(lin(mr))
       IF (hasft) THEN
-        arg = tpi * ((xs(1) + ms(1, ig)) * ft(1, isym) + (xs(2) + ms(2, ig)) * ft(2, isym) + &
-                     (xs(3) + ms(3, ig)) * ft(3, isym))
+        arg = tpi * ((xs(1) + ms(1, ig)) * ftr(1, isym) + (xs(2) + ms(2, ig)) * ftr(2, isym) + &
+                     (xs(3) + ms(3, ig)) * ftr(3, isym))
         ph(ig) = CMPLX(COS(arg), -SIN(arg), KIND=DP)
       ENDIF
     ENDDO
@@ -295,7 +297,7 @@ CONTAINS
   !
   SUBROUTINE h_images(t, xs, id)
     !! insert every image tr S xs of source id
-    USE symm_base, ONLY : s, nsym, time_reversal, ft
+    USE symm_base, ONLY : time_reversal
     TYPE(htab), INTENT(INOUT) :: t
     REAL(DP), INTENT(IN) :: xs(3)
     INTEGER, INTENT(IN) :: id
@@ -309,19 +311,19 @@ CONTAINS
     DO itr = 1, 2
       tr = 3 - 2 * itr
       IF (tr == -1 .AND. .NOT. time_reversal) EXIT
-      DO js = 1, nsym
+      DO js = 1, nsr
         ! RTSC_NSCF_SYMROT_REVOPS=1 (diagnostic): reversed op order, so images with a non-trivial stabilizer are
         ! reached by another op (a pure gauge change of the rotated set)
         is = js
-        IF (rev_ops) is = nsym + 1 - js
-        hasft = ANY(ABS(ft(:, is)) > 1.d-12)
+        IF (rev_ops) is = nsr + 1 - js
+        hasft = ANY(ABS(ftr(:, is)) > 1.d-12)
         IF (prefer_ft) THEN
           IF ((ipass == 1) .NEQV. hasft) CYCLE
         ELSE
           IF (ipass == 2) CYCLE
         ENDIF
         DO j = 1, 3
-          kr(j) = tr * (s(j, 1, is) * xs(1) + s(j, 2, is) * xs(2) + s(j, 3, is) * xs(3))
+          kr(j) = tr * (sr(j, 1, is) * xs(1) + sr(j, 2, is) * xs(2) + sr(j, 3, is) * xs(3))
         ENDDO
         IF (hkey(kr, key)) CALL h_put(t, key, id, is, tr)
       ENDDO
@@ -330,14 +332,13 @@ CONTAINS
   END SUBROUTINE h_images
   !
   LOGICAL FUNCTION g0_of(xs, xt, isym, tr, g0)
-    USE symm_base, ONLY : s
     REAL(DP), INTENT(IN) :: xs(3), xt(3)
     INTEGER, INTENT(IN) :: isym, tr
     INTEGER, INTENT(OUT) :: g0(3)
     REAL(DP) :: d(3)
     INTEGER :: j
     DO j = 1, 3
-      d(j) = xt(j) - tr * (s(j, 1, isym) * xs(1) + s(j, 2, isym) * xs(2) + s(j, 3, isym) * xs(3))
+      d(j) = xt(j) - tr * (sr(j, 1, isym) * xs(1) + sr(j, 2, isym) * xs(2) + sr(j, 3, isym) * xs(3))
     ENDDO
     g0 = NINT(d)
     g0_of = ALL(ABS(d - g0) < 1.d-6)
@@ -359,6 +360,7 @@ CONTAINS
     USE gvect,     ONLY : mill
     USE klist,     ONLY : igk_k
     USE io_global, ONLY : stdout
+    USE symm_base, ONLY : s_cur => s, ft_cur => ft, nsym_cur => nsym
     LOGICAL, INTENT(INOUT) :: kdone(nks), kskip(nks)
     INTEGER :: ik, i0, isym, tr, g0(3), jk, i1, j1
     REAL(DP) :: xt(3), xs(3)
@@ -376,6 +378,9 @@ CONTAINS
       CALL h_reset(tc)
       CALL get_environment_variable('RTSC_NSCF_SYMROT_PREFER_FT', sv, STATUS=ios)
       prefer_ft = (ios == 0 .AND. TRIM(sv) == '1')
+      nsr = nsym_cur
+      sr(:, :, 1:nsr) = s_cur(:, :, 1:nsr)
+      ftr(:, 1:nsr) = ft_cur(:, 1:nsr)
       CALL get_environment_variable('RTSC_NSCF_SYMROT_REVOPS', sv, STATUS=ios)
       rev_ops = (ios == 0 .AND. TRIM(sv) == '1')
     ENDIF
