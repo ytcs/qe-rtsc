@@ -6,6 +6,8 @@ jobs.json: {id: {structure: pymatgen dict, Ttarget: K, press_kbar?: float}}.
 Writes <workroot>/<id>/result.json (status ok | fail:<stage>), timings.tsv; restart-safe per stage marker.
 Environment: BIN (QE bin dir), PSEUDO_DIR. RTSC_STH=1, RTSC_STRICT=1, RTSC_STH_MP=1 are set for ph.x.
 EPW computes alpha^2F only (eliashberg, no liso/laniso); one retry with SCDM projections on a Wannier failure.
+Generator G1G2 (FUNNEL.md section 7, pre-registered before F0b): band exclusion by qe.n_semicore (shells not
+covered by the projection set, gap-checked; fail:semicore otherwise) and Wannier coarse k = 2 q (qe.t3a_grids).
 """
 import json
 import os
@@ -36,7 +38,7 @@ def main(jobs, jid, root, nt="8", ne="8"):
     W.mkdir(parents=True, exist_ok=True)
     os.chdir(W)
     st0 = qe.from_pmg(job["structure"])
-    res = dict(id=jid, Ttarget=job.get("Ttarget"), stages={}, nat=len(st0["species"]))
+    res = dict(id=jid, Ttarget=job.get("Ttarget"), stages={}, nat=len(st0["species"]), generator="G1G2")
     tsv = open("timings.tsv", "a")
 
     def stage(name, cmd, out, env_extra=None, timeout=None):
@@ -130,10 +132,14 @@ def main(jobs, jid, root, nt="8", ne="8"):
         else:
             shutil.copy(f"_ph0/{prefix}.q_{i}/{prefix}.dvscf1", f"save/{prefix}.dvscf_q{i}")
     # 5. nscf on the EPW coarse grid
-    nsemi = qe.n_semicore(xs)
+    try:
+        nsemi, sinfo = qe.n_semicore(xs, st["species"], PSEUDO)
+    except ValueError as ex:
+        res["semicore_error"] = str(ex)
+        return finish("fail:semicore")
     nw = qe.n_wann(st["species"])
     nbnd = nsemi + nw + max(8, nw // 2)
-    res["wannier"] = dict(nsemi=nsemi, nw=nw, nbnd=nbnd)
+    res["wannier"] = dict(nsemi=nsemi, nw=nw, nbnd=nbnd, **sinfo)
     Path("nscf.in").write_text(qe.pw_input(st, "nscf", prefix, None, ecut, pseudo=PSEUDO, nbnd=nbnd,
                                            kblock=qe.kfull(g["nk"])))
     if stage("nscf", mpi + [f"{BIN}/pw.x", "-in", "nscf.in"], "nscf.out", omp) != 0:
@@ -143,9 +149,13 @@ def main(jobs, jid, root, nt="8", ne="8"):
 
 
 def epw_stage(res, st, g, xs, xn, prefix, ne, stage, finish, job):
-    nsemi = qe.n_semicore(xs if xs.get("eig") else xn)
+    try:
+        nsemi, sinfo = qe.n_semicore(xs if xs.get("eig") else xn, st["species"], PSEUDO)
+    except ValueError as ex:
+        res["semicore_error"] = str(ex)
+        return finish("fail:semicore")
     nw = qe.n_wann(st["species"])
-    res.setdefault("wannier", {}).update(nsemi=nsemi, nw=nw)
+    res.setdefault("wannier", {}).update(nsemi=nsemi, nw=nw, **sinfo)
     xn = dict(xn, ef=xs["ef"])
     froz = qe.frozen_window(xn, nsemi, nw)
     res["wannier"]["froz"] = froz

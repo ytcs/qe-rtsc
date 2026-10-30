@@ -161,13 +161,55 @@ def n_wann(species):
     return sum(sum(cnt[o] for o in pr[e]) for e in species)
 
 
-def n_semicore(x, below=12.0):
-    """Bands lying entirely below E_F - below eV at every k."""
+def n_deep(x, below=12.0):
+    """F0 rule (superseded by G1, kept for the record): bands lying entirely below E_F - below eV at every k."""
     e = np.array(x["eig"])
     n = 0
     while n < e.shape[1] and e[:, n].max() < x["ef"] - below:
         n += 1
     return n
+
+
+# Electrons in the shells the projection set covers (valence s/p for main group, d + s for TM, ...):
+# main-group group valence; transition metals d + s; P_ONLY elements without their (unprojected) s pair.
+VAL_E = dict(H=1, Li=1, Na=1, K=1, Rb=1, Cs=1, Be=2, Mg=2, Ca=2, Sr=2, Ba=2, B=3, Al=3, Ga=3, In=3, Tl=3,
+             C=4, Si=4, Ge=4, Sn=4, Pb=4, N=5, P=5, As=5, Sb=5, Bi=5, S=6, Se=6, Te=6, O=4, F=5, Cl=5, Br=5, I=5,
+             Sc=3, Ti=4, V=5, Cr=6, Mn=7, Fe=8, Co=9, Ni=10, Cu=11, Zn=12, Y=3, Zr=4, Nb=5, Mo=6, Tc=7, Ru=8, Rh=9,
+             Pd=10, Ag=11, Cd=12, La=3, Hf=4, Ta=5, W=6, Re=7, Os=8, Ir=9, Pt=10, Au=11, Hg=12)
+
+
+def z_valence(e, pseudo):
+    t = open(f"{pseudo}/{e}_ONCV_PBE-1.2.upf").read(20000)
+    return float(re.search(r'z_valence\s*=\s*"\s*([-+0-9.eEdD]+)', t).group(1).replace("d", "e").replace("D", "e"))
+
+
+def n_shell(species, pseudo):
+    """G1 (FUNNEL.md section 7) realised by shell counting: bands of shells NOT covered by the projection set.
+    SG15 carries no PP_PSWFC, so the projected weight cannot be computed with projwfc.x; a semicore shell of an
+    element is by construction not in its (valence-shell) projection set, and a valence shell always is. Hence an
+    element's valence s band is never excluded when it carries an s projection (H3S: S 3s kept)."""
+    n = 0
+    for e in species:
+        z = z_valence(e, pseudo)
+        sc = z - VAL_E[e]
+        if sc < -1e-6 or abs(sc - round(sc)) > 1e-6 or int(round(sc)) % 2:
+            raise ValueError(f"semicore count for {e}: z {z}, valence {VAL_E[e]}")
+        n += int(round(sc)) // 2
+    return n
+
+
+def n_semicore(x, species, pseudo):
+    """G1 band exclusion: (n, info). n = shell count; requires a real gap below the first kept band at every k
+    (max_k e[n-1] < min_k e[n]); raises ValueError otherwise (recorded as fail:semicore)."""
+    e = np.array(x["eig"])
+    n = n_shell(species, pseudo)
+    info = dict(n_shell=n, n_deep_F0=n_deep(x))
+    if n:
+        top, bot = float(e[:, n - 1].max()), float(e[:, n].min())
+        info.update(excl_top_eV=round(top - x["ef"], 3), kept_bottom_eV=round(bot - x["ef"], 3))
+        if not top < bot:
+            raise ValueError(f"no gap between excluded band {n} and band {n + 1}: {top:.3f} >= {bot:.3f} eV")
+    return n, info
 
 
 def frozen_window(x, nsemi, nw):
@@ -245,7 +287,7 @@ def t3a_grids(st):
     nat = len(st["species"])
     k = kgrid(st["lattice"], 0.20 if nat <= 4 else 0.27)
     nq = 4 if nat == 1 else (3 if nat <= 4 else 2)
-    nk = nq if 3 <= nat <= 4 else 2 * nq
+    nk = 2 * nq   # G2 (FUNNEL.md section 7): Wannier/EPW coarse k = 2 q for every cell size (F0: k = q for 3-4 atoms)
     nkf = max(kgrid(st["lattice"], 0.2))
     nkf += nkf % 2
     return dict(k=k, nq=nq, nk=nk, nkf=nkf, nqf=nkf // 2)
