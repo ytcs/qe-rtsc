@@ -85,6 +85,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    USE kinds,                ONLY : DP
    USE mp_pools,             ONLY : inter_pool_comm
    USE sth_batched,          ONLY : sth_batched_flush_end, sth_call_eta
+   USE rtsc_mix,             ONLY : rtsc_mix_q0, rtsc_mix_kerker
    USE mp_bands,             ONLY : intra_bgrp_comm
    USE mp,                   ONLY : mp_sum
    USE fft_base,             ONLY : dfftp, dffts
@@ -193,6 +194,7 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    ! dV_in at tv (no mixing), so the final dpsi / drho always come from a solve at the vanilla thresh.
    REAL(DP) :: xl_l, xl_g, tv, tl, dr2_prev, xl_pred, xl_eta
    LOGICAL :: xl_on, xl_loose, xl_polish
+   REAL(DP) :: kq0
    REAL(DP), EXTERNAL :: dnrm2
    !! timing variables
    !
@@ -267,6 +269,9 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    xl_on = (xl_l > 1.d0 .OR. xl_eta > 0.d0) .AND. .NOT. okpaw .AND. .NOT. finite_freq .AND. .NOT. twochem
    xl_loose = .FALSE.
    xl_polish = .FALSE.
+   ! rtsc: Kerker-preconditioned Broyden (RTSC_MIX_Q0 > 0); in-memory mixing, no PAW, nspin_mag = 1
+   kq0 = rtsc_mix_q0()
+   IF (okpaw .OR. flmixdpot /= ' ' .OR. nspin_mag /= 1 .OR. npol /= 1) kq0 = 0.d0
    tv = 1.d-2
    tl = 1.d-2
    dr2_prev = -1.d0
@@ -465,6 +470,9 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          dvscftmp = dvscftmp - dfpt_data%dvscfp
          dr2 = (dnrm2(2 * ndim_pot, dvscftmp, 1) / REAL(2 * ndim_pot, DP))**2
          convt = .TRUE.
+      ELSEIF (kq0 > 0.d0) THEN
+         CALL rtsc_mix_kerker(dfftp%nnr, npert, dvscftmp(:, 1, :), dfpt_data%dvscfp(:, 1, :), alpha_mix(kter), dr2, &
+                              npert * tr2_ph / npol, iter, nmix_ph, convt, kq0)
       ELSE
          CALL mix_potential(2 * ndim_pot, dvscftmp, dfpt_data%dvscfp, alpha_mix(kter), dr2, &
                             npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
