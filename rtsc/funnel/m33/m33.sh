@@ -35,18 +35,14 @@ for X in $SYSTEMS; do
   fi
   # q in crystal coordinates from the dyn file (cart 2pi/alat)
   Q=$($PY - $D <<'EOP'
-import sys, glob, numpy as np
-sys.path.insert(0, sys.argv[0].rsplit('/', 1)[0] if '/' in sys.argv[0] else '.')
-d = sys.argv[1]
-f = sorted(glob.glob(f"{d}/**/x.dyn*", recursive=True))
-f = [x for x in f if not x.endswith("dyn0")][0]
-t = open(f).read()
-q = np.array([float(x) for x in t.split("q = (")[1].split(")")[0].split()])
+import re, sys
+import numpy as np
 sys.path.insert(0, "/root/rtsc/qe-rtsc/rtsc/funnel/m33")
 import pwtool as P
+d = sys.argv[1]
+q = [float(v) for v in re.findall(r"Calculation of q\s*=\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", open(f"{d}/ph.out").read())[-1]]
 x = P.read_xml(f"{d}/scf/x.save")
-qc = q @ (x["at"] / x["alat"]).T
-print(" ".join(f"{v:.10f}" for v in qc))
+print(" ".join(f"{v:.10f}" for v in np.array(q) @ (x["at"] / x["alat"]).T))
 EOP
 )
   NC=$($PY -c "print(eval(open('$D/cfg.txt').read())['nc'])"); NF=$($PY -c "print(eval(open('$D/cfg.txt').read())['nf'])")
