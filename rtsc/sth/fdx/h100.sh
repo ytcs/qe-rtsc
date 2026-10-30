@@ -54,7 +54,7 @@ curl -sSfL https://raw.githubusercontent.com/ytcs/qe-rtsc/$SHA/rtsc/pod/warm.sh 
 # warm.sh saves to the cache only on a cache miss; the sm90 archive exists, so nothing is written to /cache
 sed -i '/save\.sh/d' /root/warm.sh
 grep -c "save.sh" /root/warm.sh
-BRANCH=$SHA CC=$ARCH J=$(nproc) MDX=$MDX CUTLASS=$CUTLASS bash /root/warm.sh 2>&1 | tail -3
+BRANCH=$SHA CC=$ARCH J=${J:-26} MDX=$MDX CUTLASS=$CUTLASS bash /root/warm.sh 2>&1 | tail -3
 [ -n "$CBP" ] && { wait $CBP; echo "== $(date -u +%H:%M:%S) CBSR Stage 0"; cat $OUT/cbsr.log; }
 cd /root/rtsc && source env.sh
 B=/root/rtsc/qe-rtsc/rtsc/bench; R=$OUT/runs; Q=/root/rtsc/qe-rtsc/build-gpu/bin
