@@ -34,14 +34,15 @@ MODULE sth_engine
   INTEGER, PARAMETER :: TPB = 256      ! threads per block, element-wise kernels
   INTEGER, PARAMETER :: RB = 256       ! max threads per block, per-column reductions (power of 2)
   INTEGER, PARAMETER :: MAXPERT = 6
-  INTEGER, PARAMETER :: MAXPLAN = 12   ! FFT batch sizes 2**0 .. 2**(MAXPLAN-1)
+  INTEGER, PARAMETER :: MAXPLAN = 12
+  INTEGER, PARAMETER :: MAXE = 64      ! RTSC_STH_DEFL: at most this many known empty bands per k   ! FFT batch sizes 2**0 .. 2**(MAXPLAN-1)
   INTEGER, PARAMETER :: maxter = 400   ! as cgsolve_all
   !
   PUBLIC :: sth_engine_init, sth_engine_set_global, sth_engine_set_k, sth_engine_set_dvbare, &
             sth_engine_set_dpsi, sth_engine_setup, sth_engine_solve, sth_engine_get_dpsi, &
             sth_engine_get_hdiag, sth_engine_set_hdiag, sth_engine_reset_dpsi, sth_engine_free, sth_engine_shutdown, &
             sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
-            sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw
+            sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -63,6 +64,39 @@ MODULE sth_engine
                             sth_t_total = 0, sth_t_setup = 0
   INTEGER, PUBLIC, SAVE :: sth_nsteps = 0
   INTEGER(8), PUBLIC, SAVE :: sth_ncolapp = 0      ! column-operator applications in the CG
+  ! rtsc solve-work profile (sth_timing): valid columns, columns active at the first test, initial
+  ! residual sqrt(<g|h_diag|g>)/thresh histogram over the active columns (bins of 1/2 decade from
+  ! 10**0, last bin open), and the time of the apply_op parts (projector GEMMs vs FFT loop)
+  INTEGER, PUBLIC, SAVE :: sth_nvalid = 0, sth_nact0 = 0
+  INTEGER, PUBLIC, SAVE :: sth_r0hist(0:11) = 0
+  ! CG tests per column by distance of the band from the top occupied band of its k (0..5, 6 = more)
+  REAL(dp), PUBLIC, SAVE :: sth_stband(0:6) = 0
+  ! same, mean log10(r0/thresh) per band bin; and tests / log10(r0/thresh) by the smallest known gap
+  ! e_m(k+q) - e_n(k), m = nockq+1..nbnd: < 0.02, 0.02-0.1, 0.1-0.5, > 0.5 Ry, none known (bins 1..5)
+  REAL(dp), PUBLIC, SAVE :: sth_r0band(0:6) = 0, sth_gapst(5) = 0, sth_gapdec(5) = 0, sth_gapn(5) = 0
+  INTEGER, DEVICE, ALLOCATABLE :: d_nst(:)
+  REAL(dp), PUBLIC, SAVE :: sth_r0med = 0, sth_t_gemm = 0, sth_t_fft = 0
+  LOGICAL, PUBLIC, SAVE :: sth_prof = .FALSE.      ! sync inside apply_op to time GEMMs vs FFTs
+  !
+  ! rtsc dpsi extrapolation across the SCF iterations of one irrep (RTSC_STH_XP, SOLVE-LOG.md).
+  ! dpsi(dV_in) is affine in dV_in (one fixed operator per column), so when the adapter finds
+  ! dV_in(k) - dV_in(k-1) ~ sum_j c_j [dV_in(j) - dV_in(j-1)], the solution moves by about
+  ! sum_j c_j [dpsi(j) - dpsi(j-1)]. The call starts CG from dpsi(k-1) + that sum and solves to the
+  ! unchanged thresh, so only the starting point changes. History of dpsi increments: pinned host
+  ! memory (sth_xp_m slots); one extra device column array holds dpsi at the start of a call.
+  ! relative stopping test for non-final SCF calls (RTSC_STH_ETA, set per call by the adapter): a column
+  ! also stops when its residual has fallen below sth_eta x its residual at the first test; 0 = off
+  REAL(dp), PUBLIC, SAVE :: sth_eta = 0.0_dp
+  REAL(dp), DEVICE, ALLOCATABLE :: d_r0(:)
+  ! RTSC_STH_DEFL: additive spectral preconditioner with the known empty bands at k+q (k_check_defl)
+  INTEGER, PUBLIC, SAVE :: sth_defl = 0
+  REAL(dp), PUBLIC, SAVE :: sth_dfloor = 1.0e-4_dp
+  REAL(dp), DEVICE, ALLOCATABLE :: d_etkq(:,:)
+  INTEGER, PUBLIC, SAVE :: sth_xp_m = 0            ! history slots; 0 = off (set before irrep commit)
+  INTEGER, SAVE :: xp_nc = 0, xp_rec = 0, xp_slot(16) = 0
+  COMPLEX(dp), SAVE :: xp_c(16) = (0.0_dp, 0.0_dp)
+  COMPLEX(dp), PINNED, ALLOCATABLE, SAVE :: h_xh(:,:,:)
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_xp(:,:)
   INTEGER, PUBLIC, SAVE :: sth_bmax = 256          ! FFT chunk (largest batch); set before init
   INTEGER, PUBLIC, SAVE :: sth_debug_slot = 0      ! >0: print the CG history of this slot
   INTEGER, PUBLIC, SAVE :: sth_opvar = 0           ! testing: 1 = (g2 - e) x + Vx (same operator, other rounding)
@@ -75,7 +109,7 @@ MODULE sth_engine
   !
   ! host staging (filled by set_* calls, uploaded by setup)
   INTEGER, ALLOCATABLE, SAVE :: h_npw(:), h_npwq(:), h_nock(:), h_nockq(:), h_idxk(:,:), h_idxkq(:,:)
-  REAL(dp), ALLOCATABLE, SAVE :: h_wk(:), h_g2(:,:), h_etk(:,:), h_wwg(:,:,:), h_wg1(:,:)
+  REAL(dp), ALLOCATABLE, SAVE :: h_wk(:), h_g2(:,:), h_etk(:,:), h_wwg(:,:,:), h_wg1(:,:), h_etkq(:,:)
   COMPLEX(dp), ALLOCATABLE, SAVE :: h_W(:,:,:), h_evc(:,:), h_dvb(:,:), h_dpsi0(:,:), h_dpsi(:,:)
   LOGICAL, SAVE :: have_dpsi0 = .FALSE., h_dpsi_valid = .FALSE.
   INTEGER, ALLOCATABLE, SAVE :: h_valid(:)
@@ -184,6 +218,19 @@ CONTAINS
       i = i + INT(blockDim%x, 8) * gridDim%x
     ENDDO
   END SUBROUTINE k_sub
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_axpyc(y, x, a, n)
+    ! y = y + a x
+    INTEGER(8), VALUE :: n
+    COMPLEX(dp), VALUE :: a
+    COMPLEX(dp) :: y(n), x(n)
+    INTEGER(8) :: i
+    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    DO WHILE (i <= n)
+      y(i) = y(i) + a * x(i)
+      i = i + INT(blockDim%x, 8) * gridDim%x
+    ENDDO
+  END SUBROUTINE k_axpyc
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_icopy(a, b, n)
     INTEGER, VALUE :: n
@@ -353,14 +400,14 @@ CONTAINS
   END SUBROUTINE k_scale_wg1
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_check(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
-                                        cnt, ethr, first)
+                                        cnt, ethr, first, eta, r0, nst)
     ! cgsolve_all, per active column: h = h_diag*g ; rho = <h|g> ; converged if sqrt(rho) < ethr;
     ! otherwise h = -h + (rho/rhoold) hold  (hold is the previous h, kept in place).
     ! cnt(group) counts the columns that were active at this test (kter_eff).
     INTEGER, VALUE :: nslot, npert, npwx, nksq, first
-    REAL(dp), VALUE :: ethr
-    INTEGER :: list(*), npwq(nksq), conv(*), cnt(*)
-    REAL(dp) :: hd(npwx, nslot, nksq), rho(*)
+    REAL(dp), VALUE :: ethr, eta
+    INTEGER :: list(*), npwq(nksq), conv(*), cnt(*), nst(*)
+    REAL(dp) :: hd(npwx, nslot, nksq), rho(*), r0(*)
     COMPLEX(dp) :: g(npwx, *), h(npwx, *)
     REAL(dp), SHARED :: red(RB)
     REAL(dp), SHARED :: gam
@@ -389,7 +436,13 @@ CONTAINS
     IF (tid == 1) THEN
       rn = red(1)
       istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
-      IF (SQRT(rn) < ethr) THEN
+      IF (first == 1) r0(s) = SQRT(rn)
+      IF (first == 1) THEN
+        nst(s) = 1
+      ELSE
+        nst(s) = nst(s) + 1
+      ENDIF
+      IF (SQRT(rn) < MAX(ethr, eta * r0(s))) THEN
         conv(s) = 1
         cvd = 1
       ELSE
@@ -415,6 +468,122 @@ CONTAINS
       ENDIF
     ENDIF
   END SUBROUTINE k_check
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_check_defl(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
+                                             cnt, ethr, first, eta, r0, nst, W, nproj, nkb, nbnd, nockq, &
+                                             etk, etkq, dfloor)
+    ! k_check with the additive spectral preconditioner (RTSC_STH_DEFL): M^-1 = h_diag +
+    ! sum_m |evq_m><evq_m| / (e_m(k+q) - e_n(k)) over the known empty bands m = nockq(k)+1 .. nbnd at
+    ! k+q, which are exact eigenvectors of the column operator (eigenvalue e_m - e_n, the smallest
+    ! ones). The stopping test is unchanged (sqrt(<g|h_diag|g>) < thresh); the CG recurrence uses
+    ! rho = <g|M^-1|g> and h = -M^-1 g + gam h_old.
+    INTEGER, VALUE :: nslot, npert, npwx, nksq, first, nproj, nkb, nbnd
+    REAL(dp), VALUE :: ethr, eta, dfloor
+    INTEGER :: list(*), npwq(nksq), conv(*), cnt(*), nst(*), nockq(nksq)
+    REAL(dp) :: hd(npwx, nslot, nksq), rho(*), r0(*), etk(nbnd, nksq), etkq(nbnd, nksq)
+    COMPLEX(dp) :: g(npwx, *), h(npwx, *), W(npwx, nproj, nksq)
+    REAL(dp), SHARED :: red(RB), red2(RB)
+    REAL(dp), SHARED :: gam, rn, cre(MAXE), cim(MAXE), dm(MAXE)
+    INTEGER, SHARED :: cvd
+    INTEGER :: s, k, n, ig, nq, tid, st, istat, m, ne, m0
+    REAL(dp) :: acc, acc2, rc
+    COMPLEX(dp) :: gv, wv, hv
+    tid = threadIdx%x
+    s = list(blockIdx%x)
+    k = (s - 1) / (nslot * npert) + 1
+    n = MOD(s - 1, nslot) + 1
+    nq = npwq(k)
+    m0 = nockq(k)
+    ne = MIN(MAXE, nbnd - m0)
+    acc = 0.0_dp
+    DO ig = tid, nq, blockDim%x
+      gv = g(ig, s)
+      acc = acc + hd(ig, n, k) * (REAL(gv, dp)**2 + AIMAG(gv)**2)
+    ENDDO
+    red(tid) = acc
+    CALL syncthreads()
+    st = blockDim%x / 2
+    DO WHILE (st > 0)
+      IF (tid <= st) red(tid) = red(tid) + red(tid + st)
+      CALL syncthreads()
+      st = st / 2
+    ENDDO
+    IF (tid == 1) THEN
+      rn = red(1)
+      istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
+      IF (first == 1) r0(s) = SQRT(rn)
+      IF (first == 1) THEN
+        nst(s) = 1
+      ELSE
+        nst(s) = nst(s) + 1
+      ENDIF
+      IF (SQRT(rn) < MAX(ethr, eta * r0(s))) THEN
+        conv(s) = 1
+        cvd = 1
+      ELSE
+        cvd = 0
+      ENDIF
+    ENDIF
+    CALL syncthreads()
+    IF (cvd == 1) RETURN
+    ! c_m = <evq_m | g>
+    DO m = 1, ne
+      acc = 0.0_dp
+      acc2 = 0.0_dp
+      DO ig = tid, nq, blockDim%x
+        wv = W(ig, nkb + m0 + m, k)
+        gv = g(ig, s)
+        acc = acc + REAL(wv, dp) * REAL(gv, dp) + AIMAG(wv) * AIMAG(gv)
+        acc2 = acc2 + REAL(wv, dp) * AIMAG(gv) - AIMAG(wv) * REAL(gv, dp)
+      ENDDO
+      red(tid) = acc
+      red2(tid) = acc2
+      CALL syncthreads()
+      st = blockDim%x / 2
+      DO WHILE (st > 0)
+        IF (tid <= st) THEN
+          red(tid) = red(tid) + red(tid + st)
+          red2(tid) = red2(tid) + red2(tid + st)
+        ENDIF
+        CALL syncthreads()
+        st = st / 2
+      ENDDO
+      IF (tid == 1) THEN
+        cre(m) = red(1)
+        cim(m) = red2(1)
+        dm(m) = MAX(etkq(m0 + m, k) - etk(n, k), dfloor)
+      ENDIF
+      CALL syncthreads()
+    ENDDO
+    IF (tid == 1) THEN
+      rc = rn
+      DO m = 1, ne
+        rc = rc + (cre(m)**2 + cim(m)**2) / dm(m)
+      ENDDO
+      IF (first == 1) THEN
+        gam = 0.0_dp
+      ELSE
+        gam = rc / rho(s)
+      ENDIF
+      rho(s) = rc
+      DO m = 1, ne
+        cre(m) = cre(m) / dm(m)
+        cim(m) = cim(m) / dm(m)
+      ENDDO
+    ENDIF
+    CALL syncthreads()
+    DO ig = tid, nq, blockDim%x
+      hv = g(ig, s) * hd(ig, n, k)
+      DO m = 1, ne
+        hv = hv + W(ig, nkb + m0 + m, k) * CMPLX(cre(m), cim(m), dp)
+      ENDDO
+      IF (first == 1) THEN
+        h(ig, s) = -hv
+      ELSE
+        h(ig, s) = -hv + gam * h(ig, s)
+      ENDIF
+    ENDDO
+  END SUBROUTINE k_check_defl
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_kter(ngrp, npert, nksq, nock, cnt, kter)
     ! kter_eff = kter_eff + DBLE(lbnd) / DBLE(nbnd_occ(ikk)), once per CG step of each solve
@@ -1366,6 +1535,128 @@ CONTAINS
     CALL chk(istat, 'cublasZgemmStridedBatched (ortho back)')
   END SUBROUTINE ortho_batched
   !
+  SUBROUTINE r0_profile(thr)
+    ! histogram of sqrt(rho)/thresh over the columns still active after the first test (rho of
+    ! those columns was just written by k_check); converged columns are not counted
+    REAL(dp), INTENT(IN) :: thr
+    REAL(dp), ALLOCATABLE :: rh(:), v(:)
+    INTEGER, ALLOCATABLE :: cv(:), hv(:)
+    INTEGER :: i, b, m
+    ALLOCATE(rh(nsl), cv(nsl), hv(nvalid))
+    rh = d_rho
+    cv = d_conv
+    hv = d_valid
+    sth_r0hist = 0
+    ALLOCATE(v(nvalid))
+    m = 0
+    DO i = 1, nvalid
+      IF (cv(hv(i)) /= 0) CYCLE
+      m = m + 1
+      v(m) = SQRT(MAX(rh(hv(i)), 0.0_dp)) / thr
+      b = MIN(11, MAX(0, INT(2.0_dp * LOG10(MAX(v(m), 1.0_dp)))))
+      sth_r0hist(b) = sth_r0hist(b) + 1
+    ENDDO
+    sth_r0med = 0
+    IF (m > 0) THEN
+      CALL sort_r(v, m)
+      sth_r0med = v((m + 1) / 2)
+    ENDIF
+    DEALLOCATE(rh, cv, hv, v)
+  END SUBROUTINE r0_profile
+  !
+  SUBROUTINE band_profile(thr)
+    ! mean CG tests per column by distance of band n from the top occupied band nock(k), the mean
+    ! log10(r0/thresh) per bin, and tests and decades by the smallest known gap to the empty bands
+    REAL(dp), INTENT(IN) :: thr
+    INTEGER, ALLOCATABLE :: ns(:), hv(:)
+    REAL(dp), ALLOCATABLE :: r0h(:)
+    REAL(dp) :: cnt(0:6), dec, gap
+    INTEGER :: i, s, k, n, b, m, g
+    ALLOCATE(ns(nsl), hv(nvalid), r0h(nsl))
+    ns = d_nst
+    hv = d_valid
+    r0h = d_r0
+    sth_stband = 0; sth_r0band = 0; sth_gapst = 0; sth_gapdec = 0; sth_gapn = 0
+    cnt = 0
+    DO i = 1, nvalid
+      s = hv(i)
+      k = (s - 1) / (nslot * npert) + 1
+      n = MOD(s - 1, nslot) + 1
+      b = MIN(6, h_nock(k) - n)
+      dec = LOG10(MAX(r0h(s) / thr, 1.0_dp))
+      sth_stband(b) = sth_stband(b) + ns(s)
+      sth_r0band(b) = sth_r0band(b) + dec
+      cnt(b) = cnt(b) + 1
+      gap = 1.0e10_dp
+      DO m = h_nockq(k) + 1, nbnd
+        gap = MIN(gap, h_etkq(m, k) - h_etk(n, k))
+      ENDDO
+      IF (gap > 1.0e9_dp) THEN
+        g = 5
+      ELSEIF (gap < 0.02_dp) THEN
+        g = 1
+      ELSEIF (gap < 0.1_dp) THEN
+        g = 2
+      ELSEIF (gap < 0.5_dp) THEN
+        g = 3
+      ELSE
+        g = 4
+      ENDIF
+      sth_gapst(g) = sth_gapst(g) + ns(s)
+      sth_gapdec(g) = sth_gapdec(g) + dec
+      sth_gapn(g) = sth_gapn(g) + 1
+    ENDDO
+    DO b = 0, 6
+      IF (cnt(b) > 0) sth_stband(b) = sth_stband(b) / cnt(b)
+      IF (cnt(b) > 0) sth_r0band(b) = sth_r0band(b) / cnt(b)
+    ENDDO
+    DO g = 1, 5
+      IF (sth_gapn(g) > 0) sth_gapst(g) = sth_gapst(g) / sth_gapn(g)
+      IF (sth_gapn(g) > 0) sth_gapdec(g) = sth_gapdec(g) / sth_gapn(g)
+    ENDDO
+    DEALLOCATE(ns, hv, r0h)
+  END SUBROUTINE band_profile
+  !
+  SUBROUTINE sort_r(a, n)
+    ! in-place heapsort (ascending)
+    INTEGER, INTENT(IN) :: n
+    REAL(dp), INTENT(INOUT) :: a(n)
+    INTEGER :: i, j, l, ir
+    REAL(dp) :: t
+    IF (n < 2) RETURN
+    l = n / 2 + 1
+    ir = n
+    DO
+      IF (l > 1) THEN
+        l = l - 1
+        t = a(l)
+      ELSE
+        t = a(ir)
+        a(ir) = a(1)
+        ir = ir - 1
+        IF (ir == 1) THEN
+          a(1) = t
+          RETURN
+        ENDIF
+      ENDIF
+      i = l
+      j = l + l
+      DO WHILE (j <= ir)
+        IF (j < ir) THEN
+          IF (a(j) < a(j + 1)) j = j + 1
+        ENDIF
+        IF (t < a(j)) THEN
+          a(i) = a(j)
+          i = j
+          j = j + j
+        ELSE
+          j = ir + 1
+        ENDIF
+      ENDDO
+      a(i) = t
+    ENDDO
+  END SUBROUTINE sort_r
+  !
   SUBROUTINE apply_op(x, y, list, nl)
     ! y = (H_kq - e_n + alpha_pv P_v) x on the nl columns list(1:nl); other slots of y are garbage
     COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
@@ -1373,11 +1664,18 @@ CONTAINS
     INTEGER, INTENT(IN) :: nl
     INTEGER :: s0, nb, ip, np
     REAL(dp) :: scale
+    REAL(dp) :: ta, tb
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
+    IF (sth_prof) THEN
+      CALL tsync(); ta = wtime()
+    ENDIF
     CALL gemm_proj(x, d_cf)
     CALL k_coef_h<<<nsl, 32 * ((nproj + 31) / 32), 0, strm>>>(d_cf2, d_cf, d_dmat, nproj, nkb, nslot, &
          npert, nksq, d_nockq, alpha_pv)
     CALL kerr('coef_h')
+    IF (sth_prof) THEN
+      CALL tsync(); tb = wtime(); sth_t_gemm = sth_t_gemm + tb - ta; ta = tb
+    ENDIF
     s0 = 0
     DO WHILE (s0 < nl)
       nb = MIN(sth_bmax, nl - s0)
@@ -1396,7 +1694,13 @@ CONTAINS
       CALL kerr('gather_h')
       s0 = s0 + nb
     ENDDO
+    IF (sth_prof) THEN
+      CALL tsync(); tb = wtime(); sth_t_fft = sth_t_fft + tb - ta; ta = tb
+    ENDIF
     CALL gemm_back(d_cf2, y, (1.0_dp, 0.0_dp))
+    IF (sth_prof) THEN
+      CALL tsync(); tb = wtime(); sth_t_gemm = sth_t_gemm + tb - ta
+    ENDIF
   END SUBROUTINE apply_op
   !
   !=================================================================================================
@@ -1433,11 +1737,11 @@ CONTAINS
     nproj = nkb + nbnd
     nbox = nslot * nksq
     ALLOCATE(h_npw(nksq), h_npwq(nksq), h_nock(nksq), h_nockq(nksq), h_wk(nksq))
-    ALLOCATE(h_idxk(npwx, nksq), h_idxkq(npwx, nksq), h_g2(npwx, nksq), h_etk(nbnd, nksq))
+    ALLOCATE(h_idxk(npwx, nksq), h_idxkq(npwx, nksq), h_g2(npwx, nksq), h_etk(nbnd, nksq), h_etkq(nbnd, nksq))
     ALLOCATE(h_wwg(nbnd, nslot, nksq), h_wg1(nslot, nksq))
     ALLOCATE(h_W(npwx, nproj, nksq), h_evc(npwx, nbox))
     h_npw = 0; h_npwq = 0; h_nock = 0; h_nockq = 0; h_wk = 0
-    h_idxk = 1; h_idxkq = 1; h_g2 = 0; h_etk = 0; h_wwg = 0; h_wg1 = 0
+    h_idxk = 1; h_idxkq = 1; h_g2 = 0; h_etk = 0; h_wwg = 0; h_wg1 = 0; h_etkq = 0
     h_W = (0.0_dp, 0.0_dp); h_evc = (0.0_dp, 0.0_dp)
     CALL irrep_stage(npert_)
     staged = .TRUE.
@@ -1455,7 +1759,7 @@ CONTAINS
   END SUBROUTINE sth_engine_set_global
   !
   SUBROUTINE sth_engine_set_k(ik, npw, npwq, nock, nockq, wk, idx_k, idx_kq, evc, evq, et_k, g2kin, &
-                              vkb, wwg, wg1)
+                              vkb, wwg, wg1, et_kq)
     !! Per-k data. idx_k / idx_kq: 1-based FFT linear indices of k+G / k+q+G; evc, evq (npwx, nbnd);
     !! et_k (nbnd); g2kin (npwx) at k+q; vkb (npwx, nkb) at k+q; wwg (nbnd, nock), wg1 (nock).
     INTEGER, INTENT(IN) :: ik, npw, npwq, nock, nockq
@@ -1463,7 +1767,9 @@ CONTAINS
     INTEGER, INTENT(IN) :: idx_k(npw), idx_kq(npwq)
     COMPLEX(dp), INTENT(IN) :: evc(npwx, nbnd), evq(npwx, nbnd), vkb(npwx, nkb)
     REAL(dp), INTENT(IN) :: et_k(nbnd), g2kin(npwx), wwg(nbnd, nock), wg1(nock)
+    REAL(dp), INTENT(IN), OPTIONAL :: et_kq(nbnd)
     INTEGER :: n
+    IF (PRESENT(et_kq)) h_etkq(:, ik) = et_kq(:)
     h_npw(ik) = npw; h_npwq(ik) = npwq; h_nock(ik) = nock; h_nockq(ik) = nockq; h_wk(ik) = wk
     h_idxk(1:npw, ik) = idx_k(1:npw)
     h_idxkq(1:npwq, ik) = idx_kq(1:npwq)
@@ -1534,7 +1840,8 @@ CONTAINS
       have_handles = .TRUE.
     ENDIF
     ! memory check (bytes): column arrays, psi(r) cache, FFT box, W
-    need = 16_8 * npwx * nsl * 7 + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
+    need = 16_8 * npwx * nsl * (7 + MIN(sth_xp_m, 1)) + 16_8 * nnr * nbox + 16_8 * nnr * sth_bmax * 3 &
+           + 16_8 * npwx * nproj * nksq + 4_8 * nnr * nksq
     ! sth_mp: FP32 W, h_diag, g2kin, box (+ C2C plan work areas) and the irrep's FP32 column arrays
     IF (sth_mp) need = need + 8_8 * npwx * nproj * nksq + 4_8 * npwx * (nslot + 1) * nksq + 8_8 * nnr * sth_bmax * 3 &
                             + (8_8 * npwx * 4 + 16_8 * nproj + 12_8) * nsl
@@ -1572,6 +1879,9 @@ CONTAINS
     ALLOCATE(d_wg1(nslot, nksq), d_wgt(nksq), d_W(npwx, nproj, nksq))
     d_npw = h_npw; d_npwq = h_npwq; d_nock = h_nock; d_nockq = h_nockq
     d_idxk = h_idxk; d_idxkq = h_idxkq; d_g2 = h_g2; d_etk = h_etk; d_wwg = h_wwg; d_wg1 = h_wg1
+    IF (ALLOCATED(d_etkq)) DEALLOCATE(d_etkq)
+    ALLOCATE(d_etkq(nbnd, nksq))
+    d_etkq = h_etkq
     d_wgt = 2.0_dp * h_wk / omega
     d_W = h_W
     BLOCK
@@ -1654,11 +1964,12 @@ CONTAINS
   END SUBROUTINE sth_engine_setup
   !
   SUBROUTINE irrep_free()
+    IF (ALLOCATED(d_xp)) DEALLOCATE(d_xp)
     IF (ALLOCATED(h_dvb)) DEALLOCATE(h_dvb, h_dpsi0)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
-                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho)
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0, d_nst)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
     CALL irrep_free_mp()
   END SUBROUTINE irrep_free
@@ -1705,12 +2016,13 @@ CONTAINS
     INTEGER(8) :: need, freeb, totb
     ierr = 0
     IF (ALLOCATED(d_dvb)) DEALLOCATE(d_dvb, d_d0, d_dpsi, d_g, d_h, d_t, d_cf, d_cf2, d_ps, d_rho, d_conv, &
-                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho)
+                                     d_cnt, d_kter, d_nact, d_av, d_cv, d_dv, d_drho, d_r0, d_nst)
     IF (ALLOCATED(d_valid)) DEALLOCATE(d_valid, d_act, d_act2)
     IF (ALLOCATED(h_valid)) DEALLOCATE(h_valid)
     IF (ALLOCATED(h_dpsi)) DEALLOCATE(h_dpsi)
     CALL irrep_free_mp()
-    need = 16_8 * npwx * nsl * 7
+    IF (ALLOCATED(d_xp)) DEALLOCATE(d_xp)
+    need = 16_8 * npwx * nsl * (7 + MIN(sth_xp_m, 1))
     IF (mp_q) need = need + (8_8 * npwx * 4 + 16_8 * nproj + 12_8) * nsl
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
@@ -1722,10 +2034,19 @@ CONTAINS
     ENDIF
     ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
     ALLOCATE(d_t(npwx, nsl), d_cf(nproj, nsl), d_cf2(nproj, nsl), d_ps(nbnd, nsl))
-    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl))
+    ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl), d_r0(nsl), d_nst(nsl))
     ALLOCATE(d_dv(nnr, npert), d_drho(nnr, npert))
     ALLOCATE(h_dpsi(npwx, nsl))
     h_dpsi_valid = .FALSE.
+    xp_nc = 0
+    xp_rec = 0
+    IF (sth_xp_m > 0) THEN
+      ALLOCATE(d_xp(npwx, nsl))
+      IF (ALLOCATED(h_xh)) THEN
+        IF (SIZE(h_xh, 1) /= npwx .OR. SIZE(h_xh, 2) /= nsl .OR. SIZE(h_xh, 3) /= sth_xp_m) DEALLOCATE(h_xh)
+      ENDIF
+      IF (.NOT. ALLOCATED(h_xh)) ALLOCATE(h_xh(npwx, nsl, sth_xp_m))
+    ENDIF
     d_dvb = h_dvb
     d_dpsi = h_dpsi0
     ! valid slot list (k-major, then pert, then band)
@@ -1795,6 +2116,8 @@ CONTAINS
     istat = cudaGetLastError()   ! see sth_engine_setup
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     h_dpsi_valid = .FALSE.
+    sth_nvalid = nvalid
+    sth_t_gemm = 0; sth_t_fft = 0
     d_drho = drho
     IF (.NOT. first_iter) d_dv = dvscf
     istat = cudaDeviceSynchronize()
@@ -1847,6 +2170,18 @@ CONTAINS
     ELSE
     ax_valid = .FALSE.
     IF (first_iter) CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
+    ! dpsi extrapolation (sth_engine_xp_set): keep the start dpsi(k-1), then add sum_j c_j delta_j
+    IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
+      CALL k_copy<<<4096, TPB, 0, strm>>>(d_xp, d_dpsi, INT(npwx, 8) * nsl)
+      CALL kerr('copy (xp)')
+    ENDIF
+    IF (ALLOCATED(d_xp)) THEN
+      DO i = 1, xp_nc
+        istat = cudaMemcpyAsync(d_g, h_xh(:, :, xp_slot(i)), INT(npwx, 8) * nsl, strm)
+        CALL k_axpyc<<<4096, TPB, 0, strm>>>(d_dpsi, d_g, xp_c(i), INT(npwx, 8) * nsl)
+        CALL kerr('axpy (xp)')
+      ENDDO
+    ENDIF
     d_conv = 0
     d_cnt = 0
     d_kter = 0.0_dp
@@ -1863,8 +2198,14 @@ CONTAINS
     DO iter = 1, maxter
       first = 0
       IF (iter == 1) first = 1
-      CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
-           d_conv, d_cnt, thresh, first)
+      IF (sth_defl > 0) THEN
+        CALL k_check_defl<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, &
+             d_rho, d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst, d_W, nproj, nkb, nbnd, d_nockq, d_etk, &
+             d_etkq, sth_dfloor)
+      ELSE
+        CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
+             d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst)
+      ENDIF
       CALL kerr('check')
       CALL k_kter<<<nblk(ngrp, TPB), TPB, 0, strm>>>(ngrp, npert, nksq, d_nock, d_cnt, d_kter)
       CALL kerr('kter')
@@ -1873,6 +2214,10 @@ CONTAINS
       istat = cudaMemcpyAsync(h_nact, d_nact, 1, strm)
       CALL tsync()
       nact = h_nact(1)
+      IF (iter == 1) THEN
+        sth_nact0 = nact
+        IF (sth_timing) CALL r0_profile(thresh)
+      ENDIF
       sth_nsteps = iter
       IF (nact == 0) EXIT
       CALL apply_op(d_h, d_t, d_act, nact)
@@ -1881,8 +2226,19 @@ CONTAINS
       CALL kerr('update')
       IF (sth_debug_slot > 0) CALL debug_step(iter)
     ENDDO
+    IF (sth_timing) CALL band_profile(thresh)
+    ! dpsi extrapolation: delta = dpsi(k) - dpsi(k-1) into history slot xp_rec (d_g is free after CG)
+    IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
+      CALL k_copy<<<4096, TPB, 0, strm>>>(d_g, d_dpsi, INT(npwx, 8) * nsl)
+      CALL k_sub<<<4096, TPB, 0, strm>>>(d_g, d_xp, INT(npwx, 8) * nsl)
+      CALL kerr('delta (xp)')
+      istat = cudaMemcpyAsync(h_xh(:, :, xp_rec), d_g, INT(npwx, 8) * nsl, strm)
+      CALL tsync()
+    ENDIF
     sth_n64 = sth_ncolapp; sth_n32 = 0; sth_nround = 0
     ENDIF
+    xp_nc = 0
+    xp_rec = 0
     IF (sth_timing) THEN
       CALL tsync(); t1 = wtime(); sth_t_cg = t1 - t0; t0 = t1
     ENDIF
@@ -1932,6 +2288,20 @@ CONTAINS
       sth_t_total = sth_t_dpot + sth_t_ortho + sth_t_cg + sth_t_drho
     ENDIF
   END SUBROUTINE sth_engine_solve
+  !
+  SUBROUTINE sth_engine_xp_set(nc, slots, c, rec)
+    !! for the next sth_engine_solve only: start from dpsi + sum_i c(i) history(slots(i)); after the
+    !! solve store dpsi(end) - dpsi(start, before the extrapolation) in history slot rec (0 = do not)
+    INTEGER, INTENT(IN) :: nc, slots(*), rec
+    COMPLEX(dp), INTENT(IN) :: c(*)
+    xp_nc = 0
+    xp_rec = 0
+    IF (sth_xp_m <= 0 .OR. .NOT. ALLOCATED(h_xh)) RETURN
+    xp_nc = MIN(nc, sth_xp_m)
+    xp_slot(1:xp_nc) = slots(1:xp_nc)
+    xp_c(1:xp_nc) = c(1:xp_nc)
+    xp_rec = rec
+  END SUBROUTINE sth_engine_xp_set
   !
   SUBROUTINE sth_engine_becs(kqg, bec, alp)
     !! For drhodv, after the last solve of the irrep: bec(:, n, p, k) = vkb_kq^H dpsi_(k,p,n) and
@@ -2021,7 +2391,7 @@ CONTAINS
     qready = .FALSE.
     CALL irrep_free()
     IF (ALLOCATED(h_npw)) DEALLOCATE(h_npw, h_npwq, h_nock, h_nockq, h_wk, h_idxk, h_idxkq, h_g2, &
-                                     h_etk, h_wwg, h_wg1)
+                                     h_etk, h_wwg, h_wg1, h_etkq)
     IF (ALLOCATED(h_W)) DEALLOCATE(h_W)
     IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
     IF (ALLOCATED(d_npw)) DEALLOCATE(d_npw, d_npwq, d_nock, d_nockq, d_idxk, d_idxkq, d_g2, d_etk, &
@@ -2033,6 +2403,8 @@ CONTAINS
     IF (ALLOCATED(d_inv)) DEALLOCATE(d_inv)
     IF (ALLOCATED(s_W)) DEALLOCATE(s_W, s_hd, s_g2, s_vrs, s_dmat, s_box)
     mp_q = .FALSE.
+    IF (ALLOCATED(d_etkq)) DEALLOCATE(d_etkq)
+    IF (ALLOCATED(h_xh)) DEALLOCATE(h_xh)
     CALL sth_mem_trim()
   END SUBROUTINE sth_engine_free
   !

@@ -53,6 +53,7 @@ set(sources
     qdipol_cryst.f90
     mode_group.f90
     mix_pot.f90
+    rtsc_mix.f90
     lrcom.f90
     qpoint.f90
     lr_dot.f90
