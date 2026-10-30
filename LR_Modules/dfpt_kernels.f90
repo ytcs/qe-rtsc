@@ -185,6 +185,15 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       nsolv         ! number of linear systems
    !
    REAL(DP) :: tcpu, get_clock
+   !
+   ! rtsc RTSC_THRESH_L = L > 1 (SOLVE-LOG.md): non-final SCF iterations solve to L x the vanilla
+   ! thresh. The vanilla chain tv = min(0.1 sqrt(dr2), tv) is kept alongside; an iteration whose
+   ! predicted |ddv|^2 (dr2 * min(1, dr2/dr2_prev)) is below RTSC_THRESH_G (default 100) x tr2_ph uses
+   ! tv. If the SCF converges on a loose iteration, one polish iteration re-solves with the same
+   ! dV_in at tv (no mixing), so the final dpsi / drho always come from a solve at the vanilla thresh.
+   REAL(DP) :: xl_l, xl_g, tv, tl, dr2_prev, xl_pred
+   LOGICAL :: xl_on, xl_loose, xl_polish
+   REAL(DP), EXTERNAL :: dnrm2
    !! timing variables
    !
    !  This routine is task group aware
@@ -239,6 +248,25 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
    !
    IF (twochem) CALL allocate_twochem(npert, nsolv)
    !
+   xl_l = 1.d0
+   xl_g = 1.d2
+   BLOCK
+     CHARACTER(LEN=32) :: sv
+     INTEGER :: ios
+     CALL get_environment_variable('RTSC_THRESH_L', sv, STATUS=ios)
+     IF (ios == 0) READ(sv, *, IOSTAT=ios) xl_l
+     IF (ios /= 0) xl_l = 1.d0
+     CALL get_environment_variable('RTSC_THRESH_G', sv, STATUS=ios)
+     IF (ios == 0) READ(sv, *, IOSTAT=ios) xl_g
+     IF (ios /= 0) xl_g = 1.d2
+   END BLOCK
+   xl_on = xl_l > 1.d0 .AND. .NOT. okpaw .AND. .NOT. finite_freq .AND. .NOT. twochem
+   xl_loose = .FALSE.
+   xl_polish = .FALSE.
+   tv = 1.d-2
+   tl = 1.d-2
+   dr2_prev = -1.d0
+   !
    ! Loop over DFPT self-consistent iterations
    !
    do kter = 1, niter_ph
@@ -263,9 +291,26 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       IF (first_iter .OR. kter == 1) THEN
          ! If first iteration or first iteration after restart
          thresh = 1.0d-2
-      ELSE
+         tv = thresh
+         tl = thresh
+      ELSEIF (.NOT. xl_on) THEN
          thresh = min(1.d-1 * sqrt(dr2), thresh)
+      ELSE
+         ! rtsc: vanilla chain tv, loose chain tl; tv when this iteration may be the last one
+         IF (.NOT. xl_polish) THEN
+            tv = min(1.d-1 * sqrt(dr2), tv)
+            tl = min(xl_l * 1.d-1 * sqrt(dr2), tl, 1.0d-2)
+         ENDIF
+         xl_pred = dr2
+         IF (dr2_prev > 0.d0) xl_pred = dr2 * min(1.d0, dr2 / dr2_prev)
+         IF (xl_polish .OR. xl_pred < xl_g * tr2_ph) THEN
+            thresh = tv
+         ELSE
+            thresh = max(tl, tv)
+         ENDIF
+         IF (.NOT. xl_polish) dr2_prev = dr2   ! for the next prediction: the |ddv|^2 before the last
       ENDIF
+      xl_loose = xl_on .AND. (thresh > tv * (1.d0 + 1.d-12))
       !
       ! DFPT+U: at each ph iteration calculate dnsscf,
       ! i.e. the scf variation of the occupation matrix ns.
@@ -401,6 +446,12 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
          CALL mix_potential(2 * (ndim_pot + ndim), mixout, mixin, alpha_mix(kter), dr2, &
                             npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
          CALL setmixout(ndim_pot, ndim_paw, mixin, dfpt_data%dvscfp, dfpt_data%dbecsum, ndim, 1)
+      ELSEIF (xl_polish) THEN
+         ! rtsc polish iteration: dV_in unchanged (mix_potential returned without updating it when it
+         ! reported convergence); report |dV_out - dV_in|^2 as mix_potential does, then stop
+         dvscftmp = dvscftmp - dfpt_data%dvscfp
+         dr2 = (dnrm2(2 * ndim_pot, dvscftmp, 1) / REAL(2 * ndim_pot, DP))**2
+         convt = .TRUE.
       ELSE
          CALL mix_potential(2 * ndim_pot, dvscftmp, dfpt_data%dvscfp, alpha_mix(kter), dr2, &
                             npert * tr2_ph / npol, iter, nmix_ph, flmixdpot, convt)
@@ -465,6 +516,18 @@ SUBROUTINE dfpt_kernel(code, npert, iter0, lrdvpsi, iudvpsi, dr2, dfpt_data, &
       tcpu = get_clock(code)
       !
       dr2 = dr2 / npert
+      IF (xl_on) THEN
+         IF (xl_polish) WRITE(stdout, '(5x,"rtsc thresh: polish solve at the vanilla thresh")')
+         IF (convt .AND. xl_loose .AND. .NOT. xl_polish) THEN
+            ! converged on a loose solve: one more solve with the same dV_in at tv
+            convt = .FALSE.
+            xl_polish = .TRUE.
+            WRITE(stdout, '(5x,"rtsc thresh: converged on a loose solve (",ES9.2," > ",ES9.2,"): polish")') &
+                 thresh, tv
+         ELSE
+            IF (xl_loose) WRITE(stdout, '(5x,"rtsc thresh: loose ",ES9.2," (vanilla ",ES9.2,")")') thresh, tv
+         ENDIF
+      ENDIF
       WRITE( stdout, '(/,5x," iter # ",i3," total cpu time :",f8.1, &
       &      " secs   av.it.: ",f5.1)') iter, tcpu, averlt
       WRITE( stdout, '(5x," thresh=",es10.3, " alpha_mix = ",f6.3, &
