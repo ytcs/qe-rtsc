@@ -28,6 +28,7 @@ MODULE sth_engine
   USE cublas_v2
   USE sth_pfft, ONLY : pfft_setup, pfft_free, pfft_local, pfft_ok, pfft_info
   USE sth_pfft_s, ONLY : pfs_setup, pfs_free, pfs_local, pfs_ok
+  USE iso_c_binding, ONLY : c_int, c_double, c_float
   IMPLICIT NONE
   PRIVATE
   !
@@ -58,6 +59,44 @@ MODULE sth_engine
   INTERFACE
     SUBROUTINE acc_clear_freelists() BIND(C, name='acc_clear_freelists')
     END SUBROUTINE acc_clear_freelists
+  END INTERFACE
+  !
+  ! cuFFTDx pruned fused local operator (rtsc/sth/fdx/sth_fftdx.cu; groups/compute/FFT-LOG.md), RTSC_STH_FFTDX=1.
+  ! Built when CMake finds MathDx (RTSC_MATHDX_INC, RTSC_CUTLASS_INC); otherwise a stub whose fdx_setup returns
+  ! "unsupported" and the engine keeps pfft / cuFFT.
+  INTERFACE
+    INTEGER(c_int) FUNCTION fdx_setup(nr, nrx, nksq, npwx, npwq, idxkq, chunk) BIND(C, name='fdx_setup')
+      IMPORT :: c_int
+      INTEGER(c_int) :: nr(3), nrx(3), npwq(*), idxkq(*)
+      INTEGER(c_int), VALUE :: nksq, npwx, chunk
+    END FUNCTION fdx_setup
+    SUBROUTINE fdx_free() BIND(C, name='fdx_free')
+    END SUBROUTINE fdx_free
+    SUBROUTINE fdx_info(nst, nxa, chunk) BIND(C, name='fdx_info')
+      IMPORT :: c_int
+      INTEGER(c_int) :: nst, nxa, chunk
+    END SUBROUTINE fdx_info
+    INTEGER(c_int) FUNCTION fdx_local_d(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, vrs, npwq, g2, etk, &
+                                        scale, strm) BIND(C, name='fdx_local_d')
+      IMPORT :: c_int, c_double, cuda_stream_kind
+      COMPLEX(c_double), DEVICE :: x(*), y(*)
+      INTEGER(c_int), DEVICE :: list(*), npwq(*)
+      INTEGER(c_int), VALUE :: nl, nslot, npert, npwx, nksq, nbnd
+      REAL(c_double), DEVICE :: vrs(*), g2(*), etk(*)
+      REAL(c_double), VALUE :: scale
+      INTEGER(cuda_stream_kind), VALUE :: strm
+    END FUNCTION fdx_local_d
+    INTEGER(c_int) FUNCTION fdx_local_s(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, vrs, npwq, g2, etk, &
+                                        scale, strm) BIND(C, name='fdx_local_s')
+      IMPORT :: c_int, c_float, c_double, cuda_stream_kind
+      COMPLEX(c_float), DEVICE :: x(*), y(*)
+      INTEGER(c_int), DEVICE :: list(*), npwq(*)
+      INTEGER(c_int), VALUE :: nl, nslot, npert, npwx, nksq, nbnd
+      REAL(c_float), DEVICE :: vrs(*), g2(*)
+      REAL(c_double), DEVICE :: etk(*)
+      REAL(c_float), VALUE :: scale
+      INTEGER(cuda_stream_kind), VALUE :: strm
+    END FUNCTION fdx_local_s
   END INTERFACE
   INTEGER(8), SAVE :: mem_hw = 0
   !
@@ -109,6 +148,10 @@ MODULE sth_engine
   ! difference of the local part (diagnostic; costs one extra application).
   LOGICAL, PUBLIC, SAVE :: sth_pfft_req = .FALSE., sth_pfft_check = .FALSE.
   LOGICAL, SAVE :: pfft_checked = .FALSE.
+  ! cuFFTDx variant (takes precedence over pfft when both are requested and the grid is supported);
+  ! sth_fftdx_check: as sth_pfft_check, for fftdx against the cuFFT path
+  LOGICAL, PUBLIC, SAVE :: sth_fftdx_req = .FALSE., sth_fftdx_check = .FALSE.
+  LOGICAL, SAVE :: fdx_on = .FALSE.
   ! dV_bare psi built in the engine (KERNEL-LOG lever 4; RTSC_STH_DVB=1), set before init (per q):
   ! becp1 / alphap of every k (staged by sth_engine_set_nlk), D becp1 and D alphap on the device
   LOGICAL, PUBLIC, SAVE :: sth_dvb_req = .FALSE.
@@ -1208,6 +1251,13 @@ CONTAINS
     ENDIF
   END SUBROUTINE kerr
   !
+  SUBROUTINE errore_stop(what, ier)
+    CHARACTER(LEN=*), INTENT(IN) :: what
+    INTEGER, INTENT(IN) :: ier
+    WRITE(*, '(A,A,A,I4)') 'sth_engine: ', what, ' failed, code', ier
+    STOP 1
+  END SUBROUTINE errore_stop
+  !
   SUBROUTINE sth_mem_trim()
     !! return the device blocks freed so far (kept by the NVHPC runtime) to the driver
     INTEGER :: istat
@@ -1373,6 +1423,12 @@ CONTAINS
     CALL k_coef_h_s<<<nsl, 32 * ((nproj + 31) / 32), 0, strm>>>(s_cf2, s_cf, s_dmat, nproj, nkb, nslot, &
          npert, nksq, d_nockq, REAL(alpha_pv, sp))
     CALL kerr('coef_h_s')
+    IF (fdx_on) THEN
+      ip = fdx_local_s(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, s_vrs, d_npwq, s_g2, d_etk, scale, strm)
+      IF (ip /= 0) CALL errore_stop('fdx_local_s', ip)
+      CALL gemm_back_s(s_cf2, y)
+      RETURN
+    ENDIF
     IF (pfs_ok()) THEN
       CALL pfs_local(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, s_vrs, d_npwq, s_g2, d_etk, scale, strm)
       CALL gemm_back_s(s_cf2, y)
@@ -1730,7 +1786,7 @@ CONTAINS
     INTEGER :: s0, nb, ip, np
     REAL(dp) :: scale
     REAL(dp) :: ta, tb
-    LOGICAL :: use_p
+    LOGICAL :: use_p, use_f, chk
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     IF (sth_prof) THEN
       CALL tsync(); ta = wtime()
@@ -1742,8 +1798,10 @@ CONTAINS
     IF (sth_prof) THEN
       CALL tsync(); tb = wtime(); sth_t_gemm = sth_t_gemm + tb - ta; ta = tb
     ENDIF
-    use_p = pfft_ok() .AND. sth_opvar == 0
-    IF (.NOT. use_p .OR. (sth_pfft_check .AND. .NOT. pfft_checked)) THEN
+    use_f = fdx_on .AND. sth_opvar == 0
+    use_p = pfft_ok() .AND. sth_opvar == 0 .AND. .NOT. use_f
+    chk = .NOT. pfft_checked .AND. ((use_p .AND. sth_pfft_check) .OR. (use_f .AND. sth_fftdx_check))
+    IF (.NOT. (use_p .OR. use_f) .OR. chk) THEN
       s0 = 0
       DO WHILE (s0 < nl)
         nb = MIN(sth_bmax, nl - s0)
@@ -1763,8 +1821,11 @@ CONTAINS
         s0 = s0 + nb
       ENDDO
     ENDIF
-    IF (use_p) THEN
-      IF (sth_pfft_check .AND. .NOT. pfft_checked) CALL pfft_compare(x, y, list, nl, scale)
+    IF (chk) CALL pfft_compare(x, y, list, nl, scale, use_f)
+    IF (use_f) THEN
+      np = fdx_local_d(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+      IF (np /= 0) CALL errore_stop('fdx_local_d', np)
+    ELSE IF (use_p) THEN
       CALL pfft_local(x, y, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
     ENDIF
     IF (sth_prof) THEN
@@ -1776,13 +1837,14 @@ CONTAINS
     ENDIF
   END SUBROUTINE apply_op
   !
-  SUBROUTINE pfft_compare(x, y, list, nl, scale)
+  SUBROUTINE pfft_compare(x, y, list, nl, scale, use_f)
     ! diagnostic (RTSC_STH_PFFT_CHECK=1): y holds the cuFFT local part on list(1:nl); compute the
     ! pruned one into a scratch array and print the difference over those columns
     COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
     INTEGER, DEVICE :: list(*)
     INTEGER, INTENT(IN) :: nl
     REAL(dp), INTENT(IN) :: scale
+    LOGICAL, INTENT(IN) :: use_f
     COMPLEX(dp), DEVICE, ALLOCATABLE :: yp(:,:)
     COMPLEX(dp), ALLOCATABLE :: a(:,:), b(:,:)
     INTEGER, ALLOCATABLE :: hl(:)
@@ -1790,7 +1852,11 @@ CONTAINS
     REAL(dp) :: dmax, ymax, d2, y2
     ALLOCATE(yp(npwx, nsl), a(npwx, nsl), b(npwx, nsl), hl(nl))
     CALL tsync()
-    CALL pfft_local(x, yp, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+    IF (use_f) THEN
+      i = fdx_local_d(x, yp, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+    ELSE
+      CALL pfft_local(x, yp, list, nl, nslot, npert, npwx, nksq, nbnd, d_vrs, d_npwq, d_g2, d_etk, scale, strm)
+    ENDIF
     CALL tsync()
     a = y(:, 1:nsl)
     b = yp
@@ -1802,7 +1868,8 @@ CONTAINS
       d2 = d2 + SUM(ABS(a(:, c) - b(:, c))**2); y2 = y2 + SUM(ABS(a(:, c))**2)
     ENDDO
     IF (ymax > 0.0_dp) THEN
-      WRITE(*, '(A,I8,A,ES10.3,A,ES10.3)') '     rtsc pfft check: columns', nl, ', max|dy|/max|y| ', dmax / ymax, &
+      WRITE(*, '(A,A,I8,A,ES10.3,A,ES10.3)') '     rtsc ', MERGE('fftdx', 'pfft ', use_f), ' check: columns', nl, &
+           ', max|dy|/max|y| ', dmax / ymax, &
            ', rel L2 ', SQRT(d2 / y2)
       pfft_checked = .TRUE.     ! (a zero input, e.g. dpsi = 0 at the first iteration, is not a test)
     ENDIF
@@ -2193,7 +2260,22 @@ CONTAINS
     IF (dvb_q .AND. nkb > 0) CALL nl_setup()
     IF (ALLOCATED(h_bp)) DEALLOCATE(h_bp, h_al)
     pfft_checked = .FALSE.
-    IF (sth_pfft_req) THEN
+    fdx_on = .FALSE.
+    IF (sth_fftdx_req) THEN
+      BLOCK
+        INTEGER :: ier, ns_, nx_, pc_
+        ier = fdx_setup(nr, nrx, nksq, npwx, h_npwq, h_idxkq, 1024)
+        IF (ier == 0) THEN
+          fdx_on = .TRUE.
+          CALL fdx_info(ns_, nx_, pc_)
+          WRITE(*, '(A,I6,A,F6.3,A,I4,A,I5)') '     rtsc fftdx: on, sticks', ns_, ' (', &
+               REAL(ns_) / REAL(nr(1) * nr(2)), ' of the z-columns), occupied x-columns', nx_, ', chunk', pc_
+        ELSE
+          WRITE(*, '(A,I3,A)') '     rtsc fftdx: unsupported grid/box or not built (', ier, '), pfft/cuFFT path kept'
+        ENDIF
+      END BLOCK
+    ENDIF
+    IF (sth_pfft_req .AND. .NOT. fdx_on) THEN
       BLOCK
         INTEGER :: ier, ns_, nx_, pc_
         CALL pfft_setup(nr, nrx, nksq, npwx, h_npwq, h_idxkq, 1024, ier)
@@ -2661,6 +2743,8 @@ CONTAINS
     IF (ALLOCATED(h_xh)) DEALLOCATE(h_xh)
     CALL pfft_free()
     CALL pfs_free()
+    IF (fdx_on) CALL fdx_free()
+    fdx_on = .FALSE.
     IF (ALLOCATED(d_db)) DEALLOCATE(d_db, d_da)
     IF (ALLOCATED(h_bp)) DEALLOCATE(h_bp, h_al)
     dvb_q = .FALSE.

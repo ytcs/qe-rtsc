@@ -23,6 +23,8 @@ if [ "${NVTX:-0}" = 1 ]; then
   export LIBRARY_PATH=$SHIM:${LIBRARY_PATH:-} LD_LIBRARY_PATH=$SHIM:${LD_LIBRARY_PATH:-}
   gpuflags+=(-DQE_ENABLE_PROFILE_NVTX=ON)
 fi
+# MDX/CUTLASS set (rtsc/sth/fdx/deps.sh): the engine's cuFFTDx path (RTSC_STH_FFTDX) is built, else a stub
+if [ -n "${MDX:-}" ] && [ -n "${CUTLASS:-}" ]; then gpuflags+=(-DRTSC_MATHDX_INC=$MDX -DRTSC_CUTLASS_INC=$CUTLASS); fi
 cmake -S "$SRC" -B "$SRC/build-gpu" "${common[@]}" "${gpuflags[@]}" -DQE_GPU_ARCHS=sm_$CC -DQE_GPU="openacc;cuda" \
       -DQE_ENABLE_MPI_GPU_AWARE=ON
 cmake --build "$SRC/build-gpu" -j "$J" --target pw.x ph.x epw.x q2r.x matdyn.x

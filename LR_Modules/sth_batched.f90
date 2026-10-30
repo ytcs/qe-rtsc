@@ -611,6 +611,7 @@ CONTAINS
     USE sth_engine,       ONLY : sth_engine_init, sth_engine_set_global, sth_engine_set_k, &
                                  sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup, &
                                  sth_mp, sth_mp_eta, sth_mp_safe, sth_pfft_req, sth_pfft_check, sth_dvb_req, &
+                                 sth_fftdx_req, sth_fftdx_check, &
                                  sth_engine_set_nlk
     USE lrus,             ONLY : becp1
     !
@@ -630,6 +631,8 @@ CONTAINS
     sth_mp = sth_env_flag('RTSC_STH_MP')
     sth_pfft_req = sth_env_flag('RTSC_STH_PFFT')
     sth_pfft_check = sth_env_flag('RTSC_STH_PFFT_CHECK')
+    sth_fftdx_req = sth_env_flag('RTSC_STH_FFTDX')
+    sth_fftdx_check = sth_env_flag('RTSC_STH_FFTDX_CHECK')
     sth_dvb_req = dvb_on
     CALL env_real('RTSC_MP_ETA', sth_mp_eta)
     CALL env_real('RTSC_MP_SAFE', sth_mp_safe)

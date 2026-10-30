@@ -91,6 +91,29 @@ if(QE_ENABLE_CUDA)
                          ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/nscf_engine.f90)
 endif()
 qe_enable_cuda_fortran("${sources}")
+if(QE_ENABLE_CUDA)
+    # rtsc: cuFFTDx local operator (rtsc/sth/fdx/sth_fftdx.cu; groups/compute/FFT-LOG.md). The real kernels need the
+    # MathDx and CUTLASS headers (rtsc/sth/fdx/deps.sh); without them a stub whose fdx_setup reports "unsupported".
+    set(RTSC_MATHDX_INC "" CACHE PATH "MathDx include dir (cufftdx.hpp) for the fftdx engine path")
+    set(RTSC_CUTLASS_INC "" CACHE PATH "CUTLASS include dir for the fftdx engine path")
+    if(RTSC_MATHDX_INC AND RTSC_CUTLASS_INC)
+        find_program(RTSC_NVCC nvcc HINTS ${CUDAToolkit_BIN_DIR} REQUIRED)
+        list(GET QE_GPU_ARCHS 0 _fdx_arch)
+        string(REGEX REPLACE "[^0-9]" "" _fdx_sm "${_fdx_arch}")
+        set(_fdx_src ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/fdx/sth_fftdx.cu)
+        set(_fdx_obj ${CMAKE_CURRENT_BINARY_DIR}/sth_fftdx.o)
+        add_custom_command(OUTPUT ${_fdx_obj}
+            COMMAND ${RTSC_NVCC} -std=c++17 -O3 -arch=sm_${_fdx_sm} -DFDX_SM=${_fdx_sm}0 -Xcompiler -fPIC
+                    -I${RTSC_MATHDX_INC} -I${RTSC_CUTLASS_INC} -c ${_fdx_src} -o ${_fdx_obj}
+            DEPENDS ${_fdx_src} VERBATIM)
+        set_source_files_properties(${_fdx_obj} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+        list(APPEND sources ${_fdx_obj})
+        message(STATUS "rtsc fftdx: cuFFTDx kernels for sm_${_fdx_sm}")
+    else()
+        list(APPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../rtsc/sth/fdx/sth_fftdx_stub.c)
+        message(STATUS "rtsc fftdx: stub (set RTSC_MATHDX_INC and RTSC_CUTLASS_INC for the cuFFTDx kernels)")
+    endif()
+endif()
 qe_add_library(qe_lr_modules ${sources})
 target_link_libraries(qe_lr_modules
     PRIVATE
@@ -111,7 +134,8 @@ if(QE_ENABLE_CUDA)
     target_link_libraries(qe_lr_modules
         PRIVATE
             CUDA::cufft
-            CUDA::cublas)
+            CUDA::cublas
+            stdc++)
 endif()
 
 ###########################################################
