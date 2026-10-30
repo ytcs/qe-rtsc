@@ -194,7 +194,7 @@ MODULE sth_engine
   !   and d_inv built on the device.
   ! All of it is per-q state, freed by sth_engine_free at the q boundary.
   LOGICAL, PUBLIC, SAVE :: sth_qcache = .FALSE.
-  LOGICAL, SAVE :: qc_q = .FALSE., kqg_q = .FALSE., wdev_q = .FALSE.
+  LOGICAL, SAVE :: qc_q = .FALSE., kqg_q = .FALSE., wdev_q = .FALSE., kqg_said = .FALSE.
   REAL(dp), DEVICE, ALLOCATABLE :: d_kqgq(:,:,:)
   ! setup clocks (sth_timing): commit = free+trim+check, alloc, uploads, valid list + zeroing; dvb = local, nonlocal
   REAL(dp), PUBLIC, SAVE :: sth_t_commit(4) = 0, sth_t_dvb(2) = 0
@@ -2349,8 +2349,10 @@ CONTAINS
     need = 8_8 * npwx * 3 * nksq
     istat = cudaMemGetInfo(freeb, totb)
     IF ((ios == 0 .AND. TRIM(sv) == '1') .OR. need > freeb - 1024_8**3) THEN
-      WRITE(*, '(A,F8.3,A,F8.2,A)') '     rtsc qcache: k+q+G table (', REAL(need) / 1024.0**3, &
+      ! printed once per q
+      IF (.NOT. kqg_said) WRITE(*, '(A,F8.3,A,F8.2,A)') '     rtsc qcache: k+q+G table (', REAL(need) / 1024.0**3, &
            ' GiB) not cached (free ', REAL(freeb) / 1024.0**3, ' GiB): built per call'
+      kqg_said = .TRUE.
       RETURN
     ENDIF
     ALLOCATE(d_kqgq(npwx, 3, nksq))
@@ -3157,6 +3159,7 @@ CONTAINS
     IF (ALLOCATED(d_W)) DEALLOCATE(d_W)
     IF (ALLOCATED(d_kqgq)) DEALLOCATE(d_kqgq)
     kqg_q = .FALSE.
+    kqg_said = .FALSE.
     wdev_q = .FALSE.
     IF (ALLOCATED(d_box)) DEALLOCATE(d_box)
     IF (ALLOCATED(d_psir)) DEALLOCATE(d_psir)
