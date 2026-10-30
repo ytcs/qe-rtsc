@@ -32,7 +32,8 @@ MODULE sth_nscf_symrot
   PUBLIC :: symrot_on, symrot_plan, symrot_after_solve, symrot_report, symrot_tight, symrot_check_on, symrot_resid
   ! rtsc epw3 (RTSC_PW_SYMROT=1; groups/compute/EPW3-LOG.md): the same rotation in pw.x's nscf (c_bands_nscf), the
   ! Wannier k grid read by EPW. The module lives in PW/src so that both pw.x and ph.x use it.
-  PUBLIC :: symrot_pw_on, symrot_pw_tight, symrot_pw_check_on
+  PUBLIC :: symrot_pw_on, symrot_pw_tight, symrot_pw_check_on, symrot_note_notconv, symrot_rep_guard
+  INTEGER, SAVE :: last_notconv = 0, nbadrep = 0
   !
   ! cache of representatives (persists across q)
   INTEGER, SAVE :: nc = 0, ncmax = 0, npwc = 0, nbc = 0
@@ -84,6 +85,28 @@ CONTAINS
     IF (okvan) RETURN   ! NC only (the overlap S = 1 is assumed in the residual check; USPP untested)
     symrot_on = .TRUE.
   END FUNCTION symrot_on
+  !
+  SUBROUTINE symrot_note_notconv(n)
+    !! diag_bands reports its count of unconverged eigenvalues (stored only; no effect on the eigensolve)
+    INTEGER, INTENT(IN) :: n
+    last_notconv = n
+  END SUBROUTINE symrot_note_notconv
+  !
+  SUBROUTINE symrot_rep_guard(ik)
+    !! RTSC_PW_SYMROT: a representative whose eigensolve left unconverged eigenvalues is not a rotation source;
+    !! the k-points waiting for it are diagonalized themselves (as the switch-off build does for every k)
+    USE io_global, ONLY : stdout
+    INTEGER, INTENT(IN) :: ik
+    IF (last_notconv > 0 .AND. ALLOCATED(kind_)) THEN
+      IF (kind_(ik) == 2) THEN
+        kind_(ik) = 0
+        nbadrep = nbadrep + 1
+        WRITE(stdout, '(5x,"rtsc nscf symrot: representative ",I0," has ",I0, &
+             &" unconverged eigenvalues: its orbit is diagonalized instead (",I0," such reps)")') ik, last_notconv, nbadrep
+      ENDIF
+    ENDIF
+    last_notconv = 0
+  END SUBROUTINE symrot_rep_guard
   !
   LOGICAL FUNCTION symrot_pw_on()
     !! RTSC_PW_SYMROT=1, with the same declines as RTSC_NSCF_SYMROT

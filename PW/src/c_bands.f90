@@ -190,6 +190,7 @@ SUBROUTINE diag_bands( iter, ik, avg_iter )
   !!                                (complex Hamiltonian);
   !! * \(\textrm{test_exit_cond}\)(): the test on the iterative diagonalization.
   !
+  USE sth_nscf_symrot,      ONLY : symrot_note_notconv
   USE kinds,                ONLY : DP
   USE buffers,              ONLY : get_buffer
   USE io_global,            ONLY : stdout
@@ -328,6 +329,7 @@ SUBROUTINE diag_bands( iter, ik, avg_iter )
      WRITE( stdout, '(5X,"c_bands: ",I2, " eigenvalues not converged")' ) notconv
      !
   ENDIF
+  CALL symrot_note_notconv( notconv )   ! rtsc epw3: stored for RTSC_PW_SYMROT's guard only
   !
   RETURN
   !
@@ -895,7 +897,7 @@ SUBROUTINE c_bands_nscf( )
   USE check_stop,           ONLY : check_stop_now
   USE uspp_init,            ONLY : init_us_2
   USE sth_nscf_symrot,      ONLY : symrot_pw_on, symrot_pw_tight, symrot_pw_check_on, symrot_plan, &
-                                   symrot_after_solve, symrot_resid
+                                   symrot_after_solve, symrot_resid, symrot_rep_guard
   IMPLICIT NONE
   !
   ! ... local variables
@@ -1015,7 +1017,10 @@ SUBROUTINE c_bands_nscf( )
      ! ... save wave-functions (unless disabled in input)
      !
      IF ( io_level > -1 ) CALL save_buffer( evc, nwordwfc, iunwfc, ik )
-     IF (symrot) kdone(ik) = .TRUE.
+     IF (symrot) THEN
+        kdone(ik) = .TRUE.
+        CALL symrot_rep_guard(ik)
+     ENDIF
      !
      ! ... beware: with pools, if the number of k-points on different
      ! ... pools differs, make sure that all processors are still in
