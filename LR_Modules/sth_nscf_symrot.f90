@@ -364,10 +364,13 @@ CONTAINS
     USE uspp,      ONLY : vkb, nkb
     USE uspp_init, ONLY : init_us_2
     USE io_global, ONLY : stdout
+    USE becmod,    ONLY : becp, allocate_bec_type_acc, deallocate_bec_type_acc
     COMPLEX(DP), ALLOCATABLE :: hpsi(:,:)
     INTEGER :: ik, ib, npw
     REAL(DP) :: r, rr, rd, ro
     ALLOCATE(hpsi(npwx, nbnd))
+    ! h_psi's nonlocal term uses the global becp (allocated by diag_bands in the eigensolver path)
+    CALL allocate_bec_type_acc(nkb, nbnd, becp)
     !$acc enter data create(hpsi)
     rr = 0; rd = 0; ro = 0
     DO ik = 1, nks
@@ -392,6 +395,7 @@ CONTAINS
     ENDDO
     !$acc exit data delete(hpsi)
     DEALLOCATE(hpsi)
+    CALL deallocate_bec_type_acc(becp)
     rmax_rot = MAX(rmax_rot, rr); rmax_dav = MAX(rmax_dav, rd)
     WRITE(stdout, '(5x,"rtsc nscf symrot check: max |H psi - e psi| rotated ",ES10.3,", diagonalized ",ES10.3, &
          &"; max | |psi| - 1 | ",ES10.3)') rr, rd, ro
