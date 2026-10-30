@@ -28,6 +28,7 @@ set(src_pw
    src/bp_strings.f90 
    src/buffers.f90 
    src/c_bands.f90 
+   src/sth_nscf_symrot.f90
    src/c_phase_field.f90 
    src/orbm_kubo.f90 
    src/cdiagh.f90 
