@@ -611,7 +611,7 @@ CONTAINS
     USE sth_engine,       ONLY : sth_engine_init, sth_engine_set_global, sth_engine_set_k, &
                                  sth_engine_set_dvbare, sth_engine_set_dpsi, sth_engine_setup, &
                                  sth_mp, sth_mp_eta, sth_mp_safe, sth_pfft_req, sth_pfft_check, sth_dvb_req, &
-                                 sth_engine_set_nlk
+                                 sth_engine_set_nlk, sth_lift, sth_lift_kchunk
     USE lrus,             ONLY : becp1
     !
     LOGICAL, INTENT(IN) :: first_iter
@@ -633,6 +633,10 @@ CONTAINS
     sth_dvb_req = dvb_on
     CALL env_real('RTSC_MP_ETA', sth_mp_eta)
     CALL env_real('RTSC_MP_SAFE', sth_mp_safe)
+    ! LIFT-F preconditioner (RTSC_STH_LIFT = E_c' in Ry; FP64 CG path; SOLVE-LOG.md "LIFT-F canary")
+    sth_lift = 0.d0
+    CALL env_real('RTSC_STH_LIFT', sth_lift)
+    sth_lift_kchunk = sth_env_int('RTSC_STH_LIFT_KCHUNK')
     nslot = 0
     DO ik = 1, nksq
       nslot = MAX(nslot, nbnd_occ(ikks(ik)))
