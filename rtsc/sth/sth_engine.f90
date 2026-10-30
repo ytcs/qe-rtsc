@@ -1534,10 +1534,12 @@ CONTAINS
     mem_hw = 0
   END SUBROUTINE sth_mem_take_hw
   !
-  SUBROUTINE sth_mem_log(tag)
+  SUBROUTINE sth_mem_log(tag, need)
     !! rtsc b2 (RTSC_STH_MEMLOG=1; read-only): the engine's device arrays by component (GiB, from their
     !! allocated sizes), the driver's in-use total and the high-water so far. Used for the CBSR-B2 memory desk.
+    !! need (optional): the setup's own estimate (bytes), printed with psir_cached
     CHARACTER(LEN=*), INTENT(IN) :: tag
+    INTEGER(8), INTENT(IN), OPTIONAL :: need
     INTEGER(8) :: freeb, totb, bw, bev, bps, bbx, bhd, bix, binv, bkq, bg2, bnl, bcol, bcf, bpsx, bdv, bxp, bsp, bcb, bsum
     INTEGER :: istat, ios
     CHARACTER(LEN=8) :: sv
@@ -1577,8 +1579,10 @@ CONTAINS
     IF (ALLOCATED(d_cc)) bcb = bcb + 16_8 * SIZE(d_cc, KIND=8)
     IF (ALLOCATED(d_clam)) bcb = bcb + 8_8 * SIZE(d_clam, KIND=8)
     bsum = bw + bev + bps + bbx + bhd + bix + binv + bkq + bg2 + bnl + bcol + bcf + bpsx + bdv + bxp + bsp + bcb
-    WRITE(*, '(A,A,A,8I8)') '     rtsc memlog ', tag, ' dims npwx nslot npert nksq nnr nproj nbnd bmax:', &
-         npwx, nslot, npert, nksq, nnr, nproj, nbnd, sth_bmax
+    WRITE(*, '(A,A,A,8I8,I10)') '     rtsc memlog ', tag, ' dims npwx nslot npert nksq nnr nproj nbnd bmax nbox:', &
+         npwx, nslot, npert, nksq, nnr, nproj, nbnd, sth_bmax, nbox
+    IF (PRESENT(need)) WRITE(*, '(A,A,A,F8.3,A,L2,A,F8.3)') '     rtsc memlog ', tag, ' need GiB', REAL(need, dp) / g, &
+         ' psir_cached', psir_cached, ' free GiB', REAL(freeb, dp) / g
     WRITE(*, '(A,A,A,3F8.3)') '     rtsc memlog ', tag, ' GiB used hw engine_sum:', &
          REAL(totb - freeb, dp) / g, REAL(MAX(mem_hw, totb - freeb), dp) / g, REAL(bsum, dp) / g
     WRITE(*, '(A,A,A,17F8.3)') '     rtsc memlog ', tag, &
@@ -3225,6 +3229,7 @@ CONTAINS
              'sth_engine: psi(r) recomputed per chunk (RTSC_STH_NOPSIR=1), needs ', REAL(need) / 1024.0**3, ' GiB'
       ENDIF
     END BLOCK
+    CALL sth_mem_log('setup', need)
     IF (need > freeb - 1024_8**3) THEN
       WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
            REAL(freeb) / 1024.0**3, ' GiB'
