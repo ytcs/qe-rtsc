@@ -38,6 +38,8 @@ SUBROUTINE c_bands_nscf_ph( )
   USE uspp_init,            ONLY : init_us_2
   USE sth_nscf_start,       ONLY : nscf_start_prepare, nscf_start_get, nscf_start_free
   USE sth_nscf_batched,     ONLY : nscf_batched_run
+  USE sth_nscf_symrot,      ONLY : symrot_on, symrot_plan, symrot_after_solve, symrot_tight, &
+                                   symrot_check_on, symrot_resid
   !
   IMPLICIT NONE
   !
@@ -47,7 +49,11 @@ SUBROUTINE c_bands_nscf_ph( )
   ! ik_: k-point already done in a previous run
   ! ik : counter on k points
   LOGICAL :: exst, exst_mem
-  LOGICAL, ALLOCATABLE :: kdone(:)
+  LOGICAL, ALLOCATABLE :: kdone(:), kskip(:)
+  ! rtsc: RTSC_NSCF_SYMROT (k-points rotated from a symmetry image instead of diagonalized)
+  LOGICAL :: symrot
+  INTEGER :: ipass
+  REAL(DP) :: ethr_save
   ! rtsc: k-points already diagonalized by the batched Davidson
   !
   REAL(DP), EXTERNAL :: get_clock
@@ -82,12 +88,28 @@ SUBROUTINE c_bands_nscf_ph( )
   CALL nscf_start_prepare()
   !
   ! rtsc: batched Davidson over all k on the GPU (RTSC_STH=1); the loop below handles the rest
-  ALLOCATE(kdone(nks))
-  CALL nscf_batched_run(ik_, kdone, avg_iter)
+  ALLOCATE(kdone(nks), kskip(nks))
+  kdone(:) = .FALSE.
+  kskip(:) = .FALSE.
+  symrot = symrot_on() .AND. ik_ == 0 .AND. TRIM(starting_wfc) /= 'file'
+  ethr_save = ethr
+  IF (symrot) THEN
+     ! the representatives are diagonalized at a tighter threshold (NSCFROT-LOG.md)
+     ethr = ethr * symrot_tight()
+     CALL symrot_plan(kdone, kskip)
+  ENDIF
+  CALL nscf_batched_run(ik_, kdone, avg_iter, kskip)
   !
+  ! rtsc: pass 1 diagonalizes what the batched run left (except the k-points waiting for a rotation);
+  ! with RTSC_NSCF_SYMROT, pass 2 handles any k-point whose rotation could not be done
+  pass_loop: DO ipass = 1, 2
+  IF (ipass == 2) THEN
+     IF (.NOT. symrot) EXIT pass_loop
+     CALL symrot_after_solve(kdone, kskip)
+  ENDIF
   k_loop: DO ik = ik_+1, nks
      !
-     IF (kdone(ik)) CYCLE
+     IF (kdone(ik) .OR. kskip(ik)) CYCLE
      !
      ! ... Set k-point, spin, kinetic energy, needed by Hpsi
      !
@@ -152,6 +174,7 @@ SUBROUTINE c_bands_nscf_ph( )
      ! ... save wave-functions (unless disabled in input)
      !
      IF ( io_level > -1 ) CALL save_buffer ( evc, nwordwfc, iunwfc, ik )
+     kdone(ik) = .TRUE.
      !
      ! ... beware: with pools, if the number of k-points on different
      ! ... pools differs, make sure that all processors are still in
@@ -177,9 +200,15 @@ SUBROUTINE c_bands_nscf_ph( )
      ENDIF
      !
   END DO k_loop
+  END DO pass_loop
+  !
+  IF (symrot) THEN
+     ethr = ethr_save
+     IF (symrot_check_on()) CALL symrot_resid()
+  ENDIF
   !
   CALL nscf_start_free()
-  DEALLOCATE(kdone)
+  DEALLOCATE(kdone, kskip)
   CALL mp_sum( avg_iter, inter_pool_comm )
   avg_iter = avg_iter / nkstot
   !

@@ -79,6 +79,7 @@ set(sources
     sth_tail.f90
     sth_batched.f90
     sth_nscf_start.f90
+    sth_nscf_symrot.f90
     sth_nscf_batched.f90
     response_kernels.f90
     efermi_shift.f90

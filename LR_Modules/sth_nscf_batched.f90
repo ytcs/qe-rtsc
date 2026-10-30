@@ -17,7 +17,7 @@ MODULE sth_nscf_batched
   !
 CONTAINS
   !
-  SUBROUTINE nscf_batched_run(ik_, kdone, avg_iter)
+  SUBROUTINE nscf_batched_run(ik_, kdone, avg_iter, kskip)
     USE io_global,        ONLY : stdout
     USE klist,            ONLY : nks, xk, ngk, igk_k
     USE wvfct,            ONLY : et, nbnd, npwx, g2kin, current_k
@@ -44,14 +44,18 @@ CONTAINS
 #endif
     !
     INTEGER, INTENT(IN) :: ik_
-    LOGICAL, INTENT(OUT) :: kdone(nks)
+    LOGICAL, INTENT(INOUT) :: kdone(nks)
     REAL(DP), INTENT(INOUT) :: avg_iter
+    LOGICAL, INTENT(IN), OPTIONAL :: kskip(nks)
+    ! rtsc (RTSC_NSCF_SYMROT): k-points already done (kdone) or marked kskip are not diagonalized here;
+    ! the caller initializes kdone
     !
 #if defined(__CUDA)
     CHARACTER(LEN=16) :: s
     INTEGER :: ios, ik, k0, j, nkc, chunk, npw, na, ih, jh, niter, nfail, maxit
     INTEGER(8) :: nhpsi
-    INTEGER, ALLOCATABLE :: idx(:)
+    INTEGER, ALLOCATABLE :: idx(:), kl(:)
+    INTEGER :: nkl
     COMPLEX(DP), ALLOCATABLE :: dmat(:,:)
     LOGICAL :: ok, strict, unsup
     INTEGER(8) :: c0, c1, cr
@@ -59,7 +63,6 @@ CONTAINS
     INTEGER :: nit
 #endif
     !
-    kdone(:) = .FALSE.
 #if defined(__CUDA)
     CALL get_environment_variable('RTSC_STH', s, STATUS=ios)
     IF (.NOT. (ios == 0 .AND. TRIM(s) == '1')) RETURN
@@ -89,16 +92,31 @@ CONTAINS
         ENDDO
       ENDDO
     ENDDO
-    chunk = MIN(nks, nscf_eng_kmax(npwx, nbnd, MAX(nkb, 1), david, dffts%nnr))
+    ALLOCATE(kl(nks))
+    nkl = 0
+    DO ik = 1, nks
+      IF (kdone(ik)) CYCLE
+      IF (PRESENT(kskip)) THEN
+        IF (kskip(ik)) CYCLE
+      ENDIF
+      nkl = nkl + 1
+      kl(nkl) = ik
+    ENDDO
+    IF (nkl == 0) THEN
+      DEALLOCATE(dmat, idx, kl)
+      CALL stop_clock('nscf_batch')
+      RETURN
+    ENDIF
+    chunk = MIN(nkl, nscf_eng_kmax(npwx, nbnd, MAX(nkb, 1), david, dffts%nnr))
     nfail = 0
     tset = 0; tsol = 0; teig = 0; nit = 0
-    DO k0 = 1, nks, chunk
-      nkc = MIN(chunk, nks - k0 + 1)
+    DO k0 = 1, nkl, chunk
+      nkc = MIN(chunk, nkl - k0 + 1)
       CALL nscf_eng_init(nkc, npwx, nbnd, nkb, david, dffts%nr1, dffts%nr2, dffts%nr3, dffts%nr1x, &
                          dffts%nr2x, dffts%nr3x, dffts%nnr, vrs(:, 1), dmat, v_of_0)
       CALL SYSTEM_CLOCK(c0, cr)
       DO j = 1, nkc
-        ik = k0 + j - 1
+        ik = kl(k0 + j - 1)
         current_k = ik
         npw = ngk(ik)
         CALL g2_kin(ik)
@@ -118,7 +136,7 @@ CONTAINS
       CALL nscf_eng_solve(ethr, maxit, nhpsi)
       tsol = tsol + nscf_eng_t_tot; teig = teig + nscf_eng_t_eig; nit = MAX(nit, nscf_eng_nit)
       DO j = 1, nkc
-        ik = k0 + j - 1
+        ik = kl(k0 + j - 1)
         CALL nscf_eng_get_k(j, evc, et(:, ik), ok, niter)
         IF (ok) THEN
           IF (io_level > -1) CALL save_buffer(evc, nwordwfc, iunwfc, ik)
@@ -131,9 +149,9 @@ CONTAINS
       CALL nscf_eng_free()
     ENDDO
     !$acc update device(et)
-    DEALLOCATE(dmat, idx)
+    DEALLOCATE(dmat, idx, kl)
     WRITE(stdout, '(5x,"rtsc nscf: batched Davidson on ",I0," k-points (",I0," per chunk), ",I0, &
-         &" left to the per-k Davidson")') nks - nfail, chunk, nfail
+         &" left to the per-k Davidson")') nkl - nfail, chunk, nfail
     WRITE(stdout, '(5x,"rtsc nscf: setup ",F7.2," s, solve ",F7.2," s (host eigensolver ",F7.2," s), ",I0, &
          &" steps")') tset, tsol, teig, nit
     CALL stop_clock('nscf_batch')
