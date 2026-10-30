@@ -21,7 +21,9 @@ json.dump({k: b[k] for k in ("Nb", "Pb", "Al")}, open("p1-sg15.json", "w"))
 sp = dict(b); sp["Mg2IrH6"] = f["Mg2IrH6"]      # the same T3a input structure as the F0c SG15 run
 json.dump(sp, open("p1-spms.json", "w")); print("P1 jobs", list(sp))
 EOP
+PART=${P1_PART:-all}    # gate | arms | all
 # 1. NLCC gate
+if [ "$PART" != arms ]; then
 mark GATE_START
 PSET=spms PSEUDO_DIR=$SP python3 "$F/p1gate.py" prep "$IN/mg2irh6-st.json" gate/scf >> queue.log 2>&1
 (cd gate/scf && RTSC_STH=1 RTSC_STRICT=1 RTSC_STH_MP=1 OMP_NUM_THREADS=8 mpirun --bind-to none -np 1 -x RTSC_STH -x RTSC_STRICT \
@@ -30,6 +32,8 @@ RTSC_STH_MP=1 bash /root/rtsc/qe-rtsc/rtsc/bench/phq.sh gate/scf gate/engine $BI
 RTSC_STH=0 RTSC_STRICT=0 bash /root/rtsc/qe-rtsc/rtsc/bench/phq.sh gate/scf gate/vanilla $BIN 1 2 >> queue.log 2>&1
 python3 "$F/p1gate.py" compare gate/engine gate/vanilla gate/gate.json >> queue.log 2>&1
 mark GATE_END
+fi
+[ "$PART" = gate ] && { mark P1_GATE_ONLY_DONE; exit 0; }
 if ! python3 -c "import json,sys; sys.exit(0 if json.load(open('gate/gate.json'))['pass_gate'] else 1)"; then
   mark P1_GATE_FAIL; mark P1_DONE; exit 0
 fi
