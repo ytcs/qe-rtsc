@@ -136,6 +136,7 @@ if(QE_ENABLE_CUDA)
         PRIVATE
             CUDA::cufft
             CUDA::cublas
+            CUDA::cusolver
             stdc++)
 endif()
 

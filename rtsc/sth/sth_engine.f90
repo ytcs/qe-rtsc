@@ -26,6 +26,7 @@ MODULE sth_engine
   USE cudafor
   USE cufft
   USE cublas_v2
+  USE cusolverDn
   USE sth_pfft, ONLY : pfft_setup, pfft_free, pfft_local, pfft_ok, pfft_info
   USE sth_pfft_s, ONLY : pfs_setup, pfs_free, pfs_local, pfs_ok
   USE iso_c_binding, ONLY : c_int, c_double, c_float
@@ -2544,10 +2545,25 @@ CONTAINS
     REAL(dp), ALLOCATABLE :: lam(:), rw(:), hlam(:,:)
     INTEGER, ALLOCATABLE :: m3(:,:), iw(:)
     LOGICAL :: w_staged
+    ! rtsc b2: RTSC_STH_CBSR_GPU=1 -> the eigendecompositions run on the device (cuSOLVER zheevd), k+q serial
+    LOGICAL, SAVE :: gpu_read = .FALSE., cbsr_gpu = .FALSE., have_sol = .FALSE.
+    TYPE(cusolverDnHandle), SAVE :: hsol
+    CHARACTER(LEN=8) :: sv
+    INTEGER :: ios, lwd
+    REAL(dp) :: tasm
+    REAL(dp), DEVICE, ALLOCATABLE :: d_ew(:)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: d_ewk(:), d_ea(:,:)
+    INTEGER, DEVICE :: d_einfo
     EXTERNAL :: zgemm, zheevd
     t0 = wtime()
     teig = 0.0_dp
+    tasm = 0.0_dp
     CALL cbsr_free()
+    IF (.NOT. gpu_read) THEN
+      CALL get_environment_variable('RTSC_STH_CBSR_GPU', sv, STATUS=ios)
+      cbsr_gpu = ios == 0 .AND. TRIM(sv) == '1'
+      gpu_read = .TRUE.
+    ENDIF
     IF (ANY(nrx /= nr)) THEN
       WRITE(*, '(A)') '     rtsc cbsr: padded FFT box (nrx /= nr) not supported; CG kept'
       RETURN
@@ -2595,9 +2611,97 @@ CONTAINS
     hlam = 1.0e30_dp
     demax = 0.0_dp
     gmin = HUGE(1.0_dp)
-    ! k+q points in parallel (OpenMP; each zheevd runs on one thread), device copies serialised
     nfail = 0
     te = wtime()
+    IF (cbsr_gpu) THEN
+      ! rtsc b2: k+q serial; host assembly (OpenMP over columns), cuSOLVER zheevd in place on the device copy
+      IF (.NOT. have_sol) THEN
+        istat = cusolverDnCreate(hsol)
+        IF (istat /= CUSOLVER_STATUS_SUCCESS) CALL errore_stop('cusolverDnCreate', istat)
+        istat = cusolverDnSetStream(hsol, strm)
+        have_sol = .TRUE.
+      ENDIF
+      ALLOCATE(d_ew(npwx))
+      IF (cbsr_stream) ALLOCATE(d_ea(npwx, npwx))
+      IF (cbsr_stream) THEN
+        istat = cusolverDnZheevd_bufferSize(hsol, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, npwx, d_ea, npwx, d_ew, lwd)
+      ELSE
+        istat = cusolverDnZheevd_bufferSize(hsol, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, npwx, d_cu(:, :, 1), npwx, &
+                                            d_ew, lwd)
+      ENDIF
+      IF (istat /= CUSOLVER_STATUS_SUCCESS) CALL errore_stop('cusolverDnZheevd_bufferSize', istat)
+      ALLOCATE(d_ewk(lwd))
+      DO ik = 1, nksq
+        ta0: BLOCK
+        REAL(dp) :: tk
+        tk = wtime()
+        nq = h_npwq(ik)
+        nocc = h_nockq(ik)
+        ALLOCATE(a(nq, nq), lam(nq))
+        !$omp parallel do default(shared) private(j, ig, a1, a2, a3, b1, b2, b3)
+        DO j = 1, nq
+          b1 = m3(1, h_idxkq(j, ik)); b2 = m3(2, h_idxkq(j, ik)); b3 = m3(3, h_idxkq(j, ik))
+          DO ig = 1, nq
+            a1 = MODULO(m3(1, h_idxkq(ig, ik)) - b1, nr(1))
+            a2 = MODULO(m3(2, h_idxkq(ig, ik)) - b2, nr(2))
+            a3 = MODULO(m3(3, h_idxkq(ig, ik)) - b3, nr(3))
+            a(ig, j) = vg(1 + a1 + nr(1) * (a2 + nr(2) * a3))
+          ENDDO
+          a(j, j) = a(j, j) + h_g2(j, ik) - cbsr_v0
+        ENDDO
+        !$omp end parallel do
+        IF (nkb > 0) THEN
+          ALLOCATE(x(nkb, nq))
+          CALL zgemm('N', 'C', nkb, nq, nkb, (1.0_dp, 0.0_dp), dm, nkb, h_W(1, 1, ik), npwx, (0.0_dp, 0.0_dp), x, nkb)
+          CALL zgemm('N', 'N', nq, nq, nkb, (1.0_dp, 0.0_dp), h_W(1, 1, ik), npwx, x, nkb, (1.0_dp, 0.0_dp), a, nq)
+          DEALLOCATE(x)
+        ENDIF
+        IF (nocc > 0) CALL zgemm('N', 'C', nq, nq, nocc, CMPLX(alpha_pv, 0.0_dp, KIND=dp), h_W(1, nkb + 1, ik), npwx, &
+                                 h_W(1, nkb + 1, ik), npwx, (1.0_dp, 0.0_dp), a, nq)
+        a = 0.5_dp * (a + TRANSPOSE(CONJG(a)))
+        tasm = tasm + wtime() - tk
+        tk = wtime()
+        IF (cbsr_stream) THEN
+          d_ea = (0.0_dp, 0.0_dp)
+          d_ea(1:nq, 1:nq) = a
+          istat = cusolverDnZheevd(hsol, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, nq, d_ea, npwx, d_ew, d_ewk, lwd, &
+                                   d_einfo)
+        ELSE
+          d_cu(:, :, ik) = (0.0_dp, 0.0_dp)
+          d_cu(1:nq, 1:nq, ik) = a
+          istat = cusolverDnZheevd(hsol, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, nq, d_cu(:, :, ik), npwx, d_ew, &
+                                   d_ewk, lwd, d_einfo)
+        ENDIF
+        IF (istat /= CUSOLVER_STATUS_SUCCESS) CALL errore_stop('cusolverDnZheevd', istat)
+        istat = cudaStreamSynchronize(strm)
+        info = d_einfo
+        lam = d_ew(1:nq)
+        IF (cbsr_stream) h_cu(:, :, ik) = d_ea
+        teig = teig + wtime() - tk
+        END BLOCK ta0
+        IF (info /= 0) THEN
+          nfail = ik
+          DEALLOCATE(a, lam)
+          EXIT
+        ENDIF
+        DO m = 1, nbnd
+          eexp = h_etkq(m, ik) - cbsr_v0
+          IF (m <= nocc) eexp = eexp + alpha_pv
+          de = MINVAL(ABS(lam - eexp))
+          demax = MAX(demax, de)
+        ENDDO
+        DO i = 1, h_nock(ik)
+          gmin = MIN(gmin, lam(1) - (h_etk(i, ik) - cbsr_v0))
+        ENDDO
+        hlam(1:nq, ik) = lam
+        DEALLOCATE(a, lam)
+      ENDDO
+      DEALLOCATE(d_ew, d_ewk)
+      IF (ALLOCATED(d_ea)) DEALLOCATE(d_ea)
+      WRITE(*, '(A,I6,A,F9.2,A,F9.2,A)') '     rtsc cbsr gpu: ', nksq, ' k+q: host assembly ', tasm, ' s, device zheevd ', &
+           teig, ' s'
+    ELSE
+    ! k+q points in parallel (OpenMP; each zheevd runs on one thread), device copies serialised
     !$omp parallel do schedule(dynamic, 1) default(shared) &
     !$omp& private(ik, nq, nocc, a, lam, x, cw, rw, iw, lwork, lrwork, liwork, info, j, ig, a1, a2, a3, b1, b2, b3, m, &
     !$omp&         eexp, de, i, hul) reduction(max: demax) reduction(min: gmin)
@@ -2662,6 +2766,7 @@ CONTAINS
       DEALLOCATE(a, lam, hul)
     ENDDO
     !$omp end parallel do
+    ENDIF
     teig = wtime() - te
     IF (nfail > 0) THEN
       WRITE(*, '(A,I6,A)') '     rtsc cbsr: zheevd failed at k+q ', nfail, '; CG kept'
