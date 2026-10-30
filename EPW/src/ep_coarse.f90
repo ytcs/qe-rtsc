@@ -295,7 +295,7 @@
     USE epw_onemkl
 #endif
 #if defined (__CUDA)
-    USE epw_gpu_coarse,   ONLY : egc_init, egc_set_v, egc_local
+    USE epw_gpu_coarse,   ONLY : egc_init, egc_set_v, egc_local, egc_nl_set, egc_local_nl
 #endif
     USE ions_base,        ONLY : ityp, ntyp => nsp
     USE uspp_param,       ONLY : nh, nhm
@@ -406,8 +406,11 @@
     COMPLEX(KIND = DP), ALLOCATABLE :: swfcatomkpq_(:, :)
     !! projector for S*atomic wavefunctions at k+q-point
     ! rtsc: GPU path (local part by Parseval on the GPU, nonlocal part by projections)
-    LOGICAL :: use_gpu
+    LOGICAL :: use_gpu, nl_gpu
     INTEGER :: nt, na, mu, ih, jh, ikb, jkb, ijkb0
+    INTEGER, ALLOCATABLE :: kbatom(:)
+    REAL(KIND = DP), ALLOCATABLE :: kqg(:, :)
+    COMPLEX(KIND = DP), ALLOCATABLE :: dmat(:, :), uqm(:, :)
     INTEGER, ALLOCATABLE :: indk(:), indq(:)
     REAL(KIND = DP) :: xq_bak(3)
     REAL(KIND = DP), ALLOCATABLE :: deff(:, :, :)
@@ -479,6 +482,7 @@
     !
     ! rtsc: decide on the GPU path (NC, collinear, no spin, no DFT+U); RTSC_EPW_COARSE=0 disables it
     use_gpu = .FALSE.
+    nl_gpu = .FALSE.
 #if defined (__CUDA)
     use_gpu = ep_coarse_gpu_ok()
     IF (use_gpu) THEN
@@ -502,6 +506,32 @@
       CALL egc_init(dffts%nr1, dffts%nr2, dffts%nr3, dffts%nr1x, dffts%nr2x, dffts%nr3x, &
                     dffts%nnr, nbndep, 3 * nat, npwx)
       CALL egc_set_v(npe, vtot)
+      ! nonlocal part on the GPU too (RTSC_EPW_NL=0 keeps the host code below)
+      BLOCK
+        CHARACTER(LEN = 16) :: ev
+        CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_NL', ev)
+        nl_gpu = (TRIM(ev) /= '0') .AND. nkb > 0
+      END BLOCK
+      IF (nl_gpu) THEN
+        ALLOCATE(kbatom(nkb), dmat(nkb, nkb), uqm(3 * nat, npe), kqg(npwx, 3))
+        ijkb0 = 0
+        DO nt = 1, ntyp
+          DO na = 1, nat
+            IF (ityp(na) == nt) THEN
+              kbatom(ijkb0 + 1:ijkb0 + nh(nt)) = na
+              ijkb0 = ijkb0 + nh(nt)
+            ENDIF
+          ENDDO
+        ENDDO
+        DO ipert = 1, npe
+          mode = imode0 + ipert
+          IF (timerev) THEN
+            uqm(:, ipert) = CONJG(u(:, mode))
+          ELSE
+            uqm(:, ipert) = u(:, mode)
+          ENDIF
+        ENDDO
+      ENDIF
     ENDIF
 #endif
     !
@@ -867,6 +897,7 @@
     ENDIF
     !
     IF (use_gpu) DEALLOCATE(vtot, deff, becq, auxv, ps1, ps2, indk, indq)
+    IF (ALLOCATED(kbatom)) DEALLOCATE(kbatom, dmat, uqm, kqg)
     DEALLOCATE(elphmat, STAT = ierr)
     IF (ierr /= 0) CALL errore('ep_coarse_compute', 'Error deallocating elphmat', 1)
     DEALLOCATE(aux1, STAT = ierr)
@@ -912,6 +943,33 @@
       DO ig = 1, npwq
         indq(ig) = dffts%nl(igkq(ig))
       ENDDO
+      IF (nl_gpu) THEN
+        ! NC: deff = deeq does not depend on the band energy; D is its block-diagonal dense form
+        CALL compute_deff(deff, et_loc(ibndkept(1), ik))
+        dmat = czero
+        ijkb0 = 0
+        DO nt = 1, ntyp
+          DO na = 1, nat
+            IF (ityp(na) == nt) THEN
+              DO jh = 1, nh(nt)
+                DO ih = 1, nh(nt)
+                  dmat(ijkb0 + ih, ijkb0 + jh) = deff(ih, jh, na)
+                ENDDO
+              ENDDO
+              ijkb0 = ijkb0 + nh(nt)
+            ENDIF
+          ENDDO
+        ENDDO
+        CALL egc_nl_set(nkb, 3 * nat, npe, dmat, kbatom, uqm)
+        DO ipol_ = 1, 3
+          DO ig = 1, npwq
+            kqg(ig, ipol_) = xkqtmp(ipol_) + g(ipol_, igkq(ig))
+          ENDDO
+        ENDDO
+        CALL egc_local_nl(npw, indk, aux5, npwq, indq, aux4, vkb, npwx, kqg, becp1(ik)%k, nkb, &
+                          alphap(1, ik)%k, alphap(2, ik)%k, alphap(3, ik)%k, tpiba, elphmat)
+        RETURN
+      ENDIF
       CALL egc_local(npw, indk, aux5, npwq, indq, aux4, elphmat)
 #endif
       IF (nkb == 0) RETURN

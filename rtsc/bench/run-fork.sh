@@ -29,5 +29,5 @@ stage collect bash -c "
     else cp _ph0/$prefix.q_\$i/$prefix.dvscf1 save/$prefix.dvscf_q\$i; fi
   done"
 stage nscf env OMP_NUM_THREADS=$NT mpirun --bind-to none -np 1 -x OMP_NUM_THREADS "$BIN"/pw.x -in nscf.in > nscf.out
-stage epw  bash -c "nvidia-cuda-mps-control -d 2>/dev/null || true; OMP_NUM_THREADS=1 mpirun --bind-to none -np $NE -x OMP_NUM_THREADS $BIN/epw.x -npool $NE -in epw.in > epw.out; echo quit | nvidia-cuda-mps-control 2>/dev/null || true"
+stage epw  bash -c "nvidia-cuda-mps-control -d 2>/dev/null || true; OMP_NUM_THREADS=1 mpirun --bind-to none -np $NE -x OMP_NUM_THREADS $XR $BIN/epw.x -npool $NE -in epw.in > epw.out; echo quit | nvidia-cuda-mps-control 2>/dev/null || true"
 awk -v a="$T0" -v b="$(date +%s.%N)" 'BEGIN{printf "total\t%.2f\n", b-a}' | tee -a timings.tsv
