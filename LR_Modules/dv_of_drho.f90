@@ -9,6 +9,9 @@ MODULE dv_of_drho_lr
 
 PUBLIC :: dv_of_drho
 PUBLIC :: dv_of_drho_xc
+!
+! rtsc RTSC_DVXC_GPU=1 (groups/compute/SOLVE-LOG.md, wave 3B): the GGA part of dv_of_drho_xc on the device
+LOGICAL, SAVE :: rtsc_dvxc_init = .FALSE., rtsc_dvxc_gpu = .FALSE.
 
 CONTAINS
 
@@ -310,6 +313,21 @@ subroutine dv_of_drho_xc (dv, drho, drhoc)
   COMPLEX(DP), ALLOCATABLE :: drhotot(:, :)
   ! Total charge density. Sum of electronic (drho) and nlcc (drhoc) terms.
   INTEGER :: tpnnr
+  LOGICAL :: gpu_gc
+  REAL(DP), ALLOCATABLE :: rhoc(:)
+  !
+  IF (.NOT. rtsc_dvxc_init) THEN
+     BLOCK
+       CHARACTER(LEN=16) :: sv
+       INTEGER :: ios
+       CALL get_environment_variable('RTSC_DVXC_GPU', sv, STATUS=ios)
+       rtsc_dvxc_gpu = (ios == 0 .AND. TRIM(sv) == '1')
+       IF (rtsc_dvxc_gpu) WRITE(*, '(A)') '     rtsc dvxc_gpu: GGA response kernel (dgradcorr) on the device'
+     END BLOCK
+     rtsc_dvxc_init = .TRUE.
+  ENDIF
+  gpu_gc = rtsc_dvxc_gpu .AND. xclib_dft_is('gradient') .AND. .NOT. dft_is_nonlocc() .AND. &
+           nspin_mag == 1 .AND. nspin_gga == 1 .AND. .NOT. dfftp%lgamma
   !
   tpnnr = dfftp%nnr
   ALLOCATE(drhotot(dfftp%nnr, nspin_mag))
@@ -361,7 +379,15 @@ subroutine dv_of_drho_xc (dv, drho, drhoc)
   ! grho contains already the core charge
   !
 
-  if ( xclib_dft_is('gradient') ) THEN
+  if ( gpu_gc ) THEN
+     ! rtsc RTSC_DVXC_GPU: same arithmetic on the device; drhotot and dv stay there
+     ALLOCATE(rhoc(dfftp%nnr))
+     rhoc(:) = rho%of_r(:, 1)
+     if (nlcc_any) rhoc(:) = rhoc(:) + rho_core(:)
+     call dgradcorr_acc(dfftp, dfftp%nl, rhoc, grho, dvxc_rr, dvxc_sr, dvxc_ss, dvxc_s, xq, &
+                        drhotot, g, dv)
+     DEALLOCATE(rhoc)
+  elseif ( xclib_dft_is('gradient') ) THEN
      !$acc update self(dv,drhotot)     
      if (nlcc_any) rho%of_r(:, 1) = rho%of_r(:, 1) + rho_core (:)
      !

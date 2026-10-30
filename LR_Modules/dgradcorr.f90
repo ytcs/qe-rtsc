@@ -236,3 +236,141 @@ subroutine dgradcorr (dfft, rho, grho, dvxc_rr, dvxc_sr, dvxc_ss, &
   return
 
 end subroutine dgradcorr
+!
+!--------------------------------------------------------------------
+subroutine dgradcorr_acc (dfft, nl, rho, grho, dvxc_rr, dvxc_sr, dvxc_ss, &
+     dvxc_s, xq, drho, g, dvxc)
+  !--------------------------------------------------------------------
+  !! rtsc (RTSC_DVXC_GPU=1; groups/compute/SOLVE-LOG.md, wave 3B): dgradcorr on the device (OpenACC) for
+  !! nspin = 1, collinear, not gamma-tricks. Same arithmetic as dgradcorr's nspin = 1 branch with
+  !! fft_qgradient / fft_qgraddot inlined: drho and dvxc must be present on the device; the per-q GGA
+  !! arrays are copied in. FFTs through fwfft/invfft on device data (cuFFT).
+  !
+  USE kinds,            ONLY : DP
+  USE cell_base,        ONLY : tpiba
+  USE fft_types,        ONLY : fft_type_descriptor
+  USE fft_interfaces,   ONLY : fwfft, invfft
+  IMPLICIT NONE
+  TYPE(fft_type_descriptor), INTENT(IN) :: dfft
+  INTEGER, INTENT(IN) :: nl(dfft%ngm)
+  REAL(DP), INTENT(IN) :: rho(dfft%nnr), grho(3, dfft%nnr), dvxc_rr(dfft%nnr), dvxc_sr(dfft%nnr), &
+       dvxc_ss(dfft%nnr), dvxc_s(dfft%nnr), xq(3), g(3, dfft%ngm)
+  COMPLEX(DP), INTENT(IN) :: drho(dfft%nnr)
+  COMPLEX(DP), INTENT(INOUT) :: dvxc(dfft%nnr)
+  !
+  real(DP), parameter :: epsr = 1.0d-6, epsg = 1.0d-10
+  complex(DP), allocatable :: aux(:), dh(:), gd1(:), gd2(:), gd3(:), h1(:), h2(:), h3(:)
+  real(DP) :: grho2, qx, tp
+  complex(DP) :: s1, dr
+  integer :: k, n, ipol, nnr, ngm
+  !
+  nnr = dfft%nnr
+  ngm = dfft%ngm
+  tp = tpiba
+  allocate (aux(nnr), dh(nnr), gd1(nnr), gd2(nnr), gd3(nnr), h1(nnr), h2(nnr), h3(nnr))
+  !$acc data present(drho, dvxc) present_or_copyin(g, nl) &
+  !$acc&     copyin(rho, grho, dvxc_rr, dvxc_sr, dvxc_ss, dvxc_s) create(aux, dh, gd1, gd2, gd3, h1, h2, h3)
+  !
+  ! fft_qgradient: bring drho to G-space, multiply by i(q+G)_ipol, back to R-space, times tpiba
+  !$acc parallel loop
+  do k = 1, nnr
+     aux(k) = drho(k)
+  enddo
+  !$acc host_data use_device(aux)
+  CALL fwfft ('Rho', aux, dfft)
+  !$acc end host_data
+  do ipol = 1, 3
+     qx = xq(ipol)
+     !$acc parallel loop
+     do k = 1, nnr
+        dh(k) = (0.0_dp, 0.0_dp)
+     enddo
+     !$acc parallel loop
+     do n = 1, ngm
+        dh(nl(n)) = CMPLX(0.0_dp, qx + g(ipol, n), kind=DP) * aux(nl(n))
+     enddo
+     !$acc host_data use_device(dh)
+     CALL invfft ('Rho', dh, dfft)
+     !$acc end host_data
+     IF (ipol == 1) THEN
+        !$acc parallel loop
+        do k = 1, nnr
+           gd1(k) = dh(k) * tp
+        enddo
+     ELSEIF (ipol == 2) THEN
+        !$acc parallel loop
+        do k = 1, nnr
+           gd2(k) = dh(k) * tp
+        enddo
+     ELSE
+        !$acc parallel loop
+        do k = 1, nnr
+           gd3(k) = dh(k) * tp
+        enddo
+     ENDIF
+  enddo
+  !
+  ! pointwise part (dgradcorr, nspin == 1)
+  !$acc parallel loop private(grho2, s1, dr)
+  do k = 1, nnr
+     grho2 = grho(1, k)**2 + grho(2, k)**2 + grho(3, k)**2
+     if (abs (rho (k) ) > epsr .and. grho2 > epsg) then
+        s1 = grho (1, k) * gd1 (k) + &
+             grho (2, k) * gd2 (k) + &
+             grho (3, k) * gd3 (k)
+        dr = drho (k)
+        dvxc (k) = dvxc (k) + dvxc_rr (k) * dr &
+             + dvxc_sr (k) * s1
+        h1 (k) = (dvxc_sr(k) * dr + dvxc_ss(k) * s1 ) * grho(1, k) + dvxc_s (k) * gd1 (k)
+        h2 (k) = (dvxc_sr(k) * dr + dvxc_ss(k) * s1 ) * grho(2, k) + dvxc_s (k) * gd2 (k)
+        h3 (k) = (dvxc_sr(k) * dr + dvxc_ss(k) * s1 ) * grho(3, k) + dvxc_s (k) * gd3 (k)
+     else
+        h1 (k) = (0.d0, 0.d0)
+        h2 (k) = (0.d0, 0.d0)
+        h3 (k) = (0.d0, 0.d0)
+     endif
+  enddo
+  !
+  ! fft_qgraddot of h, subtracted from dvxc
+  !$acc parallel loop
+  do k = 1, nnr
+     dh(k) = (0.0_dp, 0.0_dp)
+  enddo
+  do ipol = 1, 3
+     qx = xq(ipol)
+     IF (ipol == 1) THEN
+        !$acc parallel loop
+        do k = 1, nnr
+           aux(k) = h1(k)
+        enddo
+     ELSEIF (ipol == 2) THEN
+        !$acc parallel loop
+        do k = 1, nnr
+           aux(k) = h2(k)
+        enddo
+     ELSE
+        !$acc parallel loop
+        do k = 1, nnr
+           aux(k) = h3(k)
+        enddo
+     ENDIF
+     !$acc host_data use_device(aux)
+     CALL fwfft ('Rho', aux, dfft)
+     !$acc end host_data
+     !$acc parallel loop
+     do n = 1, ngm
+        dh(nl(n)) = dh(nl(n)) + CMPLX(0.0_dp, qx + g(ipol, n), kind=DP) * aux(nl(n))
+     enddo
+  enddo
+  !$acc host_data use_device(dh)
+  CALL invfft ('Rho', dh, dfft)
+  !$acc end host_data
+  !$acc parallel loop
+  do k = 1, nnr
+     dvxc(k) = dvxc(k) - dh(k) * tp
+  enddo
+  !$acc end data
+  deallocate (aux, dh, gd1, gd2, gd3, h1, h2, h3)
+  !
+  return
+end subroutine dgradcorr_acc
