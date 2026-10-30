@@ -4,7 +4,7 @@
 set -uo pipefail
 mkdir -p "$1"; W=$(realpath "$1"); cd "$W"; STAGES=$2; SYSTEMS=$3
 M=$(dirname "$(realpath "$0")")
-source /root/rtsc/env.sh
+source /root/rtsc/env.sh; source /root/cupyenv.sh
 BIN=/root/rtsc/qe-rtsc/build-gpu/bin; PS=/root/rtsc/qe-rtsc/rtsc/pseudo/sg15
 PY=/root/venv-m33/bin/python
 export W90=/root/w90/src/wannier90.x P2W=$BIN/pw2wannier90.x MPIRUN="mpirun --bind-to none -np 1"
