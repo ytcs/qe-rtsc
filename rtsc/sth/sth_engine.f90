@@ -70,6 +70,9 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_r0hist(0:11) = 0
   ! CG tests per column by distance of the band from the top occupied band of its k (0..5, 6 = more)
   REAL(dp), PUBLIC, SAVE :: sth_stband(0:6) = 0
+  ! same, mean log10(r0/thresh) per band bin; and tests / log10(r0/thresh) by the smallest known gap
+  ! e_m(k+q) - e_n(k), m = nockq+1..nbnd: < 0.02, 0.02-0.1, 0.1-0.5, > 0.5 Ry, none known (bins 1..5)
+  REAL(dp), PUBLIC, SAVE :: sth_r0band(0:6) = 0, sth_gapst(5) = 0, sth_gapdec(5) = 0, sth_gapn(5) = 0
   INTEGER, DEVICE, ALLOCATABLE :: d_nst(:)
   REAL(dp), PUBLIC, SAVE :: sth_r0med = 0, sth_t_gemm = 0, sth_t_fft = 0
   LOGICAL, PUBLIC, SAVE :: sth_prof = .FALSE.      ! sync inside apply_op to time GEMMs vs FFTs
@@ -101,7 +104,7 @@ MODULE sth_engine
   !
   ! host staging (filled by set_* calls, uploaded by setup)
   INTEGER, ALLOCATABLE, SAVE :: h_npw(:), h_npwq(:), h_nock(:), h_nockq(:), h_idxk(:,:), h_idxkq(:,:)
-  REAL(dp), ALLOCATABLE, SAVE :: h_wk(:), h_g2(:,:), h_etk(:,:), h_wwg(:,:,:), h_wg1(:,:)
+  REAL(dp), ALLOCATABLE, SAVE :: h_wk(:), h_g2(:,:), h_etk(:,:), h_wwg(:,:,:), h_wg1(:,:), h_etkq(:,:)
   COMPLEX(dp), ALLOCATABLE, SAVE :: h_W(:,:,:), h_evc(:,:), h_dvb(:,:), h_dpsi0(:,:), h_dpsi(:,:)
   LOGICAL, SAVE :: have_dpsi0 = .FALSE., h_dpsi_valid = .FALSE.
   INTEGER, ALLOCATABLE, SAVE :: h_valid(:)
@@ -887,28 +890,57 @@ CONTAINS
     DEALLOCATE(rh, cv, hv, v)
   END SUBROUTINE r0_profile
   !
-  SUBROUTINE band_profile()
-    ! mean CG tests per column by distance of band n from the top occupied band nock(k)
+  SUBROUTINE band_profile(thr)
+    ! mean CG tests per column by distance of band n from the top occupied band nock(k), the mean
+    ! log10(r0/thresh) per bin, and tests and decades by the smallest known gap to the empty bands
+    REAL(dp), INTENT(IN) :: thr
     INTEGER, ALLOCATABLE :: ns(:), hv(:)
-    REAL(dp) :: cnt(0:6)
-    INTEGER :: i, s, k, n, b
-    ALLOCATE(ns(nsl), hv(nvalid))
+    REAL(dp), ALLOCATABLE :: r0h(:)
+    REAL(dp) :: cnt(0:6), dec, gap
+    INTEGER :: i, s, k, n, b, m, g
+    ALLOCATE(ns(nsl), hv(nvalid), r0h(nsl))
     ns = d_nst
     hv = d_valid
-    sth_stband = 0
+    r0h = d_r0
+    sth_stband = 0; sth_r0band = 0; sth_gapst = 0; sth_gapdec = 0; sth_gapn = 0
     cnt = 0
     DO i = 1, nvalid
       s = hv(i)
       k = (s - 1) / (nslot * npert) + 1
       n = MOD(s - 1, nslot) + 1
       b = MIN(6, h_nock(k) - n)
+      dec = LOG10(MAX(r0h(s) / thr, 1.0_dp))
       sth_stband(b) = sth_stband(b) + ns(s)
+      sth_r0band(b) = sth_r0band(b) + dec
       cnt(b) = cnt(b) + 1
+      gap = 1.0e10_dp
+      DO m = h_nockq(k) + 1, nbnd
+        gap = MIN(gap, h_etkq(m, k) - h_etk(n, k))
+      ENDDO
+      IF (gap > 1.0e9_dp) THEN
+        g = 5
+      ELSEIF (gap < 0.02_dp) THEN
+        g = 1
+      ELSEIF (gap < 0.1_dp) THEN
+        g = 2
+      ELSEIF (gap < 0.5_dp) THEN
+        g = 3
+      ELSE
+        g = 4
+      ENDIF
+      sth_gapst(g) = sth_gapst(g) + ns(s)
+      sth_gapdec(g) = sth_gapdec(g) + dec
+      sth_gapn(g) = sth_gapn(g) + 1
     ENDDO
     DO b = 0, 6
       IF (cnt(b) > 0) sth_stband(b) = sth_stband(b) / cnt(b)
+      IF (cnt(b) > 0) sth_r0band(b) = sth_r0band(b) / cnt(b)
     ENDDO
-    DEALLOCATE(ns, hv)
+    DO g = 1, 5
+      IF (sth_gapn(g) > 0) sth_gapst(g) = sth_gapst(g) / sth_gapn(g)
+      IF (sth_gapn(g) > 0) sth_gapdec(g) = sth_gapdec(g) / sth_gapn(g)
+    ENDDO
+    DEALLOCATE(ns, hv, r0h)
   END SUBROUTINE band_profile
   !
   SUBROUTINE sort_r(a, n)
@@ -1031,11 +1063,11 @@ CONTAINS
     nproj = nkb + nbnd
     nbox = nslot * nksq
     ALLOCATE(h_npw(nksq), h_npwq(nksq), h_nock(nksq), h_nockq(nksq), h_wk(nksq))
-    ALLOCATE(h_idxk(npwx, nksq), h_idxkq(npwx, nksq), h_g2(npwx, nksq), h_etk(nbnd, nksq))
+    ALLOCATE(h_idxk(npwx, nksq), h_idxkq(npwx, nksq), h_g2(npwx, nksq), h_etk(nbnd, nksq), h_etkq(nbnd, nksq))
     ALLOCATE(h_wwg(nbnd, nslot, nksq), h_wg1(nslot, nksq))
     ALLOCATE(h_W(npwx, nproj, nksq), h_evc(npwx, nbox))
     h_npw = 0; h_npwq = 0; h_nock = 0; h_nockq = 0; h_wk = 0
-    h_idxk = 1; h_idxkq = 1; h_g2 = 0; h_etk = 0; h_wwg = 0; h_wg1 = 0
+    h_idxk = 1; h_idxkq = 1; h_g2 = 0; h_etk = 0; h_wwg = 0; h_wg1 = 0; h_etkq = 0
     h_W = (0.0_dp, 0.0_dp); h_evc = (0.0_dp, 0.0_dp)
     CALL irrep_stage(npert_)
     staged = .TRUE.
@@ -1053,7 +1085,7 @@ CONTAINS
   END SUBROUTINE sth_engine_set_global
   !
   SUBROUTINE sth_engine_set_k(ik, npw, npwq, nock, nockq, wk, idx_k, idx_kq, evc, evq, et_k, g2kin, &
-                              vkb, wwg, wg1)
+                              vkb, wwg, wg1, et_kq)
     !! Per-k data. idx_k / idx_kq: 1-based FFT linear indices of k+G / k+q+G; evc, evq (npwx, nbnd);
     !! et_k (nbnd); g2kin (npwx) at k+q; vkb (npwx, nkb) at k+q; wwg (nbnd, nock), wg1 (nock).
     INTEGER, INTENT(IN) :: ik, npw, npwq, nock, nockq
@@ -1061,7 +1093,9 @@ CONTAINS
     INTEGER, INTENT(IN) :: idx_k(npw), idx_kq(npwq)
     COMPLEX(dp), INTENT(IN) :: evc(npwx, nbnd), evq(npwx, nbnd), vkb(npwx, nkb)
     REAL(dp), INTENT(IN) :: et_k(nbnd), g2kin(npwx), wwg(nbnd, nock), wg1(nock)
+    REAL(dp), INTENT(IN), OPTIONAL :: et_kq(nbnd)
     INTEGER :: n
+    IF (PRESENT(et_kq)) h_etkq(:, ik) = et_kq(:)
     h_npw(ik) = npw; h_npwq(ik) = npwq; h_nock(ik) = nock; h_nockq(ik) = nockq; h_wk(ik) = wk
     h_idxk(1:npw, ik) = idx_k(1:npw)
     h_idxkq(1:npwq, ik) = idx_kq(1:npwq)
@@ -1459,7 +1493,7 @@ CONTAINS
       CALL kerr('update')
       IF (sth_debug_slot > 0) CALL debug_step(iter)
     ENDDO
-    IF (sth_timing) CALL band_profile()
+    IF (sth_timing) CALL band_profile(thresh)
     ! dpsi extrapolation: delta = dpsi(k) - dpsi(k-1) into history slot xp_rec (d_g is free after CG)
     IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
       CALL k_copy<<<4096, TPB, 0, strm>>>(d_g, d_dpsi, INT(npwx, 8) * nsl)
@@ -1622,7 +1656,7 @@ CONTAINS
     qready = .FALSE.
     CALL irrep_free()
     IF (ALLOCATED(h_npw)) DEALLOCATE(h_npw, h_npwq, h_nock, h_nockq, h_wk, h_idxk, h_idxkq, h_g2, &
-                                     h_etk, h_wwg, h_wg1)
+                                     h_etk, h_wwg, h_wg1, h_etkq)
     IF (ALLOCATED(h_W)) DEALLOCATE(h_W)
     IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
     IF (ALLOCATED(d_npw)) DEALLOCATE(d_npw, d_npwq, d_nock, d_nockq, d_idxk, d_idxkq, d_g2, d_etk, &

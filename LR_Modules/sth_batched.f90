@@ -185,7 +185,7 @@ CONTAINS
     USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready, &
                                  sth_xp_m, sth_engine_xp_set, sth_eta, sth_timing, sth_prof, sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, &
                                  sth_nsteps, sth_ncolapp, sth_nvalid, sth_nact0, sth_r0hist, sth_r0med, &
-                                 sth_t_gemm, sth_t_fft, sth_stband
+                                 sth_t_gemm, sth_t_fft, sth_stband, sth_r0band, sth_gapst, sth_gapdec, sth_gapn
     USE qpoint,           ONLY : xq
 #endif
     !
@@ -276,6 +276,9 @@ CONTAINS
            &" r0med ",ES9.2," r0hist ",12(1x,I0))') thresh, sth_nvalid, sth_nact0, sth_nsteps, sth_ncolapp, &
            sth_r0med, sth_r0hist
       WRITE(stdout, '(5x,"rtsc solve bands: tests per column by nock-n = 0..5,6+:",7(1x,F6.2))') sth_stband
+      WRITE(stdout, '(5x,"rtsc solve bands: log10(r0/thr) by nock-n = 0..5,6+:   ",7(1x,F6.2))') sth_r0band
+      WRITE(stdout, '(5x,"rtsc solve gaps (<.02 .02-.1 .1-.5 >.5 none Ry): n",5(1x,I0)," tests",5(1x,F6.2), &
+           &" dec",5(1x,F5.2))') NINT(sth_gapn), sth_gapst, sth_gapdec
       IF (xp_m > 0) WRITE(stdout, '(5x,"rtsc xp: fit residual ",F7.4," coef",8(1x,F8.4))') xp_rho, &
            (ABS(xp_cprint(i)), i = 1, xp_ncprint)
       WRITE(stdout, '(5x,"rtsc solve t: dpot ",F8.3," ortho ",F8.3," cg ",F8.3," drho ",F8.3, &
@@ -556,7 +559,7 @@ CONTAINS
       ENDDO
       !
       CALL sth_engine_set_k(ik, npw, npwq, nock, nockq, wk(ikk), idxk(1:npw), idxkq(1:npwq), evc, evq, &
-                            et(:, ikk), g2kin, vkb, wwg(:, 1:nock), wg1(1:nock))
+                            et(:, ikk), g2kin, vkb, wwg(:, 1:nock), wg1(1:nock), et_kq=et(:, ikq))
       DO ipert = 1, npert
         nrec = (ipert - 1) * nksq + ik
         CALL get_buffer(dvpsi, lrdvpsi, iudvpsi, nrec)
