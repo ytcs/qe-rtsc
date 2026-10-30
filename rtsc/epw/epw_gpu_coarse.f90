@@ -286,7 +286,8 @@ CONTAINS
     istat = cudaMemcpy(d_ik, indk, npw);       CALL chk(istat, 'H2D indk')
     istat = cudaMemcpy(d_ck, ck, ldc * nbnd);  CALL chk(istat, 'H2D ck')
     istat = cudaMemcpy(d_cq, cq, ldc * nbnd);  CALL chk(istat, 'H2D cq')
-    istat = fdx_geom1(nr, nrx, npwq, indq, ncol)
+    ! the stick buffer holds at most 256 columns (fdx_dpot_d loops over chunks): ~0.1 GB per rank at B2
+    istat = fdx_geom1(nr, nrx, npwq, indq, MIN(ncol, 256))
     IF (istat /= 0) THEN
       WRITE(*, '(a,i0,a)') 'epw_gpu_coarse: RTSC_EPW_FDX geometry unsupported (', istat, '), Parseval form kept'
       fdx_ok = .FALSE.
