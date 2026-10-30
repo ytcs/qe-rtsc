@@ -358,6 +358,7 @@ CONTAINS
     USE control_flags, ONLY : io_level
     USE gvect,     ONLY : mill
     USE klist,     ONLY : igk_k
+    USE io_global, ONLY : stdout
     LOGICAL, INTENT(INOUT) :: kdone(nks), kskip(nks)
     INTEGER :: ik, i0, isym, tr, g0(3), jk, i1, j1
     REAL(DP) :: xt(3), xs(3)
@@ -365,8 +366,9 @@ CONTAINS
     LOGICAL :: found, keyed, hit
     INTEGER(8) :: key, c0, c1, cr
     CHARACTER(LEN=16) :: sv
-    INTEGER :: ios
+    INTEGER :: ios, miss(4), nprt
     !
+    miss = 0; nprt = 0
     CALL start_clock('nscf_symrot')
     CALL SYSTEM_CLOCK(c0, cr)
     CALL h_reset(tl)
@@ -399,7 +401,25 @@ CONTAINS
       hit = .FALSE.
       IF (keyed) THEN
         IF (h_get(tc, key, i0, isym, tr)) THEN
-          IF (g0_of(cxk(:, i0), xt, isym, tr, g0)) hit = map_ok(cngw(i0), cmill(:, :, i0), ik, isym, tr, g0)
+          IF (g0_of(cxk(:, i0), xt, isym, tr, g0)) THEN
+            hit = map_ok(cngw(i0), cmill(:, :, i0), ik, isym, tr, g0)
+            IF (.NOT. hit) THEN
+              IF (cngw(i0) /= ngk(ik)) THEN
+                miss(3) = miss(3) + 1
+              ELSE
+                miss(4) = miss(4) + 1
+              ENDIF
+              IF (nprt < 3) THEN
+                nprt = nprt + 1
+                WRITE(stdout, '(5x,"symrot miss: k ",3F10.6," src ",3F10.6," op ",I3," tr ",I2," ngs ",I0," ngk ",I0)') &
+                     xt, cxk(:, i0), isym, tr, cngw(i0), ngk(ik)
+              ENDIF
+            ENDIF
+          ELSE
+            miss(2) = miss(2) + 1
+          ENDIF
+        ELSEIF (nc > 0) THEN
+          miss(1) = miss(1) + 1
         ENDIF
       ENDIF
       DO i1 = 1, nc
@@ -459,6 +479,8 @@ CONTAINS
       CALL pos_set(ik, 0)
     ENDDO
     DEALLOCATE(mrep)
+    IF (ANY(miss > 0)) WRITE(stdout, '(5x,"rtsc nscf symrot: cache misses: no image ",I0,", G0 ",I0,", sphere size ",I0, &
+         &", sphere map ",I0)') miss
     !$acc update device(et)
     CALL SYSTEM_CLOCK(c1)
     t_plan = t_plan + REAL(c1 - c0, DP) / REAL(cr, DP)
