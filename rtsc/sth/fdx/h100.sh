@@ -38,9 +38,16 @@ for s in B1 B2; do for o in 1 2 3; do echo "-- $s kernel $o"; FDX_ONLY=$o NOPF=1
 echo "== dense V(G-G') as a GEMM (item 7)"
 $BIN/gemmbench
 echo "== $(date -u +%H:%M:%S) phase 1 done"
+# CBSR Stage 0 (groups/theory/returns/M4/S.md): runs on the GPU while phase 2 compiles on the CPUs
+CBP=
+if [ -f src/rtsc/sth/fdx/cbsrbench.cu ]; then
+  nvcc -O3 -arch=sm_$ARCH -I$NV/math_libs/13.2/include src/rtsc/sth/fdx/cbsrbench.cu -o $BIN/cbsrbench \
+       -L$NV/math_libs/13.2/lib64 -Xlinker -rpath=$NV/math_libs/13.2/lib64 -lcublas -lcusolver \
+    && { $BIN/cbsrbench > $OUT/cbsr.log 2>&1 & CBP=$!; echo "cbsrbench started (pid $CBP) -> $OUT/cbsr.log"; }
+fi
 
 # ---------------- phase 2: in-situ ph.x, B1 frozen q2, fftdx off / on (skip with PHASE2=0) ----------------
-[ "${PHASE2:-1}" = 1 ] || exit 0
+[ "${PHASE2:-1}" = 1 ] || { [ -n "$CBP" ] && wait $CBP && cat $OUT/cbsr.log; exit 0; }
 echo "== $(date -u +%H:%M:%S) warm build (sm_90, branch $SHA, cuFFTDx on)"
 mkdir -p /root/rtsc
 curl -sSfL https://raw.githubusercontent.com/ytcs/qe-rtsc/$SHA/rtsc/pod/warm.sh -o /root/warm.sh
@@ -48,6 +55,7 @@ curl -sSfL https://raw.githubusercontent.com/ytcs/qe-rtsc/$SHA/rtsc/pod/warm.sh 
 sed -i '/save\.sh/d' /root/warm.sh
 grep -c "save.sh" /root/warm.sh
 BRANCH=$SHA CC=$ARCH J=$(nproc) MDX=$MDX CUTLASS=$CUTLASS bash /root/warm.sh 2>&1 | tail -3
+[ -n "$CBP" ] && { wait $CBP; echo "== $(date -u +%H:%M:%S) CBSR Stage 0"; cat $OUT/cbsr.log; }
 cd /root/rtsc && source env.sh
 B=/root/rtsc/qe-rtsc/rtsc/bench; R=$OUT/runs; Q=/root/rtsc/qe-rtsc/build-gpu/bin
 mkdir -p $R/scf && cd $R/scf && cp $B/B1/frozen/*.in . && sed -i "s|@PSEUDO@|$B/../pseudo/sg15|" *.in
