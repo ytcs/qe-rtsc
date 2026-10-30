@@ -173,31 +173,53 @@ CONTAINS
     REAL(DP), INTENT(IN) :: xs(3)
     COMPLEX(DP), INTENT(IN) :: ws(:,:)
     COMPLEX(DP), INTENT(OUT) :: evc(npwx, nbnd)
-    INTEGER :: ig, j, mr(3), ir
+    INTEGER :: ig, j, mr(3), ib
     REAL(DP) :: arg
-    COMPLEX(DP) :: ph
     LOGICAL :: hasft
+    INTEGER, ALLOCATABLE :: imap(:)
+    COMPLEX(DP), ALLOCATABLE :: ph(:)
     hasft = ANY(ABS(ft(:, isym)) > 1.d-12)
     IF (hasft) nft = nft + 1
-    evc = (0.d0, 0.d0)
+    ALLOCATE(imap(ngs))
+    IF (hasft) ALLOCATE(ph(ngs))
     DO ig = 1, ngs
       DO j = 1, 3
         mr(j) = tr * (s(j, 1, isym) * ms(1, ig) + s(j, 2, isym) * ms(2, ig) + s(j, 3, isym) * ms(3, ig)) - g0(j)
       ENDDO
-      ir = pos(lin(mr))
+      imap(ig) = pos(lin(mr))
       IF (hasft) THEN
         arg = tpi * ((xs(1) + ms(1, ig)) * ft(1, isym) + (xs(2) + ms(2, ig)) * ft(2, isym) + &
                      (xs(3) + ms(3, ig)) * ft(3, isym))
-        ph = CMPLX(COS(arg), -SIN(arg), KIND=DP)
-      ELSE
-        ph = (1.d0, 0.d0)
-      ENDIF
-      IF (tr == 1) THEN
-        evc(ir, 1:nbnd) = ws(ig, 1:nbnd) * ph
-      ELSE
-        evc(ir, 1:nbnd) = CONJG(ws(ig, 1:nbnd) * ph)
+        ph(ig) = CMPLX(COS(arg), -SIN(arg), KIND=DP)
       ENDIF
     ENDDO
+    ! band-outer copy (contiguous reads; the sphere maps onto itself, so every row 1..ngs is written)
+    DO ib = 1, nbnd
+      evc(ngs + 1:npwx, ib) = (0.d0, 0.d0)
+      IF (hasft) THEN
+        IF (tr == 1) THEN
+          DO ig = 1, ngs
+            evc(imap(ig), ib) = ws(ig, ib) * ph(ig)
+          ENDDO
+        ELSE
+          DO ig = 1, ngs
+            evc(imap(ig), ib) = CONJG(ws(ig, ib) * ph(ig))
+          ENDDO
+        ENDIF
+      ELSE
+        IF (tr == 1) THEN
+          DO ig = 1, ngs
+            evc(imap(ig), ib) = ws(ig, ib)
+          ENDDO
+        ELSE
+          DO ig = 1, ngs
+            evc(imap(ig), ib) = CONJG(ws(ig, ib))
+          ENDDO
+        ENDIF
+      ENDIF
+    ENDDO
+    DEALLOCATE(imap)
+    IF (hasft) DEALLOCATE(ph)
   END SUBROUTINE rotate
   !
   LOGICAL FUNCTION hkey(x, key)
