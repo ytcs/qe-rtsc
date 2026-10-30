@@ -2084,6 +2084,11 @@ CONTAINS
       BLOCK
         INTEGER(8) :: freeb, totb, pre
         INTEGER :: istat
+        ! clear a pending (non-sticky) error left by other code, as sth_engine_setup does, so that zero_c's kerr
+        ! reports only its own launch (with RTSC_NSCF_SYMROT, nscf_engine, which used to clear it, may not run)
+        istat = cudaGetLastError()
+        IF (istat /= cudaSuccess) WRITE(*, '(A,A)') 'sth_engine: cleared a pending CUDA error from earlier code: ', &
+             TRIM(cudaGetErrorString(istat))
         pre = 16_8 * npwx * nproj * nksq + 16_8 * npwx * nbox
         CALL sth_mem_trim()
         istat = cudaMemGetInfo(freeb, totb)
