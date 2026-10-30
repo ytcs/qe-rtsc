@@ -73,7 +73,10 @@ CONTAINS
     USE wvfct,            ONLY : nbnd, npwx
     USE eqv,              ONLY : dpsi, dvpsi
 #if defined(__CUDA)
-    USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready
+    USE sth_engine,       ONLY : sth_engine_solve, sth_engine_get_dpsi, sth_engine_ready, sth_engine_qready, &
+                                 sth_timing, sth_prof, sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, &
+                                 sth_nsteps, sth_ncolapp, sth_nvalid, sth_nact0, sth_r0hist, sth_r0med, &
+                                 sth_t_gemm, sth_t_fft
     USE qpoint,           ONLY : xq
 #endif
     !
@@ -139,9 +142,19 @@ CONTAINS
     ALLOCATE(dv(dffts%nnr, npert), dr(dffts%nnr, npert))
     dv(:, :) = dvscfins(:, 1, :)
     dr(:, :) = drhoout(:, 1, :)
+    sth_timing = sth_env_flag('RTSC_STH_TIME')
+    sth_prof = sth_env_flag('RTSC_STH_PROF')
     CALL sth_engine_solve(first_iter, thresh, dv, dr, tot_num_iter, tot_cg_calls, nfail)
     drhoout(:, 1, :) = dr(:, :)
     DEALLOCATE(dv, dr)
+    ! rtsc solve profile (SOLVE-LOG.md): one line per call
+    IF (sth_timing) THEN
+      WRITE(stdout, '(5x,"rtsc solve: thr ",ES9.2," ncol ",I0," act0 ",I0," steps ",I0," colapp ",I0, &
+           &" r0med ",ES9.2," r0hist ",12(1x,I0))') thresh, sth_nvalid, sth_nact0, sth_nsteps, sth_ncolapp, &
+           sth_r0med, sth_r0hist
+      WRITE(stdout, '(5x,"rtsc solve t: dpot ",F8.3," ortho ",F8.3," cg ",F8.3," drho ",F8.3, &
+           &" gemm ",F8.3," fft ",F8.3)') sth_t_dpot, sth_t_ortho, sth_t_cg, sth_t_drho, sth_t_gemm, sth_t_fft
+    ENDIF
     !
     ! dpsi goes back to iudwf once per irrep (sth_batched_flush, end of dfpt_kernel) or before the
     ! engine state is replaced; nothing reads iudwf between the calls of one irrep on this path

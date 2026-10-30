@@ -63,6 +63,13 @@ MODULE sth_engine
                             sth_t_total = 0, sth_t_setup = 0
   INTEGER, PUBLIC, SAVE :: sth_nsteps = 0
   INTEGER(8), PUBLIC, SAVE :: sth_ncolapp = 0      ! column-operator applications in the CG
+  ! rtsc solve-work profile (sth_timing): valid columns, columns active at the first test, initial
+  ! residual sqrt(<g|h_diag|g>)/thresh histogram over the active columns (bins of 1/2 decade from
+  ! 10**0, last bin open), and the time of the apply_op parts (projector GEMMs vs FFT loop)
+  INTEGER, PUBLIC, SAVE :: sth_nvalid = 0, sth_nact0 = 0
+  INTEGER, PUBLIC, SAVE :: sth_r0hist(0:11) = 0
+  REAL(dp), PUBLIC, SAVE :: sth_r0med = 0, sth_t_gemm = 0, sth_t_fft = 0
+  LOGICAL, PUBLIC, SAVE :: sth_prof = .FALSE.      ! sync inside apply_op to time GEMMs vs FFTs
   INTEGER, PUBLIC, SAVE :: sth_bmax = 256          ! FFT chunk (largest batch); set before init
   INTEGER, PUBLIC, SAVE :: sth_debug_slot = 0      ! >0: print the CG history of this slot
   INTEGER, PUBLIC, SAVE :: sth_opvar = 0           ! testing: 1 = (g2 - e) x + Vx (same operator, other rounding)
@@ -813,6 +820,75 @@ CONTAINS
     ENDDO
   END SUBROUTINE ortho_exact
   !
+  SUBROUTINE r0_profile(thr)
+    ! histogram of sqrt(rho)/thresh over the columns still active after the first test (rho of
+    ! those columns was just written by k_check); converged columns are not counted
+    REAL(dp), INTENT(IN) :: thr
+    REAL(dp), ALLOCATABLE :: rh(:), v(:)
+    INTEGER, ALLOCATABLE :: cv(:), hv(:)
+    INTEGER :: i, b, m
+    ALLOCATE(rh(nsl), cv(nsl), hv(nvalid))
+    rh = d_rho
+    cv = d_conv
+    hv = d_valid
+    sth_r0hist = 0
+    ALLOCATE(v(nvalid))
+    m = 0
+    DO i = 1, nvalid
+      IF (cv(hv(i)) /= 0) CYCLE
+      m = m + 1
+      v(m) = SQRT(MAX(rh(hv(i)), 0.0_dp)) / thr
+      b = MIN(11, MAX(0, INT(2.0_dp * LOG10(MAX(v(m), 1.0_dp)))))
+      sth_r0hist(b) = sth_r0hist(b) + 1
+    ENDDO
+    sth_r0med = 0
+    IF (m > 0) THEN
+      CALL sort_r(v, m)
+      sth_r0med = v((m + 1) / 2)
+    ENDIF
+    DEALLOCATE(rh, cv, hv, v)
+  END SUBROUTINE r0_profile
+  !
+  SUBROUTINE sort_r(a, n)
+    ! in-place heapsort (ascending)
+    INTEGER, INTENT(IN) :: n
+    REAL(dp), INTENT(INOUT) :: a(n)
+    INTEGER :: i, j, l, ir
+    REAL(dp) :: t
+    IF (n < 2) RETURN
+    l = n / 2 + 1
+    ir = n
+    DO
+      IF (l > 1) THEN
+        l = l - 1
+        t = a(l)
+      ELSE
+        t = a(ir)
+        a(ir) = a(1)
+        ir = ir - 1
+        IF (ir == 1) THEN
+          a(1) = t
+          RETURN
+        ENDIF
+      ENDIF
+      i = l
+      j = l + l
+      DO WHILE (j <= ir)
+        IF (j < ir) THEN
+          IF (a(j) < a(j + 1)) j = j + 1
+        ENDIF
+        IF (t < a(j)) THEN
+          a(i) = a(j)
+          i = j
+          j = j + j
+        ELSE
+          j = ir + 1
+        ENDIF
+      ENDDO
+      a(i) = t
+    ENDDO
+  END SUBROUTINE sort_r
+  !
   SUBROUTINE apply_op(x, y, list, nl)
     ! y = (H_kq - e_n + alpha_pv P_v) x on the nl columns list(1:nl); other slots of y are garbage
     COMPLEX(dp), DEVICE :: x(npwx, *), y(npwx, *)
@@ -820,11 +896,18 @@ CONTAINS
     INTEGER, INTENT(IN) :: nl
     INTEGER :: s0, nb, ip, np
     REAL(dp) :: scale
+    REAL(dp) :: ta, tb
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
+    IF (sth_prof) THEN
+      CALL tsync(); ta = wtime()
+    ENDIF
     CALL gemm_proj(x, d_cf)
     CALL k_coef_h<<<nsl, 32 * ((nproj + 31) / 32), 0, strm>>>(d_cf2, d_cf, d_dmat, nproj, nkb, nslot, &
          npert, nksq, d_nockq, alpha_pv)
     CALL kerr('coef_h')
+    IF (sth_prof) THEN
+      CALL tsync(); tb = wtime(); sth_t_gemm = sth_t_gemm + tb - ta; ta = tb
+    ENDIF
     s0 = 0
     DO WHILE (s0 < nl)
       nb = MIN(sth_bmax, nl - s0)
@@ -843,7 +926,13 @@ CONTAINS
       CALL kerr('gather_h')
       s0 = s0 + nb
     ENDDO
+    IF (sth_prof) THEN
+      CALL tsync(); tb = wtime(); sth_t_fft = sth_t_fft + tb - ta; ta = tb
+    ENDIF
     CALL gemm_back(d_cf2, y, (1.0_dp, 0.0_dp))
+    IF (sth_prof) THEN
+      CALL tsync(); tb = wtime(); sth_t_gemm = sth_t_gemm + tb - ta
+    ENDIF
   END SUBROUTINE apply_op
   !
   !=================================================================================================
@@ -1201,6 +1290,8 @@ CONTAINS
     istat = cudaGetLastError()   ! see sth_engine_setup
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     h_dpsi_valid = .FALSE.
+    sth_nvalid = nvalid
+    sth_t_gemm = 0; sth_t_fft = 0
     d_drho = drho
     IF (.NOT. first_iter) d_dv = dvscf
     istat = cudaDeviceSynchronize()
@@ -1271,6 +1362,10 @@ CONTAINS
       istat = cudaMemcpyAsync(h_nact, d_nact, 1, strm)
       CALL tsync()
       nact = h_nact(1)
+      IF (iter == 1) THEN
+        sth_nact0 = nact
+        IF (sth_timing) CALL r0_profile(thresh)
+      ENDIF
       sth_nsteps = iter
       IF (nact == 0) EXIT
       CALL apply_op(d_h, d_t, d_act, nact)
