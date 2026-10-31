@@ -2214,6 +2214,12 @@ CONTAINS
     istat = cudaMemGetInfo(freeb, totb)
     per = 16_8 * nnr * nslot
     psir_kc = INT(MAX(0_8, MIN(INT(nksq, 8), (freeb - res) / per)))
+    ! RTSC_STH_PSIR_KC: a cap on the cached k-points (tests the cached / recomputed split where everything would fit)
+    CALL get_environment_variable('RTSC_STH_PSIR_KC', sv, STATUS=istat)
+    IF (istat == 0 .AND. LEN_TRIM(sv) > 0) THEN
+      READ(sv, *, IOSTAT=istat) b0
+      IF (istat == 0) psir_kc = MAX(0, MIN(psir_kc, b0))
+    ENDIF
     IF (psir_kc > 0) THEN
       nbx = nslot * psir_kc
       ALLOCATE(d_psir(nnr, nbx))
