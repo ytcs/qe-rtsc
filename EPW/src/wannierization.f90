@@ -100,6 +100,7 @@
     USE io_files,      ONLY : prefix
     USE io_var,        ONLY : iuwinfil
     USE io_global,     ONLY : meta_ionode, stdout
+    USE io,            ONLY : rtsc_novme
     USE input,         ONLY : nbndsub, nwanxx, proj, iprint, dis_win_min, &
                               dis_win_max, dis_froz_min, dis_froz_max, num_iter, &
                               bands_skipped, wdata, auto_projections, lsda
@@ -220,8 +221,12 @@
       !
       ! rtsc epw4 (groups/compute/EPW4-LOG.md): RTSC_W90_NOHR=1 does not add write_hr when the input does not set it,
       ! so wannier90 skips its plotting stage (H(R) and the _hr.dat, which EPW never reads). Default off.
+      ! Without write_hr wannier90 also leaves the .bvec file empty, which vmebloch2wan reads: NOHR acts only
+      ! together with RTSC_EPW_NOVME (which skips vmebloch2wan), and is ignored otherwise.
       CALL GET_ENVIRONMENT_VARIABLE('RTSC_W90_NOHR', rtsc_ev)
-      rtsc_nohr = TRIM(rtsc_ev) == '1'
+      rtsc_nohr = TRIM(rtsc_ev) == '1' .AND. rtsc_novme()
+      IF (TRIM(rtsc_ev) == '1' .AND. .NOT. rtsc_nohr) &
+        WRITE(stdout, '(5x,a)') 'rtsc: RTSC_W90_NOHR ignored (needs RTSC_EPW_NOVME=1: the .bvec file is written with write_hr)'
       IF (rtsc_nohr .AND. notfound) WRITE(stdout, '(5x,a)') 'rtsc: RTSC_W90_NOHR, write_hr not set'
       IF (notfound .AND. .NOT. rtsc_nohr) WRITE(iuwinfil, *) "write_hr = .true."
       !
