@@ -344,7 +344,7 @@ MODULE sth_engine
   !   application per step), sqrt(<g|h_diag|g>) < thresh on EVERY column (the per-column guard), failing columns take
   !   another step (at most cb_rfmax).
   ! Columns are processed one chunk of whole bases (stars) at a time, at most cb_cmax gathered columns per chunk.
-  LOGICAL, SAVE :: cbsr_rf = .FALSE., cbsr_rf_read = .FALSE., cb_tf32 = .FALSE., cb_chk = .FALSE.
+  LOGICAL, SAVE :: cbsr_rf = .FALSE., cbsr_rf_read = .FALSE., cb_tf32 = .FALSE., cb_chk = .FALSE., cb_act = .TRUE.
   INTEGER, SAVE :: cb_m0 = 64, cb_cmax = 8192, cb_rfmax = 6, cb_nch = 0, cb_nbt = 0, cb_cw = 0
   REAL(dp), SAVE :: cb_d0win = 1.0_dp
   INTEGER, ALLOCATABLE, SAVE :: cb_chb0(:), cb_chb1(:), cb_chc0(:), cb_chnc(:), cb_bN(:), cb_bnb(:), cb_boff(:)
@@ -3560,6 +3560,8 @@ CONTAINS
       cb_chk = istat == 0 .AND. TRIM(sv) == '1'
       CALL get_environment_variable('RTSC_STH_CBSR_TF32', sv, STATUS=istat)
       cb_tf32 = istat == 0 .AND. TRIM(sv) == '1'
+      CALL get_environment_variable('RTSC_STH_CBSR_ACT', sv, STATUS=istat)
+      cb_act = .NOT. (istat == 0 .AND. TRIM(sv) == '0')
       CALL get_environment_variable('RTSC_STH_CBSR_M0', sv, STATUS=istat)
       IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) cb_m0
       CALL get_environment_variable('RTSC_STH_CBSR_CMAX', sv, STATUS=istat)
@@ -4145,14 +4147,139 @@ CONTAINS
     sth_t_crfg = sth_t_crfg + wtime() - ta
   END SUBROUTINE cbsr_apply_rf
   !
+  SUBROUTINE cbsr_apply_rf_act(gs, dst, nact, done)
+    !! rf, later steps: dst -= R~ gs on the nact active columns only (d_act), grouped per basis into one small plan;
+    !! done = .FALSE. (nothing applied) if the gathered width exceeds the chunk buffers
+    COMPLEX(dp), DEVICE :: gs(npwx, *), dst(npwx, *)
+    INTEGER, INTENT(IN) :: nact
+    LOGICAL, INTENT(OUT) :: done
+    INTEGER, ALLOCATABLE :: ha(:), cnt(:), wid(:), co(:), ord(:), hsc(:), hgl(:), bN(:), bnb(:), boff(:)
+    TYPE(c_devptr), ALLOCATABLE :: hA(:), hX(:), hY(:), hA2(:), hX2(:), hY2(:)
+    TYPE(c_devptr), DEVICE, ALLOCATABLE :: pA(:), pX(:), pY(:), pA2(:), pX2(:), pY2(:)
+    INTEGER, DEVICE, ALLOCATABLE :: dsc(:), dgl(:)
+    INTEGER :: i, sc, k, sb, nb, ctot, w, nbt, b, o, istat, ncolk, n1, ny
+    REAL(dp) :: ta
+    done = .FALSE.
+    CALL tsync(); ta = wtime()
+    ncolk = nslot * npert
+    n1 = cb_n0 - cb_m0
+    ALLOCATE(ha(nact), cnt(cb_nqs), wid(cb_nqs), co(cb_nqs), ord(cb_nqs))
+    ha = d_act(1:nact)
+    cnt = 0
+    DO i = 1, nact
+      k = (ha(i) - 1) / ncolk + 1
+      cnt(h_ckq(k)) = cnt(h_ckq(k)) + 1
+    ENDDO
+    wid = cb_pad * ((cnt + cb_pad - 1) / cb_pad)
+    nb = 0
+    DO w = cb_pad, MAXVAL(wid), cb_pad
+      DO sb = 1, cb_nqs
+        IF (wid(sb) == w) THEN
+          nb = nb + 1
+          ord(nb) = sb
+        ENDIF
+      ENDDO
+    ENDDO
+    ctot = 0
+    DO i = 1, nb
+      co(ord(i)) = ctot
+      ctot = ctot + wid(ord(i))
+    ENDDO
+    IF (ctot > SIZE(d_cx, 2) .OR. nb == 0) THEN
+      DEALLOCATE(ha, cnt, wid, co, ord)
+      RETURN
+    ENDIF
+    ALLOCATE(hsc(ctot), hgl(ctot), bN(nb), bnb(nb), boff(nb))
+    hsc = 0
+    DO i = 1, nb
+      hgl(co(ord(i)) + 1:co(ord(i)) + wid(ord(i))) = ord(i)
+    ENDDO
+    cnt = 0
+    DO i = 1, nact
+      k = (ha(i) - 1) / ncolk + 1
+      sb = h_ckq(k)
+      cnt(sb) = cnt(sb) + 1
+      hsc(co(sb) + cnt(sb)) = ha(i)
+    ENDDO
+    nbt = 0
+    DO i = 1, nb
+      IF (i == 1) THEN
+        nbt = 1; bN(1) = wid(ord(1)); bnb(1) = 0; boff(1) = 0
+      ELSE IF (wid(ord(i)) /= wid(ord(i - 1))) THEN
+        nbt = nbt + 1; bN(nbt) = wid(ord(i)); bnb(nbt) = 0; boff(nbt) = i - 1
+      ENDIF
+      bnb(nbt) = bnb(nbt) + 1
+    ENDDO
+    ALLOCATE(hA(nb), hX(nb), hY(nb), hA2(nb), hX2(nb), hY2(nb), pA(nb), pX(nb), pY(nb), pA2(nb), pX2(nb), pY2(nb))
+    DO i = 1, nb
+      sb = ord(i)
+      IF (cb_qs(sb) > 0) THEN
+        hA(i) = c_devloc(cb_rep(cb_qs(sb))%u); hA2(i) = c_devloc(cb_rep(cb_qs(sb))%u32)
+      ELSE
+        hA(i) = c_devloc(cb_tmp(-cb_qs(sb))%u); hA2(i) = c_devloc(cb_tmp(-cb_qs(sb))%u32)
+      ENDIF
+      hX(i) = c_devloc(d_cx(1, co(sb) + 1)); hY(i) = c_devloc(d_cy(1, co(sb) + 1))
+      hX2(i) = c_devloc(d_cx32(1, co(sb) + 1)); hY2(i) = c_devloc(d_cy32(1, co(sb) + 1))
+    ENDDO
+    pA = hA; pX = hX; pY = hY; pA2 = hA2; pX2 = hX2; pY2 = hY2
+    ALLOCATE(dsc(ctot), dgl(ctot))
+    dsc = hsc; dgl = hgl
+    IF (cb_tf32) THEN
+      istat = cublasSetMathMode(hblas, CUBLAS_TF32_TENSOR_OP_MATH)
+      CALL chk(istat, 'cublasSetMathMode (tf32)')
+    ENDIF
+    ny = MIN(ctot, 65535)
+    CALL k_cb_gather<<<dim3(nblk(cb_n0, TPB), ny, 1), TPB, 0, strm>>>(d_cx, gs, dsc, d_ckmap, d_ckph, d_cktr, &
+         d_npwq, cb_n0, npwx, ncolk, ctot)
+    CALL kerr('cb_gather (rf act)')
+    CALL k_cb_z2c<<<4096, TPB, 0, strm>>>(d_cx32, d_cx, INT(cb_n0, 8) * ctot)
+    DO b = 1, nbt
+      o = boff(b) + 1
+      istat = cublasZgemmBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, cb_m0, bN(b), cb_n0, (1.0_dp, 0.0_dp), &
+           pA(o:), cb_n0, pX(o:), cb_n0, (0.0_dp, 0.0_dp), pY(o:), cb_m0, bnb(b))
+      CALL chk(istat, 'cublasZgemmBatched (rf act U0^H g)')
+      istat = cublasCgemmBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, n1, bN(b), cb_n0, (1.0_sp, 0.0_sp), &
+           pA2(o:), cb_n0, pX2(o:), cb_n0, (0.0_sp, 0.0_sp), pY2(o:), n1, bnb(b))
+      CALL chk(istat, 'cublasCgemmBatched (rf act U1^H g)')
+    ENDDO
+    CALL k_cb_scale_rf<<<dim3(nblk(cb_n0, TPB), ny, 1), TPB, 0, strm>>>(d_cy, d_cy32, d_cqlam, dgl, dsc, d_etk, cbsr_v0, &
+         cb_n0, cb_m0, nbnd, nslot, ncolk, ctot)
+    CALL kerr('cb_scale_rf (act)')
+    DO b = 1, nbt
+      o = boff(b) + 1
+      istat = cublasZgemmBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, cb_n0, bN(b), cb_m0, (1.0_dp, 0.0_dp), &
+           pA(o:), cb_n0, pY(o:), cb_m0, (0.0_dp, 0.0_dp), pX(o:), cb_n0, bnb(b))
+      CALL chk(istat, 'cublasZgemmBatched (rf act U0 c)')
+      istat = cublasCgemmBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, cb_n0, bN(b), n1, (1.0_sp, 0.0_sp), &
+           pA2(o:), cb_n0, pY2(o:), n1, (0.0_sp, 0.0_sp), pX2(o:), cb_n0, bnb(b))
+      CALL chk(istat, 'cublasCgemmBatched (rf act U1 c)')
+    ENDDO
+    CALL k_cb_addc<<<4096, TPB, 0, strm>>>(d_cx, d_cx32, INT(cb_n0, 8) * ctot)
+    CALL k_cb_scatter_sub<<<dim3(nblk(cb_n0, TPB), ny, 1), TPB, 0, strm>>>(dst, d_cx, dsc, d_ckmap, d_ckph, &
+         d_cktr, d_npwq, cb_n0, npwx, ncolk, ctot)
+    CALL kerr('cb_scatter_sub (act)')
+    IF (cb_tf32) THEN
+      istat = cublasSetMathMode(hblas, CUBLAS_DEFAULT_MATH)
+      CALL chk(istat, 'cublasSetMathMode (default)')
+    ENDIF
+    CALL tsync()
+    rf_gcols = rf_gcols + ctot
+    sth_t_crfg = sth_t_crfg + wtime() - ta
+    DEALLOCATE(ha, cnt, wid, co, ord, hsc, hgl, bN, bnb, boff, hA, hX, hY, hA2, hX2, hY2, pA, pX, pY, pA2, pX2, pY2, dsc, dgl)
+    done = .TRUE.
+  END SUBROUTINE cbsr_apply_rf_act
+  !
   SUBROUTINE cbsr_rf_solve(first_iter, thresh)
     !! rf: dpsi refined from its previous value under QE's own test on the true FP64 residual, every column certified
     LOGICAL, INTENT(IN) :: first_iter
     REAL(dp), INTENT(IN) :: thresh
     INTEGER :: istat, nact, n0a, st, ist(0:8)
+    INTEGER(8) :: gp_call, gp0
+    LOGICAL :: act_done
     REAL(dp) :: ta
     CALL tsync(); ta = wtime()
     sth_t_crfg = 0.0_dp
+    gp_call = 0; gp0 = rf_gcols
     IF (first_iter) THEN
       CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
       CALL zero_c(d_h, INT(npwx, 8) * nsl)
@@ -4192,7 +4319,13 @@ CONTAINS
       ! one step: the correction is computed on every planned column; converged columns have g = 0 and do not move
       CALL k_zero_conv<<<nvalid, TPB, 0, strm>>>(d_g, d_valid, d_conv, npwx, nvalid)
       CALL kerr('zero_conv')
-      CALL cbsr_apply_rf(d_g, d_dpsi)
+      ! later steps on the few columns left: a per-call plan of the active columns only (RTSC_STH_CBSR_ACT=0: full plan)
+      act_done = .FALSE.
+      IF (st >= 2 .AND. cb_act .AND. 4 * nact < nvalid) CALL cbsr_apply_rf_act(d_g, d_dpsi, nact, act_done)
+      IF (.NOT. act_done) CALL cbsr_apply_rf(d_g, d_dpsi)
+      IF (act_done) gp_call = gp_call + rf_gcols - gp0
+      IF (.NOT. act_done) gp_call = gp_call + cb_ctot
+      gp0 = rf_gcols
       CALL apply_op(d_dpsi, d_t, d_act, nact)
       sth_ncolapp = sth_ncolapp + nact
       CALL k_copy_list<<<nact, TPB, 0, strm>>>(d_h, d_t, d_act, npwx)
@@ -4202,9 +4335,9 @@ CONTAINS
     IF (nact > 0) rf_conv(8) = rf_conv(8) + nact
     sth_nsteps = st
     sth_t_crf = wtime() - ta
-    IF (sth_timing) WRITE(*, '(A,ES9.2,A,I8,A,I2,A,9I8,A,I8,A,F8.3,A,F8.3,A)') '     rtsc cbsr rf: thr ', thresh, ' columns ', &
+    IF (sth_timing) WRITE(*, '(A,ES9.2,A,I8,A,I2,A,9I8,A,I8,A,F8.3,A,F8.3,A,I9)') '     rtsc cbsr rf: thr ', thresh, ' columns ', &
          nvalid, ' steps ', st, ' converged per step 0..', ist(0:8), ' unconverged ', nact, ' | ', sth_t_crf, ' s (GEMM part ', &
-         sth_t_crfg, ' s)'
+         sth_t_crfg, ' s) gathered GEMM columns', gp_call
   END SUBROUTINE cbsr_rf_solve
   !
   SUBROUTINE apply_op(x, y, list, nl)
