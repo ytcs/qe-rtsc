@@ -3713,8 +3713,10 @@ CONTAINS
     rgib = 2.0_dp
     CALL get_environment_variable('RTSC_STH_CBSR_RESERVE', sv, STATUS=istat)
     IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) rgib
+    ! b2x: the irrep arrays at the q's LARGEST irrep (sth_npmax, set by phqscf), not the first one's npert: with the bases
+    ! filling the device, a later 2-dim irrep otherwise declines (seen at B2 frozen q2, A40)
     reserve = INT(rgib * 1024.0_dp**3, 8) + MERGE(6_8, 8_8, cb_xch .AND. .NOT. cbsr_rf .AND. .NOT. mp_q .AND. &
-              .NOT. lift_q .AND. sth_xp_m == 0) * 16_8 * npwx * nslot * npert * nksq
+              .NOT. lift_q .AND. sth_xp_m == 0) * 16_8 * npwx * nslot * MAX(npert, sth_npmax) * nksq
     ! rf: the chunk buffers (2 FP64 + 2 FP32 arrays of cb_cmax columns) and the build's FP64 staging copy
     IF (cbsr_rf) reserve = reserve + 48_8 * cb_n0 * cb_cmax + 16_8 * cb_n0 * cb_n0
     ! b2x: the exact chunk buffers (2 FP64 arrays of cb_cmax columns) and, with host staging, the staging slot
