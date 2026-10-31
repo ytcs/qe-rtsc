@@ -153,6 +153,10 @@ MODULE sth_engine
   REAL(dp), DEVICE, ALLOCATABLE :: d_r0(:)
   ! RTSC_STH_DEFL: additive spectral preconditioner with the known empty bands at k+q (k_check_defl)
   INTEGER, PUBLIC, SAVE :: sth_defl = 0
+  ! rtsc b2 diagnostic (RTSC_STH_TRUERES=1, DEFL path only): stop on the plain residual norm, and when every column
+  ! has stopped, recompute the true residual A dpsi - rhs once and restart the CG on the columns that fail (<= 3 times)
+  INTEGER, SAVE :: sth_trn = -1
+  INTEGER(8), SAVE :: trn_rechk = 0, trn_fail = 0
   REAL(dp), PUBLIC, SAVE :: sth_dfloor = 1.0e-4_dp
   REAL(dp), DEVICE, ALLOCATABLE :: d_etkq(:,:)
   INTEGER, PUBLIC, SAVE :: sth_xp_m = 0            ! history slots; 0 = off (set before irrep commit)
@@ -675,13 +679,15 @@ CONTAINS
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_check_defl(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
                                              cnt, ethr, first, eta, r0, nst, W, nproj, nkb, nbnd, nockq, &
-                                             etk, etkq, dfloor)
+                                             etk, etkq, dfloor, trn)
     ! k_check with the additive spectral preconditioner (RTSC_STH_DEFL): M^-1 = h_diag +
     ! sum_m |evq_m><evq_m| / (e_m(k+q) - e_n(k)) over the known empty bands m = nockq(k)+1 .. nbnd at
     ! k+q, which are exact eigenvectors of the column operator (eigenvalue e_m - e_n, the smallest
     ! ones). The stopping test is unchanged (sqrt(<g|h_diag|g>) < thresh); the CG recurrence uses
     ! rho = <g|M^-1|g> and h = -M^-1 g + gam h_old.
-    INTEGER, VALUE :: nslot, npert, npwx, nksq, first, nproj, nkb, nbnd
+    INTEGER, VALUE :: nslot, npert, npwx, nksq, first, nproj, nkb, nbnd, trn
+    ! trn = 1 (RTSC_STH_TRUERES, diagnostic): the stopping test uses the plain residual norm ||g||_2 instead of
+    ! QE's sqrt(<g|h_diag|g>); the CG recurrence is unchanged
     REAL(dp), VALUE :: ethr, eta, dfloor
     INTEGER :: list(*), npwq(nksq), conv(*), cnt(*), nst(*), nockq(nksq)
     REAL(dp) :: hd(npwx, nslot, nksq), rho(*), r0(*), etk(nbnd, nksq), etkq(nbnd, nksq)
@@ -690,7 +696,7 @@ CONTAINS
     REAL(dp), SHARED :: gam, rn, cre(MAXE), cim(MAXE), dm(MAXE)
     INTEGER, SHARED :: cvd
     INTEGER :: s, k, n, ig, nq, tid, st, istat, m, ne, m0
-    REAL(dp) :: acc, acc2, rc
+    REAL(dp) :: acc, acc2, rc, rt
     COMPLEX(dp) :: gv, wv, hv
     tid = threadIdx%x
     s = list(blockIdx%x)
@@ -700,28 +706,36 @@ CONTAINS
     m0 = nockq(k)
     ne = MIN(MAXE, nbnd - m0)
     acc = 0.0_dp
+    acc2 = 0.0_dp
     DO ig = tid, nq, blockDim%x
       gv = g(ig, s)
       acc = acc + hd(ig, n, k) * (REAL(gv, dp)**2 + AIMAG(gv)**2)
+      acc2 = acc2 + REAL(gv, dp)**2 + AIMAG(gv)**2
     ENDDO
     red(tid) = acc
+    red2(tid) = acc2
     CALL syncthreads()
     st = blockDim%x / 2
     DO WHILE (st > 0)
-      IF (tid <= st) red(tid) = red(tid) + red(tid + st)
+      IF (tid <= st) THEN
+        red(tid) = red(tid) + red(tid + st)
+        red2(tid) = red2(tid) + red2(tid + st)
+      ENDIF
       CALL syncthreads()
       st = st / 2
     ENDDO
     IF (tid == 1) THEN
       rn = red(1)
+      rt = rn
+      IF (trn == 1) rt = red2(1)
       istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
-      IF (first == 1) r0(s) = SQRT(rn)
+      IF (first == 1) r0(s) = SQRT(rt)
       IF (first == 1) THEN
         nst(s) = 1
       ELSE
         nst(s) = nst(s) + 1
       ENDIF
-      IF (SQRT(rn) < MAX(ethr, eta * r0(s))) THEN
+      IF (SQRT(rt) < MAX(ethr, eta * r0(s))) THEN
         conv(s) = 1
         cvd = 1
       ELSE
@@ -1858,6 +1872,64 @@ CONTAINS
     hw = MAX(mem_hw, total - freeb)
     mem_hw = 0
   END SUBROUTINE sth_mem_take_hw
+  !
+  SUBROUTINE sth_mem_log(tag, need)
+    !! rtsc b2 (RTSC_STH_MEMLOG=1; read-only): the engine's device arrays by component (GiB, from their
+    !! allocated sizes), the driver's in-use total and the high-water so far. Used for the CBSR-B2 memory desk.
+    !! need (optional): the setup's own estimate (bytes), printed with psir_cached
+    CHARACTER(LEN=*), INTENT(IN) :: tag
+    INTEGER(8), INTENT(IN), OPTIONAL :: need
+    INTEGER(8) :: freeb, totb, bw, bev, bps, bbx, bhd, bix, binv, bkq, bg2, bnl, bcol, bcf, bpsx, bdv, bxp, bsp, bcb, bsum
+    INTEGER :: istat, ios
+    CHARACTER(LEN=8) :: sv
+    LOGICAL, SAVE :: first = .TRUE., on = .FALSE.
+    REAL(dp), PARAMETER :: g = 1024.0_dp**3
+    IF (first) THEN
+      CALL get_environment_variable('RTSC_STH_MEMLOG', sv, STATUS=ios)
+      on = ios == 0 .AND. TRIM(sv) == '1'
+      first = .FALSE.
+    ENDIF
+    IF (.NOT. on) RETURN
+    istat = cudaMemGetInfo(freeb, totb)
+    bw = 0; bev = 0; bps = 0; bbx = 0; bhd = 0; bix = 0; binv = 0; bkq = 0; bg2 = 0; bnl = 0
+    bcol = 0; bcf = 0; bpsx = 0; bdv = 0; bxp = 0; bsp = 0; bcb = 0
+    IF (ALLOCATED(d_W)) bw = 16_8 * SIZE(d_W, KIND=8)
+    IF (ALLOCATED(d_evc)) bev = 16_8 * SIZE(d_evc, KIND=8)
+    IF (ALLOCATED(d_psir)) bps = 16_8 * SIZE(d_psir, KIND=8)
+    IF (ALLOCATED(d_box)) bbx = bbx + 16_8 * SIZE(d_box, KIND=8)
+    IF (ALLOCATED(d_box2)) bbx = bbx + 16_8 * SIZE(d_box2, KIND=8)
+    IF (ALLOCATED(d_hd)) bhd = 8_8 * SIZE(d_hd, KIND=8)
+    IF (ALLOCATED(d_wwg)) bhd = bhd + 8_8 * SIZE(d_wwg, KIND=8)
+    IF (ALLOCATED(d_idxk)) bix = 4_8 * (SIZE(d_idxk, KIND=8) + SIZE(d_idxkq, KIND=8))
+    IF (ALLOCATED(d_inv)) binv = 4_8 * SIZE(d_inv, KIND=8)
+    IF (ALLOCATED(d_kqgq)) bkq = 8_8 * SIZE(d_kqgq, KIND=8)
+    IF (ALLOCATED(d_g2)) bg2 = 8_8 * SIZE(d_g2, KIND=8)
+    IF (ALLOCATED(d_db)) bnl = 16_8 * (SIZE(d_db, KIND=8) + SIZE(d_da, KIND=8))
+    IF (ALLOCATED(d_dvb)) bcol = 16_8 * (SIZE(d_dvb, KIND=8) + SIZE(d_d0, KIND=8) + SIZE(d_dpsi, KIND=8) &
+                                         + SIZE(d_g, KIND=8) + SIZE(d_h, KIND=8) + SIZE(d_t, KIND=8))
+    IF (ALLOCATED(d_cf)) bcf = 16_8 * (SIZE(d_cf, KIND=8) + SIZE(d_cf2, KIND=8))
+    IF (ALLOCATED(d_ps)) bpsx = 16_8 * SIZE(d_ps, KIND=8)
+    IF (ALLOCATED(d_dv)) bdv = 16_8 * (SIZE(d_dv, KIND=8) + SIZE(d_drho, KIND=8))
+    IF (ALLOCATED(d_xp)) bxp = 16_8 * SIZE(d_xp, KIND=8)
+    IF (ALLOCATED(s_W)) bsp = 8_8 * (SIZE(s_W, KIND=8) + SIZE(s_box, KIND=8)) + 4_8 * (SIZE(s_hd, KIND=8) + SIZE(s_g2, KIND=8))
+    IF (ALLOCATED(s_e)) bsp = bsp + 8_8 * (SIZE(s_e, KIND=8) + SIZE(s_g, KIND=8) + SIZE(s_h, KIND=8) + SIZE(s_t, KIND=8) &
+                                           + SIZE(s_cf, KIND=8) + SIZE(s_cf2, KIND=8))
+    IF (ALLOCATED(d_cu)) bcb = 16_8 * SIZE(d_cu, KIND=8)
+    IF (ALLOCATED(d_cc)) bcb = bcb + 16_8 * SIZE(d_cc, KIND=8)
+    IF (ALLOCATED(d_clam)) bcb = bcb + 8_8 * SIZE(d_clam, KIND=8)
+    bsum = bw + bev + bps + bbx + bhd + bix + binv + bkq + bg2 + bnl + bcol + bcf + bpsx + bdv + bxp + bsp + bcb
+    WRITE(*, '(A,A,A,8I8,I10)') '     rtsc memlog ', tag, ' dims npwx nslot npert nksq nnr nproj nbnd bmax nbox:', &
+         npwx, nslot, npert, nksq, nnr, nproj, nbnd, sth_bmax, nbox
+    IF (PRESENT(need)) WRITE(*, '(A,A,A,F8.3,A,L2,A,F8.3)') '     rtsc memlog ', tag, ' need GiB', REAL(need, dp) / g, &
+         ' psir_cached', psir_cached, ' free GiB', REAL(freeb, dp) / g
+    WRITE(*, '(A,A,A,3F8.3)') '     rtsc memlog ', tag, ' GiB used hw engine_sum:', &
+         REAL(totb - freeb, dp) / g, REAL(MAX(mem_hw, totb - freeb), dp) / g, REAL(bsum, dp) / g
+    WRITE(*, '(A,A,A,17F8.3)') '     rtsc memlog ', tag, &
+         ' GiB W evc psir box hd+wwg idx inv kqg g2 db+da cols6 cf+cf2 ps dv+drho xp fp32 cbsr:', &
+         REAL(bw, dp) / g, REAL(bev, dp) / g, REAL(bps, dp) / g, REAL(bbx, dp) / g, REAL(bhd, dp) / g, REAL(bix, dp) / g, &
+         REAL(binv, dp) / g, REAL(bkq, dp) / g, REAL(bg2, dp) / g, REAL(bnl, dp) / g, REAL(bcol, dp) / g, REAL(bcf, dp) / g, &
+         REAL(bpsx, dp) / g, REAL(bdv, dp) / g, REAL(bxp, dp) / g, REAL(bsp, dp) / g, REAL(bcb, dp) / g
+  END SUBROUTINE sth_mem_log
   !
   REAL(dp) FUNCTION wtime()
     INTEGER(8) :: c, r
@@ -4013,6 +4085,7 @@ CONTAINS
              'sth_engine: psi(r) recomputed per chunk (RTSC_STH_NOPSIR=1), needs ', REAL(need) / 1024.0**3, ' GiB'
       ENDIF
     END BLOCK
+    CALL sth_mem_log('setup', need)
     IF (need > freeb - 1024_8**3) THEN
       WRITE(*, '(A,F8.2,A,F8.2,A)') 'sth_engine: needs ', REAL(need) / 1024.0**3, ' GiB, free ', &
            REAL(freeb) / 1024.0**3, ' GiB'
@@ -4409,6 +4482,7 @@ CONTAINS
     ax_valid = .FALSE.
     CALL tsync()
     CALL sth_mem_sample()
+    CALL sth_mem_log('commit')
     IF (sth_timing) sth_t_commit(4) = wtime() - t0
     ready = .TRUE.
   END SUBROUTINE sth_engine_irrep_commit
@@ -4433,7 +4507,7 @@ CONTAINS
     COMPLEX(dp), INTENT(IN) :: dvscf(nnr, npert)
     COMPLEX(dp), INTENT(INOUT) :: drho(nnr, npert)
     INTEGER, INTENT(OUT) :: tot_num_iter, tot_cg_calls, nfail
-    INTEGER :: istat, iter, nact, s0, nb, ip, np, first, i, k
+    INTEGER :: istat, iter, nact, s0, nb, ip, np, first, i, k, nres
     REAL(dp) :: scale, t0, t1
     REAL(dp), ALLOCATABLE :: kter(:)
     INTEGER, ALLOCATABLE :: conv(:)
@@ -4527,6 +4601,17 @@ CONTAINS
     d_cnt = 0
     d_kter = 0.0_dp
     d_rho = 0.0_dp
+    nres = 0
+    IF (sth_trn < 0) THEN
+      BLOCK
+        CHARACTER(LEN=8) :: sv
+        INTEGER :: ios
+        CALL get_environment_variable('RTSC_STH_TRUERES', sv, STATUS=ios)
+        sth_trn = 0
+        IF (ios == 0 .AND. TRIM(sv) == '1') sth_trn = 1
+        IF (sth_trn == 1) WRITE(*, '(A,L2)') '     rtsc trueres: stop on ||g||_2 + true-residual recheck; DEFL path', sth_defl > 0
+      END BLOCK
+    ENDIF
     istat = cudaDeviceSynchronize()
     CALL k_icopy<<<nblk(nvalid, TPB), TPB, 0, strm>>>(d_act, d_valid, nvalid)
     nact = nvalid
@@ -4546,7 +4631,7 @@ CONTAINS
       ELSEIF (sth_defl > 0) THEN
         CALL k_check_defl<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, &
              d_rho, d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst, d_W, nproj, nkb, nbnd, d_nockq, d_etk, &
-             d_etkq, sth_dfloor)
+             d_etkq, sth_dfloor, MAX(sth_trn, 0))
       ELSE
         CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
              d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst)
@@ -4564,6 +4649,28 @@ CONTAINS
         IF (sth_timing) CALL r0_profile(thresh)
       ENDIF
       sth_nsteps = iter
+      IF (nact == 0 .AND. sth_trn == 1 .AND. sth_defl > 0 .AND. nres < 3) THEN
+        ! true-residual recheck: g = A dpsi - rhs on every valid column; failing columns restart the CG (first = 1)
+        nres = nres + 1
+        CALL k_icopy<<<nblk(nvalid, TPB), TPB, 0, strm>>>(d_act, d_valid, nvalid)
+        nact = nvalid
+        CALL apply_op(d_dpsi, d_g, d_act, nact)
+        CALL k_sub<<<4096, TPB, 0, strm>>>(d_g, d_d0, INT(npwx, 8) * nsl)
+        CALL kerr('sub (trueres)')
+        sth_ncolapp = sth_ncolapp + nact
+        d_conv = 0
+        CALL k_check_defl<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, &
+             d_rho, d_conv, d_cnt, thresh, 1, sth_eta, d_r0, d_nst, d_W, nproj, nkb, nbnd, d_nockq, d_etk, &
+             d_etkq, sth_dfloor, 1)
+        CALL kerr('check (trueres)')
+        CALL k_compact<<<1, 1024, 0, strm>>>(d_act, d_act2, nact, d_conv, d_nact)
+        CALL kerr('compact (trueres)')
+        istat = cudaMemcpyAsync(h_nact, d_nact, 1, strm)
+        CALL tsync()
+        nact = h_nact(1)
+        trn_rechk = trn_rechk + nvalid
+        trn_fail = trn_fail + nact
+      ENDIF
       IF (nact == 0) EXIT
       CALL apply_op(d_h, d_t, d_act, nact)
       sth_ncolapp = sth_ncolapp + nact
@@ -4572,6 +4679,8 @@ CONTAINS
       IF (sth_debug_slot > 0) CALL debug_step(iter)
     ENDDO
     IF (sth_timing) CALL band_profile(thresh)
+    IF (sth_trn == 1 .AND. sth_timing) WRITE(*, '(A,I2,A,I12,A,I12)') '     rtsc trueres: rechecks this call', nres, &
+         ', cumulative columns rechecked', trn_rechk, ', failing (restarted)', trn_fail
     ! dpsi extrapolation: delta = dpsi(k) - dpsi(k-1) into history slot xp_rec (d_g is free after CG)
     IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
       CALL k_copy<<<4096, TPB, 0, strm>>>(d_g, d_dpsi, INT(npwx, 8) * nsl)
