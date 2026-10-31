@@ -152,6 +152,10 @@ MODULE sth_engine
   REAL(dp), DEVICE, ALLOCATABLE :: d_r0(:)
   ! RTSC_STH_DEFL: additive spectral preconditioner with the known empty bands at k+q (k_check_defl)
   INTEGER, PUBLIC, SAVE :: sth_defl = 0
+  ! rtsc b2 diagnostic (RTSC_STH_TRUERES=1, DEFL path only): stop on the plain residual norm, and when every column
+  ! has stopped, recompute the true residual A dpsi - rhs once and restart the CG on the columns that fail (<= 3 times)
+  INTEGER, SAVE :: sth_trn = -1
+  INTEGER(8), SAVE :: trn_rechk = 0, trn_fail = 0
   REAL(dp), PUBLIC, SAVE :: sth_dfloor = 1.0e-4_dp
   REAL(dp), DEVICE, ALLOCATABLE :: d_etkq(:,:)
   INTEGER, PUBLIC, SAVE :: sth_xp_m = 0            ! history slots; 0 = off (set before irrep commit)
@@ -629,13 +633,15 @@ CONTAINS
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_check_defl(list, nslot, npert, npwx, nksq, npwq, hd, g, h, rho, conv, &
                                              cnt, ethr, first, eta, r0, nst, W, nproj, nkb, nbnd, nockq, &
-                                             etk, etkq, dfloor)
+                                             etk, etkq, dfloor, trn)
     ! k_check with the additive spectral preconditioner (RTSC_STH_DEFL): M^-1 = h_diag +
     ! sum_m |evq_m><evq_m| / (e_m(k+q) - e_n(k)) over the known empty bands m = nockq(k)+1 .. nbnd at
     ! k+q, which are exact eigenvectors of the column operator (eigenvalue e_m - e_n, the smallest
     ! ones). The stopping test is unchanged (sqrt(<g|h_diag|g>) < thresh); the CG recurrence uses
     ! rho = <g|M^-1|g> and h = -M^-1 g + gam h_old.
-    INTEGER, VALUE :: nslot, npert, npwx, nksq, first, nproj, nkb, nbnd
+    INTEGER, VALUE :: nslot, npert, npwx, nksq, first, nproj, nkb, nbnd, trn
+    ! trn = 1 (RTSC_STH_TRUERES, diagnostic): the stopping test uses the plain residual norm ||g||_2 instead of
+    ! QE's sqrt(<g|h_diag|g>); the CG recurrence is unchanged
     REAL(dp), VALUE :: ethr, eta, dfloor
     INTEGER :: list(*), npwq(nksq), conv(*), cnt(*), nst(*), nockq(nksq)
     REAL(dp) :: hd(npwx, nslot, nksq), rho(*), r0(*), etk(nbnd, nksq), etkq(nbnd, nksq)
@@ -644,7 +650,7 @@ CONTAINS
     REAL(dp), SHARED :: gam, rn, cre(MAXE), cim(MAXE), dm(MAXE)
     INTEGER, SHARED :: cvd
     INTEGER :: s, k, n, ig, nq, tid, st, istat, m, ne, m0
-    REAL(dp) :: acc, acc2, rc
+    REAL(dp) :: acc, acc2, rc, rt
     COMPLEX(dp) :: gv, wv, hv
     tid = threadIdx%x
     s = list(blockIdx%x)
@@ -654,28 +660,36 @@ CONTAINS
     m0 = nockq(k)
     ne = MIN(MAXE, nbnd - m0)
     acc = 0.0_dp
+    acc2 = 0.0_dp
     DO ig = tid, nq, blockDim%x
       gv = g(ig, s)
       acc = acc + hd(ig, n, k) * (REAL(gv, dp)**2 + AIMAG(gv)**2)
+      acc2 = acc2 + REAL(gv, dp)**2 + AIMAG(gv)**2
     ENDDO
     red(tid) = acc
+    red2(tid) = acc2
     CALL syncthreads()
     st = blockDim%x / 2
     DO WHILE (st > 0)
-      IF (tid <= st) red(tid) = red(tid) + red(tid + st)
+      IF (tid <= st) THEN
+        red(tid) = red(tid) + red(tid + st)
+        red2(tid) = red2(tid) + red2(tid + st)
+      ENDIF
       CALL syncthreads()
       st = st / 2
     ENDDO
     IF (tid == 1) THEN
       rn = red(1)
+      rt = rn
+      IF (trn == 1) rt = red2(1)
       istat = atomicadd(cnt((s - 1) / nslot + 1), 1)
-      IF (first == 1) r0(s) = SQRT(rn)
+      IF (first == 1) r0(s) = SQRT(rt)
       IF (first == 1) THEN
         nst(s) = 1
       ELSE
         nst(s) = nst(s) + 1
       ENDIF
-      IF (SQRT(rn) < MAX(ethr, eta * r0(s))) THEN
+      IF (SQRT(rt) < MAX(ethr, eta * r0(s))) THEN
         conv(s) = 1
         cvd = 1
       ELSE
@@ -3750,7 +3764,7 @@ CONTAINS
     COMPLEX(dp), INTENT(IN) :: dvscf(nnr, npert)
     COMPLEX(dp), INTENT(INOUT) :: drho(nnr, npert)
     INTEGER, INTENT(OUT) :: tot_num_iter, tot_cg_calls, nfail
-    INTEGER :: istat, iter, nact, s0, nb, ip, np, first, i, k
+    INTEGER :: istat, iter, nact, s0, nb, ip, np, first, i, k, nres
     REAL(dp) :: scale, t0, t1
     REAL(dp), ALLOCATABLE :: kter(:)
     INTEGER, ALLOCATABLE :: conv(:)
@@ -3844,6 +3858,17 @@ CONTAINS
     d_cnt = 0
     d_kter = 0.0_dp
     d_rho = 0.0_dp
+    nres = 0
+    IF (sth_trn < 0) THEN
+      BLOCK
+        CHARACTER(LEN=8) :: sv
+        INTEGER :: ios
+        CALL get_environment_variable('RTSC_STH_TRUERES', sv, STATUS=ios)
+        sth_trn = 0
+        IF (ios == 0 .AND. TRIM(sv) == '1') sth_trn = 1
+        IF (sth_trn == 1) WRITE(*, '(A,L2)') '     rtsc trueres: stop on ||g||_2 + true-residual recheck; DEFL path', sth_defl > 0
+      END BLOCK
+    ENDIF
     istat = cudaDeviceSynchronize()
     CALL k_icopy<<<nblk(nvalid, TPB), TPB, 0, strm>>>(d_act, d_valid, nvalid)
     nact = nvalid
@@ -3863,7 +3888,7 @@ CONTAINS
       ELSEIF (sth_defl > 0) THEN
         CALL k_check_defl<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, &
              d_rho, d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst, d_W, nproj, nkb, nbnd, d_nockq, d_etk, &
-             d_etkq, sth_dfloor)
+             d_etkq, sth_dfloor, MAX(sth_trn, 0))
       ELSE
         CALL k_check<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, d_rho, &
              d_conv, d_cnt, thresh, first, sth_eta, d_r0, d_nst)
@@ -3881,6 +3906,28 @@ CONTAINS
         IF (sth_timing) CALL r0_profile(thresh)
       ENDIF
       sth_nsteps = iter
+      IF (nact == 0 .AND. sth_trn == 1 .AND. sth_defl > 0 .AND. nres < 3) THEN
+        ! true-residual recheck: g = A dpsi - rhs on every valid column; failing columns restart the CG (first = 1)
+        nres = nres + 1
+        CALL k_icopy<<<nblk(nvalid, TPB), TPB, 0, strm>>>(d_act, d_valid, nvalid)
+        nact = nvalid
+        CALL apply_op(d_dpsi, d_g, d_act, nact)
+        CALL k_sub<<<4096, TPB, 0, strm>>>(d_g, d_d0, INT(npwx, 8) * nsl)
+        CALL kerr('sub (trueres)')
+        sth_ncolapp = sth_ncolapp + nact
+        d_conv = 0
+        CALL k_check_defl<<<nact, sth_rb, 0, strm>>>(d_act, nslot, npert, npwx, nksq, d_npwq, d_hd, d_g, d_h, &
+             d_rho, d_conv, d_cnt, thresh, 1, sth_eta, d_r0, d_nst, d_W, nproj, nkb, nbnd, d_nockq, d_etk, &
+             d_etkq, sth_dfloor, 1)
+        CALL kerr('check (trueres)')
+        CALL k_compact<<<1, 1024, 0, strm>>>(d_act, d_act2, nact, d_conv, d_nact)
+        CALL kerr('compact (trueres)')
+        istat = cudaMemcpyAsync(h_nact, d_nact, 1, strm)
+        CALL tsync()
+        nact = h_nact(1)
+        trn_rechk = trn_rechk + nvalid
+        trn_fail = trn_fail + nact
+      ENDIF
       IF (nact == 0) EXIT
       CALL apply_op(d_h, d_t, d_act, nact)
       sth_ncolapp = sth_ncolapp + nact
@@ -3889,6 +3936,8 @@ CONTAINS
       IF (sth_debug_slot > 0) CALL debug_step(iter)
     ENDDO
     IF (sth_timing) CALL band_profile(thresh)
+    IF (sth_trn == 1 .AND. sth_timing) WRITE(*, '(A,I2,A,I12,A,I12)') '     rtsc trueres: rechecks this call', nres, &
+         ', cumulative columns rechecked', trn_rechk, ', failing (restarted)', trn_fail
     ! dpsi extrapolation: delta = dpsi(k) - dpsi(k-1) into history slot xp_rec (d_g is free after CG)
     IF (ALLOCATED(d_xp) .AND. xp_rec > 0) THEN
       CALL k_copy<<<4096, TPB, 0, strm>>>(d_g, d_dpsi, INT(npwx, 8) * nsl)
