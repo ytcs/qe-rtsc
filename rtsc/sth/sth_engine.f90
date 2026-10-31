@@ -2123,10 +2123,12 @@ CONTAINS
                                            + SIZE(s_cf, KIND=8) + SIZE(s_cf2, KIND=8))
     DO istat = 1, CB_MAXREP
       IF (ALLOCATED(cb_rep(istat)%u)) bcb = bcb + 16_8 * SIZE(cb_rep(istat)%u, KIND=8)
+      IF (ALLOCATED(cb_rep(istat)%u32)) bcb = bcb + 8_8 * SIZE(cb_rep(istat)%u32, KIND=8)
     ENDDO
     IF (ALLOCATED(cb_tmp)) THEN
       DO istat = 1, SIZE(cb_tmp)
         IF (ALLOCATED(cb_tmp(istat)%u)) bcb = bcb + 16_8 * SIZE(cb_tmp(istat)%u, KIND=8)
+        IF (ALLOCATED(cb_tmp(istat)%u32)) bcb = bcb + 8_8 * SIZE(cb_tmp(istat)%u32, KIND=8)
       ENDDO
     ENDIF
     bsum = bw + bev + bps + bbx + bhd + bix + binv + bkq + bg2 + bnl + bcol + bcf + bpsx + bdv + bxp + bsp + bcb
