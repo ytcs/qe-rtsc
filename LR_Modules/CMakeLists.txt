@@ -77,6 +77,7 @@ set(sources
     ch_psi_all_complex.f90
     sth_dump.f90
     sth_tail.f90
+    rtsc_vkb_batch.f90
     sth_batched.f90
     sth_nscf_start.f90
     sth_nscf_batched.f90

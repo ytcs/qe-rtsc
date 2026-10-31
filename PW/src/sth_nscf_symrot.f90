@@ -32,7 +32,7 @@ MODULE sth_nscf_symrot
   PUBLIC :: symrot_on, symrot_plan, symrot_after_solve, symrot_report, symrot_tight, symrot_check_on, symrot_resid
   ! rtsc epw3 (RTSC_PW_SYMROT=1; groups/compute/EPW3-LOG.md): the same rotation in pw.x's nscf (c_bands_nscf), the
   ! Wannier k grid read by EPW. The module lives in PW/src so that both pw.x and ph.x use it.
-  PUBLIC :: symrot_kmap
+  PUBLIC :: symrot_kmap, symrot_cache_n, symrot_cache_get, symrot_kop
   PUBLIC :: symrot_pw_on, symrot_pw_tight, symrot_pw_check_on, symrot_note_notconv, symrot_rep_guard
   INTEGER, SAVE :: last_notconv = 0, nbadrep = 0
   !
@@ -755,15 +755,72 @@ CONTAINS
                         sr(j, 3, isym) * cmill(3, ig, i0)) - kg0(j, ik)
         ENDDO
         imap(ig) = pos(lin(mr))
-        arg = tpi * ((cxk(1, i0) + cmill(1, ig, i0)) * ftr(1, isym) + (cxk(2, i0) + cmill(2, ig, i0)) * ftr(2, isym) + &
-                      (cxk(3, i0) + cmill(3, ig, i0)) * ftr(3, isym))
-        ph(ig) = CMPLX(COS(arg), -SIN(arg), KIND=DP)
+        IF (ANY(ABS(ftr(:, isym)) > 1.d-12)) THEN      ! as rotate: a phase only with a fractional translation
+          arg = tpi * ((cxk(1, i0) + cmill(1, ig, i0)) * ftr(1, isym) + (cxk(2, i0) + cmill(2, ig, i0)) * ftr(2, isym) + &
+                        (cxk(3, i0) + cmill(3, ig, i0)) * ftr(3, isym))
+          ph(ig) = CMPLX(COS(arg), -SIN(arg), KIND=DP)
+        ELSE
+          ph(ig) = (1.d0, 0.d0)
+        ENDIF
       ENDDO
       CALL pos_set(ik, 0)
     ENDIF
     IF (ANY(imap(1:ngs) < 1)) RETURN
     ok = .TRUE.
   END SUBROUTINE symrot_kmap
+  !
+  INTEGER FUNCTION symrot_cache_n()
+    !! number of cached representatives (RTSC_STH_KDEV keeps a device copy)
+    symrot_cache_n = nc
+  END FUNCTION symrot_cache_n
+  !
+  SUBROUTINE symrot_cache_get(i0, ngs, nb, wfc, mill)
+    !! cached representative i0: its G count and its nbnd coefficient columns (cache G order); optionally its Miller indices
+    INTEGER, INTENT(IN) :: i0
+    INTEGER, INTENT(OUT) :: ngs, nb
+    COMPLEX(DP), INTENT(OUT) :: wfc(:,:)
+    INTEGER, INTENT(OUT), OPTIONAL :: mill(:,:)
+    ngs = cngw(i0)
+    nb = nbc
+    wfc(1:ngs, 1:nbc) = cwfc(1:ngs, 1:nbc, i0)
+    IF (PRESENT(mill)) mill(1:3, 1:ngs) = cmill(1:3, 1:ngs, i0)
+  END SUBROUTINE symrot_cache_get
+  !
+  SUBROUTINE symrot_kop(ik, i0, sop, tr, g0, hasft, ok)
+    !! rtsc KDEV v2: the operation that maps cache entry i0 onto k-point ik of the current plan, without any per-G work:
+    !! Miller m of i0 goes to tr * sop m - g0 in ik's sphere (sop = identity, tr = 1, g0 = 0 for a representative itself).
+    !! hasft: the operation carries a fractional translation (a phase per G). ok = .FALSE. as in symrot_kmap.
+    USE klist,     ONLY : nks, ngk
+    INTEGER, INTENT(IN) :: ik
+    INTEGER, INTENT(OUT) :: i0, sop(3, 3), tr, g0(3)
+    LOGICAL, INTENT(OUT) :: hasft, ok
+    INTEGER :: j, isym
+    REAL(DP) :: xt(3), kr(3), d(3)
+    ok = .FALSE.; i0 = 0; tr = 1; g0 = 0; hasft = .FALSE.
+    sop = 0; sop(1, 1) = 1; sop(2, 2) = 1; sop(3, 3) = 1
+    IF (.NOT. ALLOCATED(kind_)) RETURN
+    IF (SIZE(kind_) /= nks .OR. ik < 1 .OR. ik > nks) RETURN
+    IF (kind_(ik) < 1 .OR. kind_(ik) > 3) RETURN
+    i0 = ksrc(ik)
+    IF (i0 < 1 .OR. i0 > nc) RETURN
+    IF (cngw(i0) /= ngk(ik)) RETURN
+    isym = ksym(ik)
+    CALL kcryst(ik, xt)
+    IF (isym == -1) THEN
+      IF (ANY(ABS(xt - cxk(:, i0)) > 1.d-6)) RETURN
+    ELSE
+      IF (isym < 1 .OR. isym > nsr) RETURN
+      tr = ktr(ik)
+      DO j = 1, 3
+        kr(j) = tr * (sr(j, 1, isym) * cxk(1, i0) + sr(j, 2, isym) * cxk(2, i0) + sr(j, 3, isym) * cxk(3, i0))
+      ENDDO
+      d = xt - kr - kg0(:, ik)
+      IF (ANY(ABS(d) > 1.d-6)) RETURN
+      sop = sr(:, :, isym); g0 = kg0(:, ik)
+      hasft = ANY(ABS(ftr(:, isym)) > 1.d-12)
+    ENDIF
+    ok = .TRUE.
+  END SUBROUTINE symrot_kop
   !
   SUBROUTINE symrot_report()
     USE io_global, ONLY : stdout

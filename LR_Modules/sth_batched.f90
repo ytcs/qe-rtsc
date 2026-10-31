@@ -633,8 +633,10 @@ CONTAINS
                                  sth_fdxdp_req, sth_fdxdp_check, sth_obatch, sth_timing, &
                                  sth_engine_set_nlk, sth_qcache, sth_engine_wdev, sth_engine_set_wdev, &
                                  sth_lift, sth_lift_kchunk, sth_lift_fb, sth_cbsr, sth_cbsr_skip, &
-                                 sth_engine_cbsr_map
-    USE sth_nscf_symrot,  ONLY : symrot_kmap
+                                 sth_engine_cbsr_map, sth_engine_rwf_count, sth_engine_rwf_put, sth_engine_kdev_map, &
+                                 sth_engine_set_wdev_n, sth_engine_kdev_op
+    USE sth_nscf_symrot,  ONLY : symrot_kmap, symrot_cache_n, symrot_cache_get, symrot_kop
+    USE rtsc_vkb,         ONLY : vkb_batch
     USE lrus,             ONLY : becp1
     !
     LOGICAL, INTENT(IN) :: first_iter
@@ -650,6 +652,11 @@ CONTAINS
     INTEGER(8) :: c0, c1, c2, crate, ca, cb
     REAL(DP) :: tk(6)      ! RTSC_STH_TIME: per-k loop split (get_buffer, init_us_2, g2kin+weights, set_k, dvbare/dpsi, set_wdev)
     LOGICAL :: wdev
+    ! RTSC_STH_KDEV (SOLVE-LOG.md session 4): vkb by vkb_batch in chunks; evc / evq of SYMROT-mapped k rotated on the device
+    LOGICAL :: kdev, kmapped, okk, okq, fk, fq
+    INTEGER :: i0k, i0q, ngsk, ngsq, trk, trq, ftk, ftq, nkd, ich, nch, j, kdv, sk(3, 3), sq(3, 3), g0k(3), g0q(3)
+    INTEGER, ALLOCATABLE :: mapk(:), mapq(:), ikl(:), mil(:,:)
+    COMPLEX(DP), ALLOCATABLE :: phk(:), phq(:), wtmp(:,:), vkbb(:,:,:)
     !
     CALL start_clock('sth_init')
     CALL SYSTEM_CLOCK(c0, crate)
@@ -702,6 +709,45 @@ CONTAINS
     ENDIF
     !
     ALLOCATE(idxk(npwx), idxkq(npwx), wwg(nbnd, nbnd), wg1(nbnd))
+    kdv = sth_env_int('RTSC_STH_KDEV')       ! 1: v1 (host maps), 2: v2 (maps on the device)
+    kdev = kdv > 0 .AND. wdev .AND. .NOT. lgamma
+    nkd = 0
+    IF (kdev) THEN
+      IF (sth_timing) CALL SYSTEM_CLOCK(ca)
+      ! the SYMROT cache entries not yet on the device
+      IF (symrot_cache_n() > sth_engine_rwf_count()) THEN
+        ALLOCATE(wtmp(npwx, nbnd), mil(3, npwx))
+        DO j = sth_engine_rwf_count() + 1, symrot_cache_n()
+          CALL symrot_cache_get(j, ngsk, ich, wtmp, mil)
+          CALL sth_engine_rwf_put(j, ngsk, ich, wtmp, mil)
+        ENDDO
+        DEALLOCATE(wtmp, mil)
+      ENDIF
+      ALLOCATE(mapk(npwx), mapq(npwx), phk(npwx), phq(npwx))
+      IF (sth_timing) THEN
+        CALL SYSTEM_CLOCK(cb); tk(1) = tk(1) + REAL(cb - ca, DP) / crate; ca = cb
+      ENDIF
+      ! vkb of every k+q, in chunks (bitwise init_us_2's), device-to-device into W
+      nch = MIN(nksq, 256, npwx)
+      ALLOCATE(vkbb(npwx, MAX(nkb, 1), nch), ikl(nch))
+      !$acc enter data create(vkbb)
+      DO ich = 1, nksq, nch
+        j = MIN(nch, nksq - ich + 1)
+        DO ik = 1, j
+          ikl(ik) = ikqs(ich + ik - 1)
+          mapk(ik) = ngk(ikl(ik))
+        ENDDO
+        CALL vkb_batch(j, ikl(1:j), vkbb)
+        !$acc host_data use_device(vkbb)
+        CALL sth_engine_set_wdev_n(ich, j, mapk(1:j), vkbb)
+        !$acc end host_data
+      ENDDO
+      !$acc exit data delete(vkbb)
+      DEALLOCATE(vkbb, ikl)
+      IF (sth_timing) THEN
+        CALL SYSTEM_CLOCK(cb); tk(2) = tk(2) + REAL(cb - ca, DP) / crate; ca = cb
+      ENDIF
+    ENDIF
     DO ik = 1, nksq
       IF (sth_timing) CALL SYSTEM_CLOCK(ca)
       ikk = ikks(ik); ikq = ikqs(ik)
@@ -709,13 +755,29 @@ CONTAINS
       nock = nbnd_occ(ikk); nockq = nbnd_occ(ikq)
       idxk(1:npw) = dffts%nl(igk_k(1:npw, ikk))
       idxkq(1:npwq) = dffts%nl(igk_k(1:npwq, ikq))
-      CALL get_buffer(evc, lrwfc, iuwfc, ikk)
-      IF (.NOT. lgamma) CALL get_buffer(evq, lrwfc, iuwfc, ikq)   ! lgamma: evq => evc, ikq = ikk
+      kmapped = .FALSE.
+      IF (kdev .AND. kdv == 2) THEN
+        CALL symrot_kop(ikk, i0k, sk, trk, g0k, fk, okk)
+        CALL symrot_kop(ikq, i0q, sq, trq, g0q, fq, okq)
+        kmapped = okk .AND. okq .AND. .NOT. fk .AND. .NOT. fq
+        IF (kmapped) kmapped = (i0k <= sth_engine_rwf_count() .AND. i0q <= sth_engine_rwf_count())
+      ELSE IF (kdev) THEN
+        CALL symrot_kmap(ikk, i0k, ngsk, trk, mapk, phk, okk)
+        CALL symrot_kmap(ikq, i0q, ngsq, trq, mapq, phq, okq)
+        kmapped = okk .AND. okq
+        IF (kmapped) kmapped = (i0k <= sth_engine_rwf_count() .AND. i0q <= sth_engine_rwf_count())
+      ENDIF
+      IF (.NOT. kmapped) THEN
+        CALL get_buffer(evc, lrwfc, iuwfc, ikk)
+        IF (.NOT. lgamma) CALL get_buffer(evq, lrwfc, iuwfc, ikq)   ! lgamma: evq => evc, ikq = ikk
+      ENDIF
       IF (sth_timing) THEN
         CALL SYSTEM_CLOCK(cb); tk(1) = tk(1) + REAL(cb - ca, DP) / crate; ca = cb
       ENDIF
-      CALL init_us_2(npwq, igk_k(1, ikq), xk(1, ikq), vkb, .true.)
-      IF (wdev) THEN
+      IF (.NOT. kdev) CALL init_us_2(npwq, igk_k(1, ikq), xk(1, ikq), vkb, .true.)
+      IF (kdev) THEN
+        CONTINUE     ! vkb already in W (chunks above)
+      ELSE IF (wdev) THEN
         !$acc host_data use_device(vkb)
         CALL sth_engine_set_wdev(ik, npwq, vkb)
         !$acc end host_data
@@ -754,7 +816,29 @@ CONTAINS
         CALL SYSTEM_CLOCK(cb); tk(3) = tk(3) + REAL(cb - ca, DP) / crate; ca = cb
       ENDIF
       CALL sth_engine_set_k(ik, npw, npwq, nock, nockq, wk(ikk), idxk(1:npw), idxkq(1:npwq), evc, evq, &
-                            et(:, ikk), g2kin, vkb, wwg(:, 1:nock), wg1(1:nock), et_kq=et(:, ikq))
+                            et(:, ikk), g2kin, vkb, wwg(:, 1:nock), wg1(1:nock), et_kq=et(:, ikq), nowf=kmapped)
+      IF (kdev .AND. kdv == 2) THEN
+        IF (kmapped) THEN
+          CALL sth_engine_kdev_op(ik, 1, i0k, trk, sk, g0k)
+          CALL sth_engine_kdev_op(ik, 2, i0q, trq, sq, g0q)
+          nkd = nkd + 1
+        ELSE
+          CALL sth_engine_kdev_op(ik, 1, 0, 1, sk, g0k)
+          CALL sth_engine_kdev_op(ik, 2, 0, 1, sq, g0q)
+        ENDIF
+      ELSE IF (kdev) THEN
+        IF (kmapped) THEN
+          ftk = 0; ftq = 0
+          IF (ANY(phk(1:npw) /= (1.d0, 0.d0))) ftk = 1
+          IF (ANY(phq(1:npwq) /= (1.d0, 0.d0))) ftq = 1
+          CALL sth_engine_kdev_map(ik, 1, i0k, trk, ftk, mapk, phk)
+          CALL sth_engine_kdev_map(ik, 2, i0q, trq, ftq, mapq, phq)
+          nkd = nkd + 1
+        ELSE
+          CALL sth_engine_kdev_map(ik, 1, 0, 1, 0, mapk, phk)
+          CALL sth_engine_kdev_map(ik, 2, 0, 1, 0, mapq, phq)
+        ENDIF
+      ENDIF
       IF (dvb_on) CALL sth_engine_set_nlk(ik, becp1(ik)%k, dvb_al(1, ik)%k, dvb_al(2, ik)%k, dvb_al(3, ik)%k)
       IF (sth_timing) THEN
         CALL SYSTEM_CLOCK(cb); tk(4) = tk(4) + REAL(cb - ca, DP) / crate; ca = cb
@@ -789,6 +873,17 @@ CONTAINS
       ENDIF
     ENDDO
     DEALLOCATE(idxk, idxkq, wwg, wg1)
+    IF (kdev) THEN
+      ! leave the host state as the default loop leaves it: evc / evq / vkb of the last k, k+q
+      ikk = ikks(nksq); ikq = ikqs(nksq)
+      CALL get_buffer(evc, lrwfc, iuwfc, ikk)
+      CALL get_buffer(evq, lrwfc, iuwfc, ikq)
+      CALL init_us_2(ngk(ikq), igk_k(1, ikq), xk(1, ikq), vkb, .true.)
+      !$acc update host(vkb)
+      DEALLOCATE(mapk, mapq, phk, phq)
+      IF (sth_timing) WRITE(stdout, '(5x,"rtsc kdev: ",I0," of ",I0," k blocks with both wavefunctions rotated on the device")') &
+           nkd, nksq
+    ENDIF
     IF (lgamma) THEN
       !$acc update device(evc)
     ELSE

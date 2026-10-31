@@ -48,7 +48,8 @@ MODULE sth_engine
             sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
             sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set, &
             sth_engine_set_nlk, sth_engine_build_dvb, sth_engine_dvb_check, &
-            sth_engine_kqg_ready, sth_engine_set_kqg, sth_engine_set_wdev, sth_engine_wdev, sth_engine_cbsr_map
+            sth_engine_kqg_ready, sth_engine_set_kqg, sth_engine_set_wdev, sth_engine_wdev, sth_engine_cbsr_map, &
+            sth_engine_rwf_count, sth_engine_rwf_put, sth_engine_kdev_map, sth_engine_set_wdev_n, sth_engine_kdev_op
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -309,7 +310,7 @@ MODULE sth_engine
   INTEGER, DEVICE, ALLOCATABLE :: d_ckmap(:,:), d_cktr(:)
   COMPLEX(dp), DEVICE, ALLOCATABLE :: d_ckph(:,:)
   ! per-q bases of this q (nqs): rep id (> 0) or -tmp index; per-irrep plan of gathered columns and batched GEMMs
-  INTEGER, SAVE :: cb_nqs = 0, cb_npl = -1, cb_ctot = 0, cb_ngrp = 0, cb_ntmp = 0
+  INTEGER, SAVE :: cb_nqs = 0, cb_npl = -1, cb_ctot = 0, cb_ngrp = 0, cb_ntmp = 0, cb_pad = 0
   INTEGER, ALLOCATABLE, SAVE :: cb_qs(:), cb_gN(:), cb_gnb(:), cb_goff(:)
   INTEGER, DEVICE, ALLOCATABLE :: d_cgsc(:), d_cgl(:)
   REAL(dp), DEVICE, ALLOCATABLE :: d_cqlam(:,:)
@@ -322,6 +323,19 @@ MODULE sth_engine
   TYPE(cusolverDnHandle), SAVE :: hsolv
   LOGICAL, SAVE :: have_solv = .FALSE.
   INTEGER, SAVE :: cb_lwork = 0
+  !
+  ! rtsc KDEV (RTSC_STH_KDEV=1, with QCACHE; SOLVE-LOG.md session 4): the adapter's per-k loop on the GPU. evq / evc of every k
+  ! whose k and k+q are RTSC_NSCF_SYMROT images are built here by the same coefficient rotation SYMROT applies on the host,
+  ! from a device copy of the SYMROT cache (d_rwf, kept across q); vkb comes from vkb_batch (sth_engine_set_wdev_n).
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_rwf(:,:,:)
+  INTEGER, SAVE :: rwf_n = 0, rwf_ld = 0, rwf_nb = 0
+  INTEGER, PUBLIC, SAVE :: sth_kdev_nrot = 0
+  INTEGER, ALLOCATABLE, SAVE :: h_kdrep(:,:), h_kdtr(:,:), h_kdft(:,:), h_kdmap(:,:,:)
+  ! KDEV v2 (RTSC_STH_KDEV=2): maps built on the device from the cache's Miller indices and the operation (S, tr, G0)
+  INTEGER, DEVICE, ALLOCATABLE :: d_rmill(:,:,:)
+  INTEGER, ALLOCATABLE, SAVE :: h_kdop(:,:,:)       ! (12, 2, nksq): S (9), G0 (3)
+  LOGICAL, SAVE :: kd_v2 = .FALSE.
+  COMPLEX(dp), ALLOCATABLE, SAVE :: h_kdph(:,:,:)
   LOGICAL, SAVE :: lift_q = .FALSE., lift_stream = .FALSE.
   INTEGER, SAVE :: lift_nm = 0, lift_kc = 0
   REAL(dp), SAVE :: lift_v0 = 0.0_dp
@@ -887,6 +901,119 @@ CONTAINS
       i = i + INT(blockDim%x, 8) * gridDim%x
     ENDDO
   END SUBROUTINE k_lift_scale
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_kd_rot(w, evc, rwf, rep, tr, ft, map, ph, npwq, npw, nock, npwx, nproj, nkb, nbnd, &
+                                       nslot, ldr, nbr, nksq)
+    ! KDEV: SYMROT's rotation on the device. which = 1: evc of k (bands <= nock) into d_evc; which = 2: evq of k+q (all
+    ! bands) into W. dst(map(ig)) = src(ig) [* ph(ig)], conjugated for time reversal: exactly rotate's arithmetic.
+    INTEGER, VALUE :: npwx, nproj, nkb, nbnd, nslot, ldr, nbr, nksq
+    COMPLEX(dp) :: w(npwx, nproj, *), evc(npwx, *), rwf(ldr, nbr, *), ph(npwx, 2, *)
+    INTEGER :: rep(2, *), tr(2, *), ft(2, *), map(npwx, 2, *), npwq(*), npw(*), nock(*)
+    INTEGER :: ig, b, k, wh, r
+    COMPLEX(dp) :: v
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    b = blockIdx%y
+    k = blockIdx%z
+    DO WHILE (k <= nksq)
+      DO wh = 1, 2
+        r = rep(wh, k)
+        IF (r < 1) CYCLE
+        IF (wh == 1) THEN
+          IF (b > nock(k) .OR. ig > npw(k)) CYCLE
+        ELSE
+          IF (ig > npwq(k)) CYCLE
+        ENDIF
+        v = rwf(ig, b, r)
+        IF (ft(wh, k) == 1) v = v * ph(ig, wh, k)
+        IF (tr(wh, k) == -1) v = CONJG(v)
+        IF (wh == 1) THEN
+          evc(map(ig, 1, k), nslot * (k - 1) + b) = v
+        ELSE
+          w(map(ig, 2, k), nkb + b, k) = v
+        ENDIF
+      ENDDO
+      k = k + gridDim%z
+    ENDDO
+  END SUBROUTINE k_kd_rot
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_kd_inv(inv, idxk, idxkq, npw, npwq, wh, k0, nk, nnr, npwx)
+    ! KDEV v2: inv(idx(ig, k0 + j), j) = ig on the target sphere (k for wh = 1, k+q for wh = 2); the table is zeroed by
+    ! k_kd_rot2 after use (every entry it set), so it is all zeros before the first call
+    INTEGER, VALUE :: wh, k0, nk, nnr, npwx
+    INTEGER :: inv(nnr, *), idxk(npwx, *), idxkq(npwx, *), npw(*), npwq(*)
+    INTEGER :: ig, j, k
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    j = blockIdx%y
+    DO WHILE (j <= nk)
+      k = k0 + j
+      IF (wh == 1) THEN
+        IF (ig <= npw(k)) inv(idxk(ig, k), j) = ig
+      ELSE
+        IF (ig <= npwq(k)) inv(idxkq(ig, k), j) = ig
+      ENDIF
+      j = j + gridDim%y
+    ENDDO
+  END SUBROUTINE k_kd_inv
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_kd_rot2(w, evc, rwf, rmill, rep, tr, op, inv, npwq, npw, nock, wh, k0, nk, npwx, nproj, &
+                                        nkb, nbnd, nslot, ldr, nbr, nnr, nr1, nr2, nr3)
+    ! KDEV v2: dst(inv(box(tr S m - G0))) = src (conjugated for tr = -1) for every G of the cache entry: rotate's copy, with
+    ! the map from the device (no fractional translations here; those k take the host path)
+    INTEGER, VALUE :: wh, k0, nk, npwx, nproj, nkb, nbnd, nslot, ldr, nbr, nnr, nr1, nr2, nr3
+    COMPLEX(dp) :: w(npwx, nproj, *), evc(npwx, *), rwf(ldr, nbr, *)
+    INTEGER :: rmill(3, ldr, *), rep(2, *), tr(2, *), op(12, 2, *), inv(nnr, *), npwq(*), npw(*), nock(*)
+    INTEGER :: ig, b, j, k, r, t, m1, m2, m3, a1, a2, a3, p, n
+    COMPLEX(dp) :: v
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    b = blockIdx%y
+    j = blockIdx%z
+    DO WHILE (j <= nk)
+      k = k0 + j
+      r = rep(wh, k)
+      IF (r > 0) THEN
+        IF (wh == 1) THEN
+          n = npw(k)
+        ELSE
+          n = npwq(k)
+        ENDIF
+        IF (ig <= n .AND. (wh == 2 .OR. b <= nock(k))) THEN
+          t = tr(wh, k)
+          m1 = rmill(1, ig, r); m2 = rmill(2, ig, r); m3 = rmill(3, ig, r)
+          a1 = t * (op(1, wh, k) * m1 + op(4, wh, k) * m2 + op(7, wh, k) * m3) - op(10, wh, k)
+          a2 = t * (op(2, wh, k) * m1 + op(5, wh, k) * m2 + op(8, wh, k) * m3) - op(11, wh, k)
+          a3 = t * (op(3, wh, k) * m1 + op(6, wh, k) * m2 + op(9, wh, k) * m3) - op(12, wh, k)
+          p = inv(1 + MODULO(a1, nr1) + nr1 * (MODULO(a2, nr2) + nr2 * MODULO(a3, nr3)), j)
+          IF (p < 1) p = npwx       ! cannot happen for a SYMROT map (checked on the host); keeps the write in bounds
+          v = rwf(ig, b, r)
+          IF (t == -1) v = CONJG(v)
+          IF (wh == 1) THEN
+            evc(p, nslot * (k - 1) + b) = v
+          ELSE
+            w(p, nkb + b, k) = v
+          ENDIF
+        ENDIF
+      ENDIF
+      j = j + gridDim%z
+    ENDDO
+  END SUBROUTINE k_kd_rot2
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_kd_clr(inv, idxk, idxkq, npw, npwq, wh, k0, nk, nnr, npwx)
+    ! KDEV v2: zero the entries k_kd_inv set (the table is reused by the next chunk)
+    INTEGER, VALUE :: wh, k0, nk, nnr, npwx
+    INTEGER :: inv(nnr, *), idxk(npwx, *), idxkq(npwx, *), npw(*), npwq(*)
+    INTEGER :: ig, j, k
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    j = blockIdx%y
+    DO WHILE (j <= nk)
+      k = k0 + j
+      IF (wh == 1) THEN
+        IF (ig <= npw(k)) inv(idxk(ig, k), j) = 0
+      ELSE
+        IF (ig <= npwq(k)) inv(idxkq(ig, k), j) = 0
+      ENDIF
+      j = j + gridDim%y
+    ENDDO
+  END SUBROUTINE k_kd_clr
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_scal(a, f, n)
     INTEGER(8), VALUE :: n
@@ -2645,6 +2772,169 @@ CONTAINS
     ENDIF
   END SUBROUTINE lift_apply
   !
+  INTEGER FUNCTION sth_engine_rwf_count()
+    !! KDEV: SYMROT cache entries already on the device
+    sth_engine_rwf_count = rwf_n
+  END FUNCTION sth_engine_rwf_count
+  !
+  SUBROUTINE sth_engine_rwf_put(i, ngs, nb, wfc, mill)
+    !! KDEV: SYMROT cache entry i (ngs coefficients x nb bands, cache G order) onto the device (entries arrive in order);
+    !! v2 also keeps its Miller indices
+    INTEGER, INTENT(IN) :: i, ngs, nb
+    COMPLEX(dp), INTENT(IN) :: wfc(:,:)
+    INTEGER, INTENT(IN), OPTIONAL :: mill(:,:)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: tmp(:,:,:)
+    INTEGER, DEVICE, ALLOCATABLE :: itmp(:,:,:)
+    INTEGER :: cap
+    IF (rwf_ld == 0) THEN
+      rwf_ld = SIZE(wfc, 1); rwf_nb = nb
+    ENDIF
+    IF (ngs > rwf_ld .OR. nb /= rwf_nb .OR. i /= rwf_n + 1) CALL errore_stop('sth_engine_rwf_put (shape or order)', i)
+    cap = 0
+    IF (ALLOCATED(d_rwf)) cap = SIZE(d_rwf, 3)
+    IF (i > cap) THEN
+      ALLOCATE(tmp(rwf_ld, rwf_nb, MAX(64, 2 * cap)))
+      IF (cap > 0) THEN
+        tmp(:, :, 1:cap) = d_rwf(:, :, 1:cap)
+        DEALLOCATE(d_rwf)
+      ENDIF
+      CALL MOVE_ALLOC(tmp, d_rwf)
+      ALLOCATE(itmp(3, rwf_ld, SIZE(d_rwf, 3)))
+      itmp = 0
+      IF (cap > 0) THEN
+        itmp(:, :, 1:cap) = d_rmill(:, :, 1:cap)
+        DEALLOCATE(d_rmill)
+      ENDIF
+      CALL MOVE_ALLOC(itmp, d_rmill)
+    ENDIF
+    d_rwf(1:ngs, 1:nb, i) = wfc(1:ngs, 1:nb)
+    IF (PRESENT(mill)) d_rmill(1:3, 1:ngs, i) = mill(1:3, 1:ngs)
+    rwf_n = i
+  END SUBROUTINE sth_engine_rwf_put
+  !
+  SUBROUTINE sth_engine_kdev_map(ik, wh, i0, tr, ft, imap, ph)
+    !! KDEV, per q: k (wh = 1) or k+q (wh = 2) of column block ik is SYMROT cache entry i0 rotated by (imap, ph, tr);
+    !! ft = 1 if the rotation carries a phase. i0 = 0: host path (the caller uploaded evc / evq through set_k).
+    INTEGER, INTENT(IN) :: ik, wh, i0, tr, ft, imap(*)
+    COMPLEX(dp), INTENT(IN) :: ph(*)
+    INTEGER :: n
+    IF (ALLOCATED(h_kdrep)) THEN
+      IF (SIZE(h_kdrep, 2) /= nksq .OR. SIZE(h_kdmap, 1) /= npwx) DEALLOCATE(h_kdrep, h_kdtr, h_kdft, h_kdmap, h_kdph)
+    ENDIF
+    IF (.NOT. ALLOCATED(h_kdrep)) THEN
+      ALLOCATE(h_kdrep(2, nksq), h_kdtr(2, nksq), h_kdft(2, nksq), h_kdmap(npwx, 2, nksq), h_kdph(npwx, 2, nksq))
+      h_kdrep = 0
+    ENDIF
+    h_kdrep(wh, ik) = i0
+    IF (i0 < 1) RETURN
+    h_kdtr(wh, ik) = tr; h_kdft(wh, ik) = ft
+    IF (wh == 1) THEN
+      n = h_npw(ik)
+    ELSE
+      n = h_npwq(ik)
+    ENDIF
+    h_kdmap(1:n, wh, ik) = imap(1:n)
+    IF (ft == 1) h_kdph(1:n, wh, ik) = ph(1:n)
+  END SUBROUTINE sth_engine_kdev_map
+  !
+  SUBROUTINE sth_engine_kdev_op(ik, wh, i0, tr, sop, g0)
+    !! KDEV v2, per q: k (wh = 1) or k+q (wh = 2) of block ik is cache entry i0 under (sop, tr, g0); i0 = 0: host path
+    INTEGER, INTENT(IN) :: ik, wh, i0, tr, sop(3, 3), g0(3)
+    IF (ALLOCATED(h_kdrep)) THEN
+      IF (SIZE(h_kdrep, 2) /= nksq) DEALLOCATE(h_kdrep, h_kdtr, h_kdft, h_kdmap, h_kdph)
+    ENDIF
+    IF (ALLOCATED(h_kdop)) THEN
+      IF (SIZE(h_kdop, 3) /= nksq) DEALLOCATE(h_kdop)
+    ENDIF
+    IF (.NOT. ALLOCATED(h_kdrep)) THEN
+      ALLOCATE(h_kdrep(2, nksq), h_kdtr(2, nksq), h_kdft(2, nksq), h_kdmap(1, 2, 1), h_kdph(1, 2, 1))
+      h_kdrep = 0
+    ENDIF
+    IF (.NOT. ALLOCATED(h_kdop)) ALLOCATE(h_kdop(12, 2, nksq))
+    kd_v2 = .TRUE.
+    h_kdrep(wh, ik) = i0
+    IF (i0 < 1) RETURN
+    h_kdtr(wh, ik) = tr; h_kdft(wh, ik) = 0
+    h_kdop(1:9, wh, ik) = RESHAPE(sop, (/ 9 /))
+    h_kdop(10:12, wh, ik) = g0
+  END SUBROUTINE sth_engine_kdev_op
+  !
+  SUBROUTINE sth_engine_kdev_build(nrot)
+    !! KDEV, per q (after the per-k loop, before setup): evc / evq of every mapped k into d_evc / W, one kernel
+    INTEGER, INTENT(OUT) :: nrot
+    INTEGER, DEVICE, ALLOCATABLE :: d_rep(:,:), d_tr(:,:), d_ft(:,:), d_map(:,:,:)
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: d_ph(:,:,:)
+    nrot = 0
+    IF (.NOT. ALLOCATED(h_kdrep) .OR. .NOT. wdev_q) RETURN
+    nrot = COUNT(h_kdrep > 0)
+    IF (nrot == 0) RETURN
+    IF (kd_v2) THEN
+      CALL kdev_build_v2()
+      kd_v2 = .FALSE.
+      h_kdrep = 0
+      RETURN
+    ENDIF
+    ALLOCATE(d_rep(2, nksq), d_tr(2, nksq), d_ft(2, nksq), d_map(npwx, 2, nksq))
+    d_rep = h_kdrep; d_tr = h_kdtr; d_ft = h_kdft; d_map = h_kdmap
+    IF (ANY(h_kdft == 1 .AND. h_kdrep > 0)) THEN
+      ALLOCATE(d_ph(npwx, 2, nksq))
+      d_ph = h_kdph
+    ELSE
+      ALLOCATE(d_ph(1, 2, 1))
+    ENDIF
+    CALL k_kd_rot<<<dim3(nblk(npwx, TPB), nbnd, MIN(nksq, 65535)), TPB, 0, strm>>>(d_W, d_evc, d_rwf, d_rep, d_tr, d_ft, &
+         d_map, d_ph, d_npwq, d_npw, d_nock, npwx, nproj, nkb, nbnd, nslot, rwf_ld, rwf_nb, nksq)
+    CALL kerr('kd_rot')
+    CALL tsync()
+    DEALLOCATE(d_rep, d_tr, d_ft, d_map, d_ph)
+    h_kdrep = 0
+  END SUBROUTINE sth_engine_kdev_build
+  !
+  SUBROUTINE kdev_build_v2()
+    !! KDEV v2: per chunk of k, the inverse of each target sphere's FFT index list (box table), then the rotation through
+    !! (S, tr, G0) of the cache's Miller indices; k and k+q in two passes
+    INTEGER, DEVICE, ALLOCATABLE :: d_rep(:,:), d_tr(:,:), d_op(:,:,:), d_inv2(:,:)
+    INTEGER :: kc, k0, nk, wh
+    IF (ANY(nrx /= nr)) CALL errore_stop('kdev v2: padded FFT box', 1)
+    kc = MAX(1, MIN(nksq, INT(2_8 * 1024_8**3 / (4_8 * nnr))))
+    kc = MIN(kc, 512)
+    ALLOCATE(d_rep(2, nksq), d_tr(2, nksq), d_op(12, 2, nksq), d_inv2(nnr, kc))
+    d_rep = h_kdrep; d_tr = h_kdtr; d_op = h_kdop
+    d_inv2 = 0
+    DO wh = 1, 2
+      DO k0 = 0, nksq - 1, kc
+        nk = MIN(kc, nksq - k0)
+        CALL k_kd_inv<<<dim3(nblk(npwx, TPB), MIN(nk, 65535), 1), TPB, 0, strm>>>(d_inv2, d_idxk, d_idxkq, d_npw, d_npwq, &
+             wh, k0, nk, nnr, npwx)
+        CALL kerr('kd_inv')
+        CALL k_kd_rot2<<<dim3(nblk(npwx, TPB), nbnd, MIN(nk, 65535)), TPB, 0, strm>>>(d_W, d_evc, d_rwf, d_rmill, d_rep, &
+             d_tr, d_op, d_inv2, d_npwq, d_npw, d_nock, wh, k0, nk, npwx, nproj, nkb, nbnd, nslot, rwf_ld, rwf_nb, nnr, &
+             nr(1), nr(2), nr(3))
+        CALL kerr('kd_rot2')
+        CALL k_kd_clr<<<dim3(nblk(npwx, TPB), MIN(nk, 65535), 1), TPB, 0, strm>>>(d_inv2, d_idxk, d_idxkq, d_npw, d_npwq, &
+             wh, k0, nk, nnr, npwx)
+        CALL kerr('kd_clr')
+      ENDDO
+    ENDDO
+    CALL tsync()
+    DEALLOCATE(d_rep, d_tr, d_op, d_inv2)
+  END SUBROUTINE kdev_build_v2
+  !
+  SUBROUTINE sth_engine_set_wdev_n(ik0, n, npwq, vkbb)
+    !! KDEV: vkb of k+q blocks ik0 .. ik0+n-1 (vkb_batch's chunk, on the device; npwq(j) rows each) into W, one sync
+    INTEGER, INTENT(IN) :: ik0, n, npwq(n)
+    COMPLEX(dp), DEVICE, INTENT(IN) :: vkbb(npwx, nkb, *)
+    INTEGER :: j, istat
+    IF (nkb < 1) RETURN
+    istat = cudaDeviceSynchronize()
+    DO j = 1, n
+      istat = cudaMemcpy2DAsync(d_W(1, 1, ik0 + j - 1), npwx, vkbb(1, 1, j), npwx, npwq(j), nkb, &
+                                cudaMemcpyDeviceToDevice, strm)
+      CALL chk(istat, 'cudaMemcpy2DAsync (vkb chunk -> W)')
+    ENDDO
+    istat = cudaDeviceSynchronize()
+  END SUBROUTINE sth_engine_set_wdev_n
+  !
   SUBROUTINE cbsr_free()
     !! per-q CBSR state (the bases of cb_rep stay resident across q)
     INTEGER :: i
@@ -3009,13 +3299,27 @@ CONTAINS
       s = h_ckq(ik)
       ncol(s) = ncol(s) + npert * h_nock(ik)
     ENDDO
-    wid = 16 * ((ncol + 15) / 16)
+    ! width of each basis' column block: padded to a multiple of RTSC_STH_CBSR_PAD (default 8) so that bases of equal
+    ! width share one batched GEMM (zero padding columns: no effect on the valid ones)
+    IF (cb_pad == 0) THEN
+      cb_pad = 8
+      BLOCK
+        CHARACTER(LEN=16) :: sv
+        INTEGER :: ios, v
+        CALL get_environment_variable('RTSC_STH_CBSR_PAD', sv, STATUS=ios)
+        IF (ios == 0 .AND. LEN_TRIM(sv) > 0) THEN
+          READ(sv, *, IOSTAT=ios) v
+          IF (ios == 0 .AND. v >= 1) cb_pad = v
+        ENDIF
+      END BLOCK
+    ENDIF
+    wid = cb_pad * ((ncol + cb_pad - 1) / cb_pad)
     ! order bases by width (counting sort over the distinct widths)
     w = MAXVAL(wid)
-    ALLOCATE(cnt(0:w / 16))
+    ALLOCATE(cnt(0:w / cb_pad))
     cnt = 0
     DO s = 1, cb_nqs
-      cnt(wid(s) / 16) = cnt(wid(s) / 16) + 1
+      cnt(wid(s) / cb_pad) = cnt(wid(s) / cb_pad) + 1
     ENDDO
     cb_ngrp = COUNT(cnt(1:) > 0)
     IF (ALLOCATED(cb_gN)) DEALLOCATE(cb_gN, cb_gnb, cb_goff)
@@ -3024,9 +3328,9 @@ CONTAINS
     DO w = 1, UBOUND(cnt, 1)
       IF (cnt(w) == 0) CYCLE
       g = g + 1
-      cb_gN(g) = 16 * w; cb_gnb(g) = cnt(w); cb_goff(g) = i
+      cb_gN(g) = cb_pad * w; cb_gnb(g) = cnt(w); cb_goff(g) = i
       DO s = 1, cb_nqs
-        IF (wid(s) == 16 * w) THEN
+        IF (wid(s) == cb_pad * w) THEN
           i = i + 1
           ord(i) = s
         ENDIF
@@ -3074,6 +3378,15 @@ CONTAINS
       hY(i) = c_devloc(d_cy(1, co(s) + 1))
     ENDDO
     d_pA = hA; d_pX = hX; d_pY = hY
+    IF (sth_timing) THEN
+      ! batch shapes (for the H100 projection): width x number of bases, per group
+      WRITE(*, '(A,I3,A,I8,A,I8,A)', ADVANCE='NO') '     rtsc cbsr plan: npert ', npert, ', columns ', nvalid, ', gathered ', &
+           cb_ctot, ', groups (width x bases):'
+      DO g = 1, cb_ngrp
+        WRITE(*, '(1X,I0,A,I0)', ADVANCE='NO') cb_gN(g), 'x', cb_gnb(g)
+      ENDDO
+      WRITE(*, *)
+    ENDIF
     DEALLOCATE(ncol, wid, ord, co, hsc, hgl, cnt, hA, hX, hY)
     cb_npl = npert
     istat = 0
@@ -3294,7 +3607,7 @@ CONTAINS
   END SUBROUTINE sth_engine_set_global
   !
   SUBROUTINE sth_engine_set_k(ik, npw, npwq, nock, nockq, wk, idx_k, idx_kq, evc, evq, et_k, g2kin, &
-                              vkb, wwg, wg1, et_kq)
+                              vkb, wwg, wg1, et_kq, nowf)
     !! Per-k data. idx_k / idx_kq: 1-based FFT linear indices of k+G / k+q+G; evc, evq (npwx, nbnd);
     !! et_k (nbnd); g2kin (npwx) at k+q; vkb (npwx, nkb) at k+q; wwg (nbnd, nock), wg1 (nock).
     INTEGER, INTENT(IN) :: ik, npw, npwq, nock, nockq
@@ -3303,6 +3616,7 @@ CONTAINS
     COMPLEX(dp), INTENT(IN) :: evc(npwx, nbnd), evq(npwx, nbnd), vkb(npwx, nkb)
     REAL(dp), INTENT(IN) :: et_k(nbnd), g2kin(npwx), wwg(nbnd, nock), wg1(nock)
     REAL(dp), INTENT(IN), OPTIONAL :: et_kq(nbnd)
+    LOGICAL, INTENT(IN), OPTIONAL :: nowf     ! KDEV: evc / evq are built on the device (sth_engine_kdev_build)
     INTEGER :: n
     IF (PRESENT(et_kq)) h_etkq(:, ik) = et_kq(:)
     h_npw(ik) = npw; h_npwq(ik) = npwq; h_nock(ik) = nock; h_nockq(ik) = nockq; h_wk(ik) = wk
@@ -3314,6 +3628,9 @@ CONTAINS
     h_wg1(1:nock, ik) = wg1(1:nock)
     IF (wdev_q) THEN
       ! QCACHE: vkb comes from the device (sth_engine_set_wdev); evq and evc are uploaded here
+      IF (PRESENT(nowf)) THEN
+        IF (nowf) RETURN
+      ENDIF
       d_W(1:npwq, nkb + 1:nkb + nbnd, ik) = evq(1:npwq, 1:nbnd)
       IF (nock > 0) d_evc(1:npw, nslot * (ik - 1) + 1:nslot * (ik - 1) + nock) = evc(1:npw, 1:nock)
       RETURN
@@ -3638,6 +3955,12 @@ CONTAINS
     d_etkq = h_etkq
     d_wgt = 2.0_dp * h_wk / omega
     IF (.NOT. wdev_q) d_W = h_W
+    ! KDEV: evq / evc of the SYMROT-mapped k on the device (before the psi(r) cache reads d_evc)
+    IF (ALLOCATED(h_kdrep)) THEN
+      CALL sth_engine_kdev_build(sth_kdev_nrot)
+      IF (sth_timing .AND. sth_kdev_nrot > 0) WRITE(*, '(A,I8,A)') '     rtsc kdev: ', sth_kdev_nrot, &
+           ' k / k+q wavefunctions rotated on the device'
+    ENDIF
     IF (sth_timing) THEN
       CALL tsync(); tq(1) = wtime()
     ENDIF
