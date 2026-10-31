@@ -4153,7 +4153,7 @@ CONTAINS
     COMPLEX(dp), DEVICE :: gs(npwx, *), dst(npwx, *)
     INTEGER, INTENT(IN) :: nact
     LOGICAL, INTENT(OUT) :: done
-    INTEGER, ALLOCATABLE :: ha(:), cnt(:), wid(:), co(:), ord(:), hsc(:), hgl(:), bN(:), bnb(:), boff(:)
+    INTEGER, ALLOCATABLE :: hact(:), cnt(:), wid(:), co(:), ord(:), hsc(:), hgl(:), bN(:), bnb(:), boff(:)
     TYPE(c_devptr), ALLOCATABLE :: hA(:), hX(:), hY(:), hA2(:), hX2(:), hY2(:)
     TYPE(c_devptr), DEVICE, ALLOCATABLE :: pA(:), pX(:), pY(:), pA2(:), pX2(:), pY2(:)
     INTEGER, DEVICE, ALLOCATABLE :: dsc(:), dgl(:)
@@ -4163,11 +4163,11 @@ CONTAINS
     CALL tsync(); ta = wtime()
     ncolk = nslot * npert
     n1 = cb_n0 - cb_m0
-    ALLOCATE(ha(nact), cnt(cb_nqs), wid(cb_nqs), co(cb_nqs), ord(cb_nqs))
-    ha = d_act(1:nact)
+    ALLOCATE(hact(nact), cnt(cb_nqs), wid(cb_nqs), co(cb_nqs), ord(cb_nqs))
+    hact = d_act(1:nact)
     cnt = 0
     DO i = 1, nact
-      k = (ha(i) - 1) / ncolk + 1
+      k = (hact(i) - 1) / ncolk + 1
       cnt(h_ckq(k)) = cnt(h_ckq(k)) + 1
     ENDDO
     wid = cb_pad * ((cnt + cb_pad - 1) / cb_pad)
@@ -4186,7 +4186,7 @@ CONTAINS
       ctot = ctot + wid(ord(i))
     ENDDO
     IF (ctot > SIZE(d_cx, 2) .OR. nb == 0) THEN
-      DEALLOCATE(ha, cnt, wid, co, ord)
+      DEALLOCATE(hact, cnt, wid, co, ord)
       RETURN
     ENDIF
     ALLOCATE(hsc(ctot), hgl(ctot), bN(nb), bnb(nb), boff(nb))
@@ -4196,10 +4196,10 @@ CONTAINS
     ENDDO
     cnt = 0
     DO i = 1, nact
-      k = (ha(i) - 1) / ncolk + 1
+      k = (hact(i) - 1) / ncolk + 1
       sb = h_ckq(k)
       cnt(sb) = cnt(sb) + 1
-      hsc(co(sb) + cnt(sb)) = ha(i)
+      hsc(co(sb) + cnt(sb)) = hact(i)
     ENDDO
     nbt = 0
     DO i = 1, nb
@@ -4265,7 +4265,7 @@ CONTAINS
     CALL tsync()
     rf_gcols = rf_gcols + ctot
     sth_t_crfg = sth_t_crfg + wtime() - ta
-    DEALLOCATE(ha, cnt, wid, co, ord, hsc, hgl, bN, bnb, boff, hA, hX, hY, hA2, hX2, hY2, pA, pX, pY, pA2, pX2, pY2, dsc, dgl)
+    DEALLOCATE(hact, cnt, wid, co, ord, hsc, hgl, bN, bnb, boff, hA, hX, hY, hA2, hX2, hY2, pA, pX, pY, pA2, pX2, pY2, dsc, dgl)
     done = .TRUE.
   END SUBROUTINE cbsr_apply_rf_act
   !
