@@ -362,6 +362,7 @@ MODULE sth_engine
   !   Where a basis is stored does not change its numbers (an A40 device for the B2 gate; a safety net on the H100).
   ! - Under RTSC_STRICT=1, a CBSR decline ("CG kept") at q /= Gamma stops ph.x (the pre-flight rule of MILESTONE-2).
   LOGICAL, SAVE :: cb_xch = .FALSE., cb_host = .FALSE., cb_strict = .FALSE.
+  LOGICAL, SAVE :: sth_drho2 = .FALSE., sth_drho2_read = .FALSE.   ! RTSC_STH_DRHO2 (k_drho2)
   INTEGER, SAVE :: cb_hs(CB_MAXREP) = 0, cb_nh = 0, cb_nhcap = 0
   INTEGER(8), SAVE :: cb_hcopy = 0
   INTEGER, SAVE :: cb_stg_cur = 0, cb_hostn = 0
@@ -1685,6 +1686,58 @@ CONTAINS
       drho(ir, p) = drho(ir, p) + acc(p)
     ENDDO
   END SUBROUTINE k_drho
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_drho2(drho, box, psir, list, s0, nb, nnr, nslot, npert, wgt, pj)
+    ! rtsc b2x (RTSC_STH_DRHO2): k_drho with the same arithmetic in the same order (bitwise), restructured: the nb column
+    ! descriptors (pert, psi(r) slot, weight) are decoded once per block into shared memory, and the per-pert sums are
+    ! register scalars selected by p instead of a dynamically indexed local array. nb <= 256 (sth_bmax).
+    INTEGER, VALUE :: s0, nb, nnr, nslot, npert, pj
+    COMPLEX(dp) :: drho(nnr, *), box(nnr, *), psir(nnr, *)
+    INTEGER :: list(*)
+    REAL(dp) :: wgt(*)
+    INTEGER, SHARED :: cp(256), cb(256)
+    REAL(dp), SHARED :: cw(256)
+    INTEGER :: ir, j, s, k, n, p
+    COMPLEX(dp) :: a1, a2, a3, a4, a5, a6, x
+    j = threadIdx%x
+    DO WHILE (j <= nb)
+      s = list(s0 + j)
+      k = (s - 1) / (nslot * npert) + 1
+      n = MOD(s - 1, nslot) + 1
+      cp(j) = MOD((s - 1) / nslot, npert) + 1
+      cb(j) = n + nslot * (k - 1)
+      IF (pj == 1) cb(j) = j
+      cw(j) = wgt(k)
+      j = j + blockDim%x
+    ENDDO
+    CALL syncthreads()
+    ir = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    IF (ir > nnr) RETURN
+    a1 = (0.0_dp, 0.0_dp); a2 = a1; a3 = a1; a4 = a1; a5 = a1; a6 = a1
+    DO j = 1, nb
+      p = cp(j)
+      x = cw(j) * (CONJG(psir(ir, cb(j))) * box(ir, j))
+      IF (p == 1) THEN
+        a1 = a1 + x
+      ELSE IF (p == 2) THEN
+        a2 = a2 + x
+      ELSE IF (p == 3) THEN
+        a3 = a3 + x
+      ELSE IF (p == 4) THEN
+        a4 = a4 + x
+      ELSE IF (p == 5) THEN
+        a5 = a5 + x
+      ELSE
+        a6 = a6 + x
+      ENDIF
+    ENDDO
+    drho(ir, 1) = drho(ir, 1) + a1
+    IF (npert >= 2) drho(ir, 2) = drho(ir, 2) + a2
+    IF (npert >= 3) drho(ir, 3) = drho(ir, 3) + a3
+    IF (npert >= 4) drho(ir, 4) = drho(ir, 4) + a4
+    IF (npert >= 5) drho(ir, 5) = drho(ir, 5) + a5
+    IF (npert >= 6) drho(ir, 6) = drho(ir, 6) + a6
+  END SUBROUTINE k_drho2
   !
   !-------------------------------------------------------------------------------------------------
   ! mixed precision (sth_mp): FP32 operator, FP32 PCG with FP64 dots, FP64 round control
@@ -5474,6 +5527,15 @@ CONTAINS
     !
     t0 = wtime()
     istat = cudaGetLastError()   ! see sth_engine_setup
+    IF (.NOT. sth_drho2_read) THEN
+      BLOCK
+        CHARACTER(LEN=8) :: sv
+        INTEGER :: ios
+        CALL get_environment_variable('RTSC_STH_DRHO2', sv, STATUS=ios)
+        sth_drho2 = ios == 0 .AND. TRIM(sv) == '1'
+        sth_drho2_read = .TRUE.
+      END BLOCK
+    ENDIF
     scale = 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp)
     h_dpsi_valid = .FALSE.
     sth_nvalid = nvalid
@@ -5692,12 +5754,22 @@ CONTAINS
       CALL fft_exec(ip, d_box, CUFFT_INVERSE)
       ENDIF
       IF (s0 < psir_nv) THEN
+        IF (sth_drho2 .AND. nb <= 256) THEN
+          CALL k_drho2<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
+               npert, d_wgt, 0)
+        ELSE
         CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
              npert, d_wgt, 0)
+        ENDIF
       ELSE
         CALL psir_chunk(s0, nb, ip)
+        IF (sth_drho2 .AND. nb <= 256) THEN
+          CALL k_drho2<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_box2, d_valid, s0, nb, nnr, nslot, &
+               npert, d_wgt, 1)
+        ELSE
         CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_box2, d_valid, s0, nb, nnr, nslot, &
              npert, d_wgt, 1)
+        ENDIF
       ENDIF
       CALL kerr('drho')
       s0 = s0 + nb
