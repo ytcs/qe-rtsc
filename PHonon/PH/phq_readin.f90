@@ -411,6 +411,21 @@ SUBROUTINE phq_readin()
   ! ... Check all namelist variables
   !
   IF (tr2_ph <= 0.D0) CALL errore (' phq_readin', ' Wrong tr2_ph ', 1)
+  ! rtsc b2x (RTSC_TR2_SCALE; groups/compute/SOLVE-LOG.md session 6): the DFPT self-consistency threshold tr2_ph scaled
+  ! after input on every rank (a solver-convergence lever; the frozen ph.in stays as it is). Off unless set.
+  BLOCK
+    CHARACTER(LEN=32) :: sv_tr2
+    INTEGER :: ios_tr2
+    REAL(DP) :: sc_tr2
+    CALL get_environment_variable('RTSC_TR2_SCALE', sv_tr2, STATUS=ios_tr2)
+    IF (ios_tr2 == 0 .AND. LEN_TRIM(sv_tr2) > 0) THEN
+      READ(sv_tr2, *, IOSTAT=ios_tr2) sc_tr2
+      IF (ios_tr2 == 0 .AND. sc_tr2 > 0.d0) THEN
+        tr2_ph = tr2_ph * sc_tr2
+        WRITE(stdout, '(5x,"rtsc tr2: tr2_ph scaled by ",ES9.2," to ",ES9.2," (RTSC_TR2_SCALE)")') sc_tr2, tr2_ph
+      ENDIF
+    ENDIF
+  END BLOCK
   IF (eth_rps<= 0.D0) CALL errore ( 'phq_readin', ' Wrong eth_rps', 1)
   IF (eth_ns <= 0.D0) CALL errore ( 'phq_readin', ' Wrong eth_ns ', 1)
 
