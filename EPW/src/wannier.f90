@@ -314,6 +314,7 @@
       !
       ! Hamiltonian
       !
+      CALL start_clock('b2w_setup') ! rtsc epw4 profiling clock
       CALL hambloch2wan(nbnd, nbndsub, nk_loc, nkpts, et_loc, xk_loc, cu, lwin, exband, nrr_k, irvec_k, wslen_k, chw)
       !
       ! Kohn-Sham eigenvalues
@@ -333,6 +334,7 @@
       ! Dynamical Matrix
       !
       IF (.NOT. lifc) CALL dynbloch2wan(nmodes, nqc, xqc, dynq, nrr_q, irvec_q, wslen_q)
+      CALL stop_clock('b2w_setup') ! rtsc epw4 profiling clock
       !
       !
       ! Electron-Phonon vertex (Bloch el and Bloch ph -> Wannier el and Bloch ph)
@@ -388,7 +390,9 @@
       ! Electron-Phonon vertex (Wannier el and Bloch ph -> Wannier el and Wannier ph)
       !
       IF (etf_mem == 0) THEN
+        CALL start_clock('b2w_wanp') ! rtsc epw4 profiling clock
         CALL ephbloch2wanp(nbndsub, nmodes, xqc, nqc, irvec_k, irvec_g, nrr_k, nrr_g, epmatwe)
+        CALL stop_clock('b2w_wanp')
         ! TODO: the following I/O optimization is disabled because epmatwp was distributed across pools
         ! IF (ionode) CALL ephbloch2wanp(nbndsub, nmodes, xqc, nqc, irvec_k, irvec_g, nrr_k, nrr_g, epmatwe)
         ! CALL mp_bcast(epmatwp, ionode_id, inter_pool_comm)
@@ -402,7 +406,9 @@
       CALL mp_barrier(world_comm)
       !
       IF (epwwrite) THEN
+        CALL start_clock('b2w_write') ! rtsc epw4 profiling clock
         CALL epw_write(nrr_k, nrr_q, nrr_g, w_centers)
+        CALL stop_clock('b2w_write')
         !
         CALL epw_write_ws_data(dims, dims2, nrr_k, irvec_k, ndegen_k, wslen_k, &
           nrr_q, irvec_q, ndegen_q, wslen_q, nrr_g, irvec_g, ndegen_g, wslen_g)

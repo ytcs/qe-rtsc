@@ -1793,6 +1793,10 @@
     CALL print_clock('Ham: step 4')
     CALL print_clock('ep: step 1')
     CALL print_clock('ep: step 2')
+    CALL print_clock('ep: step 2r') ! rtsc epw4 profiling clocks
+    CALL print_clock('b2w_setup')
+    CALL print_clock('b2w_wanp')
+    CALL print_clock('b2w_write')
     CALL print_clock('ep: step 3')
     CALL print_clock('ep: step 4')
     CALL print_clock('unfold_sthmat')

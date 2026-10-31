@@ -1502,7 +1502,9 @@
                    cf, nks, czero, epmatw(1, 1, 1, imode), nbndsub * nbndsub)
       ENDDO
       DEALLOCATE(cf)
+      CALL start_clock('ep: step 2r') ! rtsc epw4 profiling clock (the inter-pool reduction)
       CALL mp_sum(epmatw, inter_pool_comm)
+      CALL stop_clock('ep: step 2r')
     ELSE
     DO imode = 1, nmodes
       DO ir = 1, nrr
