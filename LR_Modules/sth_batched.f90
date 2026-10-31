@@ -632,7 +632,9 @@ CONTAINS
                                  sth_fftdx_req, sth_fftdx_check, &
                                  sth_fdxdp_req, sth_fdxdp_check, sth_obatch, sth_timing, &
                                  sth_engine_set_nlk, sth_qcache, sth_engine_wdev, sth_engine_set_wdev, &
-                                 sth_lift, sth_lift_kchunk, sth_lift_fb, sth_cbsr
+                                 sth_lift, sth_lift_kchunk, sth_lift_fb, sth_cbsr, sth_cbsr_skip, &
+                                 sth_engine_cbsr_map
+    USE sth_nscf_symrot,  ONLY : symrot_kmap
     USE lrus,             ONLY : becp1
     !
     LOGICAL, INTENT(IN) :: first_iter
@@ -797,6 +799,37 @@ CONTAINS
       WRITE(*, '(A,F8.3,A)') '     rtsc sth_init: host per-k loop ', REAL(c1 - c0, DP) / REAL(crate, DP), ' s'
       WRITE(stdout, '(5x,"rtsc sth_init k-loop: get_buffer ",F7.3," init_us_2+vkb ",F7.3," g2kin+weights ",F7.3, &
            &" set_k ",F7.3," dvbare/dpsi ",F7.3)') tk(1:5)
+    ENDIF
+    ! CBSR (RTSC_STH_CBSR=1): which RTSC_NSCF_SYMROT cache entry, and which G map, every k+q was rotated from
+    IF (sth_cbsr) THEN
+    BLOCK
+      INTEGER :: i0, ngs, tr, nmap, ios
+      LOGICAL :: ok
+      INTEGER, ALLOCATABLE :: imap(:)
+      COMPLEX(DP), ALLOCATABLE :: ph(:)
+      CHARACTER(LEN=8) :: sv
+      ! q = Gamma reads the scf psi (no SYMROT map): every k needs its own basis, which costs more than Gamma's CG
+      ! (|K_irr| eigendecompositions for one q); CG is kept there unless RTSC_STH_CBSR_GAMMA=1
+      sth_cbsr_skip = .FALSE.
+      IF (lgamma) THEN
+        CALL get_environment_variable('RTSC_STH_CBSR_GAMMA', sv, STATUS=ios)
+        sth_cbsr_skip = .NOT. (ios == 0 .AND. TRIM(sv) == '1')
+      ENDIF
+      ALLOCATE(imap(npwx), ph(npwx))
+      nmap = 0
+      DO ik = 1, nksq
+        ok = .FALSE.
+        IF (.NOT. lgamma) CALL symrot_kmap(ikqs(ik), i0, ngs, tr, imap, ph, ok)
+        IF (ok) THEN
+          nmap = nmap + 1
+        ELSE
+          i0 = 0; ngs = 0; tr = 1
+        ENDIF
+        CALL sth_engine_cbsr_map(ik, i0, ngs, tr, imap, ph)
+      ENDDO
+      WRITE(stdout, '(5x,"rtsc cbsr: ",I0," of ",I0," k+q mapped onto RTSC_NSCF_SYMROT cache entries")') nmap, nksq
+      DEALLOCATE(imap, ph)
+    END BLOCK
     ENDIF
     CALL sth_engine_setup(ierr)
     IF (ierr == 0 .AND. dvb_on) CALL dvb_build(npert, lrdvpsi, iudvpsi)

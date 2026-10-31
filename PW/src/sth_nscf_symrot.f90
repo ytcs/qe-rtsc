@@ -32,6 +32,7 @@ MODULE sth_nscf_symrot
   PUBLIC :: symrot_on, symrot_plan, symrot_after_solve, symrot_report, symrot_tight, symrot_check_on, symrot_resid
   ! rtsc epw3 (RTSC_PW_SYMROT=1; groups/compute/EPW3-LOG.md): the same rotation in pw.x's nscf (c_bands_nscf), the
   ! Wannier k grid read by EPW. The module lives in PW/src so that both pw.x and ph.x use it.
+  PUBLIC :: symrot_kmap
   PUBLIC :: symrot_pw_on, symrot_pw_tight, symrot_pw_check_on, symrot_note_notconv, symrot_rep_guard
   INTEGER, SAVE :: last_notconv = 0, nbadrep = 0
   !
@@ -509,6 +510,7 @@ CONTAINS
         IF (io_level > -1) CALL save_buffer(evc, nwordwfc, iunwfc, ik)
         kdone(ik) = .TRUE.
         kind_(ik) = 1; ksrc(ik) = i0
+        ksym(ik) = isym; ktr(ik) = tr; kg0(:, ik) = g0     ! kept for symrot_kmap (RTSC_STH_CBSR)
         nrot_c = nrot_c + 1
         found = .TRUE.
         EXIT
@@ -597,6 +599,7 @@ CONTAINS
       cwfc(1:ngk(ik), 1:nbnd, nc) = evc(1:ngk(ik), 1:nbnd)
       ce(1:nbnd, nc) = et(1:nbnd, ik)
       slot(ik) = nc
+      ksrc(ik) = nc; ksym(ik) = -1                     ! identity, for symrot_kmap (RTSC_STH_CBSR)
       CALL h_images(tc, cxk(:, nc), nc)
     ENDDO
     ! rotate the waiting k-points
@@ -701,6 +704,66 @@ CONTAINS
     WRITE(stdout, '(5x,"rtsc nscf symrot check: max |H psi - e psi| rotated ",ES10.3,", diagonalized ",ES10.3, &
          &"; max | |psi| - 1 | ",ES10.3)') rr, rd, ro
   END SUBROUTINE symrot_resid
+  !
+  !------------------------------------------------------------------------------------------
+  SUBROUTINE symrot_kmap(ik, i0, ngs, tr, imap, ph, ok)
+    !------------------------------------------------------------------------------------------
+    !! rtsc CBSR (RTSC_STH_CBSR; groups/compute/SOLVE-LOG.md session 4): for k-point ik of the current plan, the cache
+    !! entry i0 whose eigenpairs it was rotated from (or which it is), and the G map of that rotation:
+    !!   psi_ik(imap(ig)) = ph(ig) psi_i0(ig) (tr = 1),  conj(ph(ig) psi_i0(ig)) (tr = -1),  ig = 1..ngs (cache order).
+    !! ok = .FALSE. if ik was diagonalized itself (no cache entry) or the plan does not describe the current k list.
+    !! Read-only: nothing of the nscf changes.
+    USE klist,     ONLY : nks, ngk
+    USE constants, ONLY : tpi
+    INTEGER, INTENT(IN) :: ik
+    INTEGER, INTENT(OUT) :: i0, ngs, tr, imap(:)
+    COMPLEX(DP), INTENT(OUT) :: ph(:)
+    LOGICAL, INTENT(OUT) :: ok
+    INTEGER :: ig, j, mr(3), isym
+    REAL(DP) :: xt(3), kr(3), d(3), arg
+    ok = .FALSE.; i0 = 0; ngs = 0; tr = 1
+    IF (.NOT. ALLOCATED(kind_)) RETURN
+    IF (SIZE(kind_) /= nks .OR. ik < 1 .OR. ik > nks) RETURN
+    IF (kind_(ik) < 1 .OR. kind_(ik) > 3) RETURN
+    i0 = ksrc(ik)
+    IF (i0 < 1 .OR. i0 > nc) RETURN
+    ngs = cngw(i0)
+    IF (ngs /= ngk(ik) .OR. SIZE(imap) < ngs .OR. npos == 0) RETURN
+    isym = ksym(ik)
+    CALL kcryst(ik, xt)
+    IF (isym == -1) THEN
+      IF (ANY(ABS(xt - cxk(:, i0)) > 1.d-6)) RETURN
+      tr = 1
+      CALL pos_set(ik, 1)
+      DO ig = 1, ngs
+        imap(ig) = pos(lin(cmill(:, ig, i0)))
+        ph(ig) = (1.d0, 0.d0)
+      ENDDO
+      CALL pos_set(ik, 0)
+    ELSE
+      IF (isym < 1 .OR. isym > nsr) RETURN
+      tr = ktr(ik)
+      DO j = 1, 3
+        kr(j) = tr * (sr(j, 1, isym) * cxk(1, i0) + sr(j, 2, isym) * cxk(2, i0) + sr(j, 3, isym) * cxk(3, i0))
+      ENDDO
+      d = xt - kr - kg0(:, ik)
+      IF (ANY(ABS(d) > 1.d-6)) RETURN
+      CALL pos_set(ik, 1)
+      DO ig = 1, ngs
+        DO j = 1, 3
+          mr(j) = tr * (sr(j, 1, isym) * cmill(1, ig, i0) + sr(j, 2, isym) * cmill(2, ig, i0) + &
+                        sr(j, 3, isym) * cmill(3, ig, i0)) - kg0(j, ik)
+        ENDDO
+        imap(ig) = pos(lin(mr))
+        arg = tpi * ((cxk(1, i0) + cmill(1, ig, i0)) * ftr(1, isym) + (cxk(2, i0) + cmill(2, ig, i0)) * ftr(2, isym) + &
+                      (cxk(3, i0) + cmill(3, ig, i0)) * ftr(3, isym))
+        ph(ig) = CMPLX(COS(arg), -SIN(arg), KIND=DP)
+      ENDDO
+      CALL pos_set(ik, 0)
+    ENDIF
+    IF (ANY(imap(1:ngs) < 1)) RETURN
+    ok = .TRUE.
+  END SUBROUTINE symrot_kmap
   !
   SUBROUTINE symrot_report()
     USE io_global, ONLY : stdout

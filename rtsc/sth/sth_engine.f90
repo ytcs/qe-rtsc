@@ -26,6 +26,7 @@ MODULE sth_engine
   USE cudafor
   USE cufft
   USE cublas_v2
+  USE cusolverDn
   USE sth_pfft, ONLY : pfft_setup, pfft_free, pfft_local, pfft_ok, pfft_info
   USE sth_pfft_s, ONLY : pfs_setup, pfs_free, pfs_local, pfs_ok
   USE iso_c_binding, ONLY : c_int, c_double, c_float
@@ -47,7 +48,7 @@ MODULE sth_engine
             sth_weights, sth_engine_ready, sth_engine_irrep, sth_engine_irrep_commit, sth_engine_qready, &
             sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set, &
             sth_engine_set_nlk, sth_engine_build_dvb, sth_engine_dvb_check, &
-            sth_engine_kqg_ready, sth_engine_set_kqg, sth_engine_set_wdev, sth_engine_wdev
+            sth_engine_kqg_ready, sth_engine_set_kqg, sth_engine_set_wdev, sth_engine_wdev, sth_engine_cbsr_map
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -277,18 +278,50 @@ MODULE sth_engine
   INTEGER, PUBLIC, SAVE :: sth_lift_nfb(4) = 0
   INTEGER, DEVICE, ALLOCATABLE :: d_lok(:,:)
   !
-  ! rtsc CBSR canary (RTSC_STH_CBSR=1; SOLVE-LOG.md "CBSR canary"): per k+q the full dense A~ = H_kq + alpha_pv P_v
-  ! (nscf evq, energy zero V0) is diagonalised once per q (host zheevd, FP64): A~ - V0 = U Lambda U^H. Each SCF call then
-  ! replaces the CG by dpsi_n = U diag(1/(Lambda - e~_n)) U^H b_n, b_n = the engine's orthogonalised right-hand side:
-  ! QE's linear system solved exactly. U is device-resident when it fits, else pinned host chunks streamed per call.
-  LOGICAL, PUBLIC, SAVE :: sth_cbsr = .FALSE.
-  REAL(dp), PUBLIC, SAVE :: sth_t_cbuild = 0, sth_t_csolve = 0
-  LOGICAL, SAVE :: cbsr_q = .FALSE., cbsr_stream = .FALSE.
-  INTEGER, SAVE :: cbsr_kc = 0
+  ! rtsc CBSR (RTSC_STH_CBSR=1; SOLVE-LOG.md "CBSR canary" and session 4 "production"). Exact spectral solve of the engine's
+  ! own system A~ = H_kq + alpha_pv P_v (nscf evq, energy zero V0): A~ - V0 = U Lambda U^H, and each SCF call replaces the
+  ! CG by dpsi_n = U diag(1/(Lambda - e~_n)) U^H b_n on the engine's orthogonalised right-hand side (QE's system solved
+  ! exactly; referee B's theta-weighted closed form with the nscf psi as the single psi source).
+  ! Production path:
+  ! - U is built on the GPU (dense assembly kernel + cuBLAS + cuSOLVER zheevd) once per RTSC_NSCF_SYMROT cache entry
+  !   (one per full-group orbit of k-points) and kept on the device across q (cb_rep, in the entry's own G order).
+  !   Every k+q of a q that SYMROT rotated from entry i0 uses U_i0 through the rotation's G map (imap, phase, time
+  !   reversal; symrot_kmap): b is gathered into the entry's G order, solved, and scattered back. A k+q without a map
+  !   (diagonalized itself, or q = Gamma, which reads the scf psi) gets a per-q basis (cb_tmp), built the same way.
+  ! - The ZGEMMs run batched over every column that shares a basis (all k+q of the q in its star, all patterns and
+  !   bands): columns are grouped per basis, padded to a multiple of 16, and bases of equal padded width go into one
+  !   cublasZgemmBatched.
+  LOGICAL, PUBLIC, SAVE :: sth_cbsr = .FALSE., sth_cbsr_skip = .FALSE.
+  REAL(dp), PUBLIC, SAVE :: sth_t_cbuild = 0, sth_t_csolve = 0, sth_t_ceig = 0
+  LOGICAL, SAVE :: cbsr_q = .FALSE.
   REAL(dp), SAVE :: cbsr_v0 = 0.0_dp
-  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_cu(:,:,:), d_cc(:,:)
-  COMPLEX(dp), PINNED, ALLOCATABLE, SAVE :: h_cu(:,:,:)
-  REAL(dp), DEVICE, ALLOCATABLE :: d_clam(:,:)
+  INTEGER, PARAMETER :: CB_MAXREP = 8192
+  TYPE cb_slot_t
+    COMPLEX(dp), DEVICE, ALLOCATABLE :: u(:,:)
+  END TYPE cb_slot_t
+  TYPE(cb_slot_t), SAVE :: cb_rep(CB_MAXREP)
+  TYPE(cb_slot_t), ALLOCATABLE, SAVE :: cb_tmp(:)
+  REAL(dp), ALLOCATABLE, SAVE :: h_cblam(:,:), h_cbtlam(:,:)
+  INTEGER, SAVE :: cb_n0 = 0, cb_nres = 0, cb_nbuilt = 0, cb_qcount = 0, cb_lastq(CB_MAXREP) = 0
+  ! per-q map of every k+q onto its basis (sth_engine_cbsr_map): rep id (0: per-q basis), time reversal, G map, phase
+  INTEGER, ALLOCATABLE, SAVE :: h_ckrep(:), h_cktr(:), h_ckmap(:,:), h_ckq(:)
+  COMPLEX(dp), ALLOCATABLE, SAVE :: h_ckph(:,:)
+  INTEGER, DEVICE, ALLOCATABLE :: d_ckmap(:,:), d_cktr(:)
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_ckph(:,:)
+  ! per-q bases of this q (nqs): rep id (> 0) or -tmp index; per-irrep plan of gathered columns and batched GEMMs
+  INTEGER, SAVE :: cb_nqs = 0, cb_npl = -1, cb_ctot = 0, cb_ngrp = 0, cb_ntmp = 0
+  INTEGER, ALLOCATABLE, SAVE :: cb_qs(:), cb_gN(:), cb_gnb(:), cb_goff(:)
+  INTEGER, DEVICE, ALLOCATABLE :: d_cgsc(:), d_cgl(:)
+  REAL(dp), DEVICE, ALLOCATABLE :: d_cqlam(:,:)
+  TYPE(c_devptr), DEVICE, ALLOCATABLE :: d_pA(:), d_pX(:), d_pY(:)
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_cx(:,:), d_cy(:,:)
+  ! build workspace (GPU assembly + cuSOLVER)
+  COMPLEX(dp), DEVICE, ALLOCATABLE :: d_ca(:,:), d_cvg(:), d_cwork(:), d_cx1(:,:)
+  REAL(dp), DEVICE, ALLOCATABLE :: d_cw(:)
+  INTEGER, DEVICE, ALLOCATABLE :: d_cinfo(:)
+  TYPE(cusolverDnHandle), SAVE :: hsolv
+  LOGICAL, SAVE :: have_solv = .FALSE.
+  INTEGER, SAVE :: cb_lwork = 0
   LOGICAL, SAVE :: lift_q = .FALSE., lift_stream = .FALSE.
   INTEGER, SAVE :: lift_nm = 0, lift_kc = 0
   REAL(dp), SAVE :: lift_v0 = 0.0_dp
@@ -855,28 +888,172 @@ CONTAINS
     ENDDO
   END SUBROUTINE k_lift_scale
   !
-  ATTRIBUTES(GLOBAL) SUBROUTINE k_cbsr_scale(c, lam, etk, nm, nbnd, nslot, ncolk, k0, ntot, v0)
-    ! CBSR: c(j, sc) /= (Lambda_j(k) - (e_n(k) - V0)) on the chunk's columns (padding rows: Lambda = 1e30 -> 0)
-    INTEGER, VALUE :: nm, nbnd, nslot, ncolk, k0
-    INTEGER(8), VALUE :: ntot
-    REAL(dp), VALUE :: v0
-    COMPLEX(dp) :: c(nm, *)
-    REAL(dp) :: lam(nm, *), etk(nbnd, *)
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_scal(a, f, n)
+    INTEGER(8), VALUE :: n
+    REAL(dp), VALUE :: f
+    COMPLEX(dp) :: a(*)
     INTEGER(8) :: i
-    INTEGER :: j, sc, k, n
-    REAL(dp) :: d
     i = INT(blockIdx%x - 1, 8) * blockDim%x + threadIdx%x
-    DO WHILE (i <= ntot)
-      j = INT(MOD(i - 1, INT(nm, 8))) + 1
-      sc = INT((i - 1) / nm) + 1 + k0 * ncolk
-      k = (sc - 1) / ncolk + 1
-      n = MOD(sc - 1, nslot) + 1
-      d = lam(j, k) - (etk(n, k) - v0)
-      IF (ABS(d) < 1.0e-12_dp) d = SIGN(1.0e-12_dp, d)
-      c(j, sc) = c(j, sc) / d
+    DO WHILE (i <= n)
+      a(i) = a(i) * f
       i = i + INT(blockDim%x, 8) * gridDim%x
     ENDDO
-  END SUBROUTINE k_cbsr_scale
+  END SUBROUTINE k_cb_scal
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_asm(a, vg, idx, g2, nq, n0, nr1, nr2, nr3, v0)
+    ! CBSR assembly: a(ig, j) = V(G_ig - G_j) + delta_ij (|k+q+G_j|^2 - V0) on the nq x nq block, zero elsewhere (n0 x n0)
+    INTEGER, VALUE :: nq, n0, nr1, nr2, nr3
+    REAL(dp), VALUE :: v0
+    COMPLEX(dp) :: a(n0, *), vg(*)
+    INTEGER :: idx(*)
+    REAL(dp) :: g2(*)
+    INTEGER :: ig, j, i1, j1, a1, a2, a3
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    j = blockIdx%y
+    DO WHILE (j <= n0)
+      IF (ig <= n0) THEN
+        IF (ig <= nq .AND. j <= nq) THEN
+          i1 = idx(ig) - 1; j1 = idx(j) - 1
+          a1 = MODULO(MOD(i1, nr1) - MOD(j1, nr1), nr1)
+          a2 = MODULO(MOD(i1 / nr1, nr2) - MOD(j1 / nr1, nr2), nr2)
+          a3 = MODULO(i1 / (nr1 * nr2) - j1 / (nr1 * nr2), nr3)
+          a(ig, j) = vg(1 + a1 + nr1 * (a2 + nr2 * a3))
+          IF (ig == j) a(ig, j) = a(ig, j) + (g2(j) - v0)
+        ELSE
+          a(ig, j) = (0.0_dp, 0.0_dp)
+        ENDIF
+      ENDIF
+      j = j + gridDim%y
+    ENDDO
+  END SUBROUTINE k_cb_asm
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_herm(a, nq, n0)
+    ! upper triangle (read by zheevd 'U') = the Hermitian part: a(i, j) = (a(i, j) + conj(a(j, i))) / 2, i <= j
+    INTEGER, VALUE :: nq, n0
+    COMPLEX(dp) :: a(n0, *)
+    INTEGER :: i, j
+    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    j = blockIdx%y
+    DO WHILE (j <= nq)
+      IF (i < j) THEN
+        a(i, j) = 0.5_dp * (a(i, j) + CONJG(a(j, i)))
+      ELSE IF (i == j) THEN
+        a(i, i) = CMPLX(REAL(a(i, i)), 0.0_dp, KIND=dp)
+      ENDIF
+      j = j + gridDim%y
+    ENDDO
+  END SUBROUTINE k_cb_herm
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_torep(u, a, map, ph, tr, nq, n0)
+    ! eigenvectors of the member k+q (a) into the basis' own G order: u(ig, j) = conj(ph) a(map(ig), j) (tr = 1),
+    ! conj(ph a(map(ig), j)) (tr = -1); zero outside the nq x nq block
+    INTEGER, VALUE :: tr, nq, n0
+    COMPLEX(dp) :: u(n0, *), a(n0, *), ph(*)
+    INTEGER :: map(*)
+    INTEGER :: ig, j
+    COMPLEX(dp) :: v
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    j = blockIdx%y
+    DO WHILE (j <= n0)
+      IF (ig <= n0) THEN
+        IF (ig <= nq .AND. j <= nq) THEN
+          v = a(map(ig), j)
+          IF (tr == 1) THEN
+            u(ig, j) = CONJG(ph(ig)) * v
+          ELSE
+            u(ig, j) = CONJG(ph(ig) * v)
+          ENDIF
+        ELSE
+          u(ig, j) = (0.0_dp, 0.0_dp)
+        ENDIF
+      ENDIF
+      j = j + gridDim%y
+    ENDDO
+  END SUBROUTINE k_cb_torep
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_gather(x, d0, gsc, map, ph, tr, npwq, n0, npwx, ncolk, ctot)
+    ! x(:, c) = the right-hand side of engine slot gsc(c) in its basis' G order (0 for padding columns)
+    INTEGER, VALUE :: n0, npwx, ncolk, ctot
+    COMPLEX(dp) :: x(n0, *), d0(npwx, *), ph(n0, *)
+    INTEGER :: gsc(*), map(n0, *), tr(*), npwq(*)
+    INTEGER :: j, c, sc, k
+    COMPLEX(dp) :: b
+    j = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    c = blockIdx%y
+    DO WHILE (c <= ctot)
+      IF (j <= n0) THEN
+        sc = gsc(c)
+        IF (sc > 0) THEN
+          k = (sc - 1) / ncolk + 1
+          IF (j <= npwq(k)) THEN
+            b = d0(map(j, k), sc)
+            IF (tr(k) == 1) THEN
+              x(j, c) = CONJG(ph(j, k)) * b
+            ELSE
+              x(j, c) = CONJG(ph(j, k) * b)
+            ENDIF
+          ELSE
+            x(j, c) = (0.0_dp, 0.0_dp)
+          ENDIF
+        ELSE
+          x(j, c) = (0.0_dp, 0.0_dp)
+        ENDIF
+      ENDIF
+      c = c + gridDim%y
+    ENDDO
+  END SUBROUTINE k_cb_gather
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_scale(y, lam, gl, gsc, etk, v0, n0, nbnd, nslot, ncolk, ctot)
+    ! y(j, c) /= (Lambda_j - (e_n(k) - V0)), Lambda of the column's basis (padding rows: Lambda = 1e30 -> 0)
+    INTEGER, VALUE :: n0, nbnd, nslot, ncolk, ctot
+    REAL(dp), VALUE :: v0
+    COMPLEX(dp) :: y(n0, *)
+    REAL(dp) :: lam(n0, *), etk(nbnd, *)
+    INTEGER :: gl(*), gsc(*)
+    INTEGER :: j, c, sc, k, n
+    REAL(dp) :: d
+    j = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    c = blockIdx%y
+    DO WHILE (c <= ctot)
+      IF (j <= n0) THEN
+        sc = gsc(c)
+        IF (sc > 0) THEN
+          k = (sc - 1) / ncolk + 1
+          n = MOD(sc - 1, nslot) + 1
+          d = lam(j, gl(c)) - (etk(n, k) - v0)
+          IF (ABS(d) < 1.0e-12_dp) d = SIGN(1.0e-12_dp, d)
+          y(j, c) = y(j, c) / d
+        ENDIF
+      ENDIF
+      c = c + gridDim%y
+    ENDDO
+  END SUBROUTINE k_cb_scale
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_scatter(dpsi, x, gsc, map, ph, tr, npwq, n0, npwx, ncolk, ctot)
+    ! dpsi(map(j, k), sc) = ph x(j, c) (tr = 1), conj(ph x(j, c)) (tr = -1); rows > npwq(k) are left as they are (zero)
+    INTEGER, VALUE :: n0, npwx, ncolk, ctot
+    COMPLEX(dp) :: dpsi(npwx, *), x(n0, *), ph(n0, *)
+    INTEGER :: gsc(*), map(n0, *), tr(*), npwq(*)
+    INTEGER :: j, c, sc, k
+    j = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    c = blockIdx%y
+    DO WHILE (c <= ctot)
+      IF (j <= n0) THEN
+        sc = gsc(c)
+        IF (sc > 0) THEN
+          k = (sc - 1) / ncolk + 1
+          IF (j <= npwq(k)) THEN
+            IF (tr(k) == 1) THEN
+              dpsi(map(j, k), sc) = ph(j, k) * x(j, c)
+            ELSE
+              dpsi(map(j, k), sc) = CONJG(ph(j, k) * x(j, c))
+            ENDIF
+          ENDIF
+        ENDIF
+      ENDIF
+      c = c + gridDim%y
+    ENDDO
+  END SUBROUTINE k_cb_scatter
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_r2c(a, b, n)
     ! a (complex) = b (real)
@@ -2469,204 +2646,472 @@ CONTAINS
   END SUBROUTINE lift_apply
   !
   SUBROUTINE cbsr_free()
-    IF (ALLOCATED(d_cu)) DEALLOCATE(d_cu)
-    IF (ALLOCATED(h_cu)) DEALLOCATE(h_cu)
-    IF (ALLOCATED(d_clam)) DEALLOCATE(d_clam)
-    IF (ALLOCATED(d_cc)) DEALLOCATE(d_cc)
+    !! per-q CBSR state (the bases of cb_rep stay resident across q)
+    INTEGER :: i
+    IF (ALLOCATED(cb_tmp)) THEN
+      DO i = 1, SIZE(cb_tmp)
+        IF (ALLOCATED(cb_tmp(i)%u)) DEALLOCATE(cb_tmp(i)%u)
+      ENDDO
+      DEALLOCATE(cb_tmp)
+    ENDIF
+    IF (ALLOCATED(h_cbtlam)) DEALLOCATE(h_cbtlam)
+    IF (ALLOCATED(d_ckmap)) DEALLOCATE(d_ckmap, d_cktr, d_ckph)
+    IF (ALLOCATED(cb_qs)) DEALLOCATE(cb_qs)
+    IF (ALLOCATED(cb_gN)) DEALLOCATE(cb_gN, cb_gnb, cb_goff)
+    IF (ALLOCATED(d_cgsc)) DEALLOCATE(d_cgsc, d_cgl)
+    IF (ALLOCATED(d_cqlam)) DEALLOCATE(d_cqlam)
+    IF (ALLOCATED(d_pA)) DEALLOCATE(d_pA, d_pX, d_pY)
+    IF (ALLOCATED(d_cx)) DEALLOCATE(d_cx)
+    IF (ALLOCATED(d_cy)) DEALLOCATE(d_cy)
+    IF (ALLOCATED(d_ca)) DEALLOCATE(d_ca, d_cvg, d_cw, d_cinfo, d_cx1)
+    IF (ALLOCATED(d_cwork)) DEALLOCATE(d_cwork)
+    cb_lwork = 0
+    cb_nqs = 0; cb_npl = -1; cb_ctot = 0; cb_ngrp = 0; cb_ntmp = 0
     cbsr_q = .FALSE.
-    cbsr_stream = .FALSE.
   END SUBROUTINE cbsr_free
   !
-  SUBROUTINE cbsr_build()
-    !! CBSR canary: dense A~ per k+q of this q, host zheevd, U and Lambda (FP64); see the module header.
-    INTEGER :: ik, nq, i, j, ig, jg, m, nocc, info, lwork, lrwork, liwork, istat, a1, a2, a3, b1, b2, b3, kc, nfail
-    INTEGER(8) :: freeb, totb, ubytes, avail
-    REAL(dp) :: t0, te, teig, de, demax, eexp, gmin
-    COMPLEX(dp), ALLOCATABLE :: vg(:), a(:,:), x(:,:), cw(:), hu(:,:), dm(:,:), hul(:,:)
-    REAL(dp), ALLOCATABLE :: lam(:), rw(:), hlam(:,:)
-    INTEGER, ALLOCATABLE :: m3(:,:), iw(:)
-    LOGICAL :: w_staged
-    EXTERNAL :: zgemm, zheevd
-    t0 = wtime()
-    teig = 0.0_dp
+  SUBROUTINE cbsr_release()
+    !! every CBSR basis, including the resident ones (shutdown)
+    INTEGER :: i, istat
     CALL cbsr_free()
+    DO i = 1, CB_MAXREP
+      IF (ALLOCATED(cb_rep(i)%u)) DEALLOCATE(cb_rep(i)%u)
+    ENDDO
+    cb_nres = 0
+    IF (ALLOCATED(h_ckrep)) DEALLOCATE(h_ckrep, h_cktr, h_ckmap, h_ckph, h_ckq)
+    IF (have_solv) THEN
+      istat = cusolverDnDestroy(hsolv)
+      have_solv = .FALSE.
+    ENDIF
+  END SUBROUTINE cbsr_release
+  !
+  SUBROUTINE sth_engine_cbsr_map(ik, irep, ngs, tr, imap, ph)
+    !! (after sth_engine_init, before sth_engine_setup) k+q of column block ik is the image of RTSC_NSCF_SYMROT cache
+    !! entry irep: evq_ik(imap(ig)) = ph(ig) psi_irep(ig) (tr = 1) or conj(ph(ig) psi_irep(ig)) (tr = -1), ig = 1..ngs.
+    !! irep = 0: no map; k+q gets its own per-q basis.
+    INTEGER, INTENT(IN) :: ik, irep, ngs, tr, imap(*)
+    COMPLEX(dp), INTENT(IN) :: ph(*)
+    INTEGER :: ig
+    IF (ALLOCATED(h_ckrep)) THEN
+      IF (SIZE(h_ckrep) /= nksq .OR. SIZE(h_ckmap, 1) /= npwx) DEALLOCATE(h_ckrep, h_cktr, h_ckmap, h_ckph, h_ckq)
+    ENDIF
+    IF (.NOT. ALLOCATED(h_ckrep)) ALLOCATE(h_ckrep(nksq), h_cktr(nksq), h_ckmap(npwx, nksq), h_ckph(npwx, nksq), &
+                                           h_ckq(nksq))
+    IF (ik == 1) h_ckrep = -1
+    IF (irep > 0 .AND. irep <= CB_MAXREP .AND. ngs == h_npwq(ik)) THEN
+      h_ckrep(ik) = irep
+      h_cktr(ik) = tr
+      h_ckmap(1:ngs, ik) = imap(1:ngs)
+      h_ckph(1:ngs, ik) = ph(1:ngs)
+    ELSE
+      h_ckrep(ik) = 0
+      h_cktr(ik) = 1
+      DO ig = 1, h_npwq(ik)
+        h_ckmap(ig, ik) = ig
+        h_ckph(ig, ik) = (1.0_dp, 0.0_dp)
+      ENDDO
+    ENDIF
+    IF (h_npwq(ik) < npwx) THEN
+      h_ckmap(h_npwq(ik) + 1:npwx, ik) = 1
+      h_ckph(h_npwq(ik) + 1:npwx, ik) = (0.0_dp, 0.0_dp)
+    ENDIF
+  END SUBROUTINE sth_engine_cbsr_map
+  !
+  INTEGER FUNCTION cb_bisect(lam, n, x)
+    !! index of the element of the ascending lam(1:n) nearest to x
+    INTEGER, INTENT(IN) :: n
+    REAL(dp), INTENT(IN) :: lam(n), x
+    INTEGER :: lo, hi, mid
+    lo = 1; hi = n
+    DO WHILE (hi - lo > 1)
+      mid = (lo + hi) / 2
+      IF (lam(mid) <= x) THEN
+        lo = mid
+      ELSE
+        hi = mid
+      ENDIF
+    ENDDO
+    cb_bisect = lo
+    IF (ABS(lam(hi) - x) < ABS(lam(lo) - x)) cb_bisect = hi
+  END FUNCTION cb_bisect
+  !
+  SUBROUTINE cb_build_one(ik, u, hlam, map, ph, tr)
+    !! the basis of member k+q ik: dense A~ - V0 on the device, zheevd (cuSOLVER), eigenvectors into the basis' G order
+    INTEGER, INTENT(IN) :: ik, tr
+    COMPLEX(dp), DEVICE :: u(cb_n0, cb_n0), ph(*)
+    INTEGER, DEVICE :: map(*)
+    REAL(dp), INTENT(OUT) :: hlam(cb_n0)
+    INTEGER :: nq, nocc, istat, info(1), lw
+    REAL(dp) :: te
+    nq = h_npwq(ik)
+    nocc = h_nockq(ik)
+    CALL k_cb_asm<<<dim3(nblk(cb_n0, TPB), MIN(cb_n0, 65535), 1), TPB, 0, strm>>>(d_ca, d_cvg, d_idxkq(1, ik), &
+         d_g2(1, ik), nq, cb_n0, nr(1), nr(2), nr(3), cbsr_v0)
+    CALL kerr('cb_asm')
+    IF (nkb > 0) THEN
+      ! A += vkb D vkb^H
+      istat = cublasZgemm(hblas, CUBLAS_OP_N, CUBLAS_OP_C, nkb, nq, nkb, (1.0_dp, 0.0_dp), d_dmat, nkb, &
+                          d_W(1, 1, ik), npwx, (0.0_dp, 0.0_dp), d_cx1, nkb)
+      CALL chk(istat, 'cublasZgemm (cbsr D W^H)')
+      istat = cublasZgemm(hblas, CUBLAS_OP_N, CUBLAS_OP_N, nq, nq, nkb, (1.0_dp, 0.0_dp), d_W(1, 1, ik), npwx, &
+                          d_cx1, nkb, (1.0_dp, 0.0_dp), d_ca, cb_n0)
+      CALL chk(istat, 'cublasZgemm (cbsr W D W^H)')
+    ENDIF
+    IF (nocc > 0) THEN
+      ! A += alpha_pv evq evq^H (occupied bands of k+q, the engine's own evq)
+      istat = cublasZgemm(hblas, CUBLAS_OP_N, CUBLAS_OP_C, nq, nq, nocc, CMPLX(alpha_pv, 0.0_dp, KIND=dp), &
+                          d_W(1, nkb + 1, ik), npwx, d_W(1, nkb + 1, ik), npwx, (1.0_dp, 0.0_dp), d_ca, cb_n0)
+      CALL chk(istat, 'cublasZgemm (cbsr alpha P_v)')
+    ENDIF
+    CALL k_cb_herm<<<dim3(nblk(nq, TPB), MIN(nq, 65535), 1), TPB, 0, strm>>>(d_ca, nq, cb_n0)
+    CALL kerr('cb_herm')
+    IF (cb_lwork == 0) THEN
+      istat = cusolverDnZheevd_bufferSize(hsolv, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, cb_n0, d_ca, cb_n0, &
+                                          d_cw, lw)
+      CALL chk(istat, 'cusolverDnZheevd_bufferSize')
+      cb_lwork = lw
+      ALLOCATE(d_cwork(cb_lwork))
+    ENDIF
+    CALL tsync(); te = wtime()
+    istat = cusolverDnZheevd(hsolv, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, nq, d_ca, cb_n0, d_cw, &
+                             d_cwork, cb_lwork, d_cinfo(1))
+    CALL chk(istat, 'cusolverDnZheevd')
+    info = d_cinfo
+    IF (info(1) /= 0) CALL errore_stop('cusolverDnZheevd (cbsr)', info(1))
+    CALL tsync(); sth_t_ceig = sth_t_ceig + wtime() - te
+    CALL k_cb_torep<<<dim3(nblk(cb_n0, TPB), MIN(cb_n0, 65535), 1), TPB, 0, strm>>>(u, d_ca, map, ph, tr, nq, cb_n0)
+    CALL kerr('cb_torep')
+    hlam = 1.0e30_dp
+    hlam(1:nq) = d_cw(1:nq)
+  END SUBROUTINE cb_build_one
+  !
+  SUBROUTINE cbsr_build()
+    !! per q: the basis of every k+q (resident rep bases reused; missing ones built), the assembly check, the device maps
+    INTEGER :: ik, i, r, s, m, nq, nnew, ntmp, istat, ndone, jk
+    INTEGER(8) :: freeb, totb, sbytes, reserve
+    REAL(dp) :: t0, de, demo, deme, gmin, eexp, rgib
+    INTEGER, ALLOCATABLE :: first(:), tmpk(:)
+    LOGICAL, ALLOCATABLE :: need(:)
+    REAL(dp), ALLOCATABLE :: lam1(:)
+    CHARACTER(LEN=32) :: sv
+    t0 = wtime()
+    sth_t_ceig = 0.0_dp
+    CALL cbsr_free()
+    IF (sth_cbsr_skip) THEN
+      WRITE(*, '(A)') '     rtsc cbsr: off at q = Gamma (RTSC_STH_CBSR_GAMMA unset); CG kept'
+      RETURN
+    ENDIF
     IF (ANY(nrx /= nr)) THEN
       WRITE(*, '(A)') '     rtsc cbsr: padded FFT box (nrx /= nr) not supported; CG kept'
       RETURN
     ENDIF
-    w_staged = .FALSE.
-    IF (.NOT. ALLOCATED(h_W)) THEN
-      ALLOCATE(h_W(npwx, nproj, nksq))
-      CALL tsync()
-      h_W = d_W
-      w_staged = .TRUE.
+    IF (.NOT. ALLOCATED(h_ckrep)) THEN
+      WRITE(*, '(A)') '     rtsc cbsr: no k+q map (sth_engine_cbsr_map not called); CG kept'
+      RETURN
     ENDIF
-    ! V(G) on the box, exactly as LIFT (the matrix elements of apply_op's local part)
+    IF (SIZE(h_ckrep) /= nksq .OR. ANY(h_ckrep < 0)) THEN
+      WRITE(*, '(A)') '     rtsc cbsr: incomplete k+q map; CG kept'
+      RETURN
+    ENDIF
+    IF (cb_n0 == 0) cb_n0 = npwx
+    IF (npwx /= cb_n0) THEN
+      WRITE(*, '(A,I6,A,I6,A)') '     rtsc cbsr: npwx ', npwx, ' /= the resident bases'' ', cb_n0, '; CG kept at this q'
+      RETURN
+    ENDIF
+    IF (.NOT. have_solv) THEN
+      istat = cusolverDnCreate(hsolv)
+      CALL chk(istat, 'cusolverDnCreate')
+      istat = cusolverDnSetStream(hsolv, strm)
+      CALL chk(istat, 'cusolverDnSetStream')
+      have_solv = .TRUE.
+    ENDIF
+    IF (.NOT. ALLOCATED(h_cblam)) THEN
+      ALLOCATE(h_cblam(cb_n0, CB_MAXREP))
+      h_cblam = 1.0e30_dp
+    ENDIF
+    cb_qcount = cb_qcount + 1
+    !
+    ! which bases this q needs: resident reps, reps to build (first member), per-q bases
+    ALLOCATE(first(CB_MAXREP), need(CB_MAXREP), tmpk(nksq))
+    first = 0; need = .FALSE.
+    ntmp = 0
+    DO ik = 1, nksq
+      r = h_ckrep(ik)
+      IF (r > 0) THEN
+        need(r) = .TRUE.
+        IF (first(r) == 0) first(r) = ik
+      ELSE
+        ntmp = ntmp + 1
+        tmpk(ntmp) = ik
+      ENDIF
+    ENDDO
+    nnew = 0
+    DO r = 1, CB_MAXREP
+      IF (need(r) .AND. .NOT. ALLOCATED(cb_rep(r)%u)) nnew = nnew + 1
+    ENDDO
+    ! memory: the new bases plus a reserve for the irrep arrays (8 column arrays) and RTSC_STH_CBSR_RESERVE GiB (default 2)
+    sbytes = 16_8 * cb_n0 * cb_n0
+    rgib = 2.0_dp
+    CALL get_environment_variable('RTSC_STH_CBSR_RESERVE', sv, STATUS=istat)
+    IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) rgib
+    reserve = INT(rgib * 1024.0_dp**3, 8) + 8_8 * 16_8 * npwx * nslot * npert * nksq
+    CALL sth_mem_trim()
+    istat = cudaMemGetInfo(freeb, totb)
+    IF (sbytes * (nnew + ntmp) + reserve > freeb) THEN
+      ! evict resident bases this q does not use, least recently used first
+      DO WHILE (sbytes * (nnew + ntmp) + reserve > freeb)
+        m = 0
+        DO r = 1, CB_MAXREP
+          IF (ALLOCATED(cb_rep(r)%u) .AND. .NOT. need(r)) THEN
+            IF (m == 0) THEN
+              m = r
+            ELSE IF (cb_lastq(r) < cb_lastq(m)) THEN
+              m = r
+            ENDIF
+          ENDIF
+        ENDDO
+        IF (m == 0) EXIT
+        DEALLOCATE(cb_rep(m)%u)
+        cb_nres = cb_nres - 1
+        CALL sth_mem_trim()
+        istat = cudaMemGetInfo(freeb, totb)
+      ENDDO
+      IF (sbytes * (nnew + ntmp) + reserve > freeb) THEN
+        WRITE(*, '(A,I6,A,F8.2,A,F8.2,A)') '     rtsc cbsr: ', nnew + ntmp, ' new bases need ', &
+             REAL(sbytes * (nnew + ntmp), dp) / 1024.0_dp**3, ' GiB, free after the reserve ', &
+             REAL(freeb - reserve, dp) / 1024.0_dp**3, ' GiB: CG kept at this q'
+        DEALLOCATE(first, need, tmpk)
+        RETURN
+      ENDIF
+    ENDIF
+    !
+    ! build workspace, V(G) (exactly as the canary: the matrix elements of apply_op's local part), maps on the device
+    ALLOCATE(d_ca(cb_n0, cb_n0), d_cvg(nnr), d_cw(cb_n0), d_cinfo(1), d_cx1(MAX(nkb, 1), cb_n0))
     CALL k_r2c<<<4096, TPB, 0, strm>>>(d_box, d_vrs, INT(nnr, 8))
     CALL kerr('r2c (cbsr)')
     CALL fft_exec(0, d_box, CUFFT_FORWARD)
-    ALLOCATE(vg(nnr))
-    CALL tsync()
-    vg = d_box(:, 1)
-    vg = vg / REAL(nr(1) * nr(2) * nr(3), dp)
+    istat = cudaMemcpyAsync(d_cvg, d_box(:, 1), nnr, strm)
+    CALL chk(istat, 'cudaMemcpyAsync (cbsr vg)')
+    CALL k_cb_scal<<<4096, TPB, 0, strm>>>(d_cvg, 1.0_dp / REAL(nr(1) * nr(2) * nr(3), dp), INT(nnr, 8))
+    CALL kerr('scale (cbsr vg)')
     CALL zero_c(d_box, INT(nnr, 8))
-    cbsr_v0 = REAL(vg(1), dp)
-    ALLOCATE(m3(3, nnr))
-    DO i = 1, nnr
-      m3(1, i) = MOD(i - 1, nr(1))
-      m3(2, i) = MOD((i - 1) / nr(1), nr(2))
-      m3(3, i) = (i - 1) / (nr(1) * nr(2))
-    ENDDO
-    ALLOCATE(dm(MAX(nkb, 1), MAX(nkb, 1)))
-    IF (nkb > 0) dm = d_dmat
-    ! storage: device if it fits (with 3 GiB and the per-call coefficient array spare), else streamed chunks
-    CALL sth_mem_trim()
-    istat = cudaMemGetInfo(freeb, totb)
-    ubytes = 16_8 * npwx * npwx * nksq
-    avail = freeb - 3_8 * 1024_8**3 - 16_8 * npwx * nslot * MAXPERT * nksq
-    kc = nksq
-    IF (ubytes > avail) kc = INT(MAX(1_8, avail / (16_8 * npwx * npwx)))
-    cbsr_kc = MIN(kc, nksq)
-    cbsr_stream = cbsr_kc < nksq
-    IF (cbsr_stream) THEN
-      ALLOCATE(h_cu(npwx, npwx, nksq), d_cu(npwx, npwx, cbsr_kc))
-    ELSE
-      ALLOCATE(d_cu(npwx, npwx, nksq))
-    ENDIF
-    ALLOCATE(hlam(npwx, nksq), hu(npwx, npwx))
-    hlam = 1.0e30_dp
-    demax = 0.0_dp
-    gmin = HUGE(1.0_dp)
-    ! k+q points in parallel (OpenMP; each zheevd runs on one thread), device copies serialised
-    nfail = 0
-    te = wtime()
-    !$omp parallel do schedule(dynamic, 1) default(shared) &
-    !$omp& private(ik, nq, nocc, a, lam, x, cw, rw, iw, lwork, lrwork, liwork, info, j, ig, a1, a2, a3, b1, b2, b3, m, &
-    !$omp&         eexp, de, i, hul) reduction(max: demax) reduction(min: gmin)
-    DO ik = 1, nksq
-      IF (nfail > 0) CYCLE
-      nq = h_npwq(ik)
-      nocc = h_nockq(ik)
-      ALLOCATE(a(nq, nq), lam(nq))
-      DO j = 1, nq
-        b1 = m3(1, h_idxkq(j, ik)); b2 = m3(2, h_idxkq(j, ik)); b3 = m3(3, h_idxkq(j, ik))
-        DO ig = 1, nq
-          a1 = MODULO(m3(1, h_idxkq(ig, ik)) - b1, nr(1))
-          a2 = MODULO(m3(2, h_idxkq(ig, ik)) - b2, nr(2))
-          a3 = MODULO(m3(3, h_idxkq(ig, ik)) - b3, nr(3))
-          a(ig, j) = vg(1 + a1 + nr(1) * (a2 + nr(2) * a3))
+    BLOCK
+      COMPLEX(dp) :: v1(1)
+      CALL tsync()
+      v1 = d_cvg(1:1)
+      cbsr_v0 = REAL(v1(1), dp)
+    END BLOCK
+    ALLOCATE(d_ckmap(npwx, nksq), d_cktr(nksq), d_ckph(npwx, nksq))
+    d_ckmap = h_ckmap; d_cktr = h_cktr; d_ckph = h_ckph
+    !
+    ! per-q basis list: the reps this q uses, then the per-q bases
+    cb_nqs = COUNT(need) + ntmp
+    ALLOCATE(cb_qs(cb_nqs))
+    s = 0
+    DO r = 1, CB_MAXREP
+      IF (need(r)) THEN
+        s = s + 1
+        cb_qs(s) = r
+        cb_lastq(r) = cb_qcount
+        DO ik = 1, nksq
+          IF (h_ckrep(ik) == r) h_ckq(ik) = s
         ENDDO
-        a(j, j) = a(j, j) + h_g2(j, ik) - cbsr_v0
-      ENDDO
-      IF (nkb > 0) THEN
-        ALLOCATE(x(nkb, nq))
-        CALL zgemm('N', 'C', nkb, nq, nkb, (1.0_dp, 0.0_dp), dm, nkb, h_W(1, 1, ik), npwx, (0.0_dp, 0.0_dp), x, nkb)
-        CALL zgemm('N', 'N', nq, nq, nkb, (1.0_dp, 0.0_dp), h_W(1, 1, ik), npwx, x, nkb, (1.0_dp, 0.0_dp), a, nq)
-        DEALLOCATE(x)
       ENDIF
-      IF (nocc > 0) CALL zgemm('N', 'C', nq, nq, nocc, CMPLX(alpha_pv, 0.0_dp, KIND=dp), h_W(1, nkb + 1, ik), npwx, &
-                               h_W(1, nkb + 1, ik), npwx, (1.0_dp, 0.0_dp), a, nq)
-      a = 0.5_dp * (a + TRANSPOSE(CONJG(a)))
-      ALLOCATE(cw(1), rw(1), iw(1))
-      CALL zheevd('V', 'U', nq, a, nq, lam, cw, -1, rw, -1, iw, -1, info)
-      lwork = INT(REAL(cw(1))); lrwork = INT(rw(1)); liwork = iw(1)
-      DEALLOCATE(cw, rw, iw)
-      ALLOCATE(cw(lwork), rw(lrwork), iw(liwork))
-      CALL zheevd('V', 'U', nq, a, nq, lam, cw, lwork, rw, lrwork, iw, liwork, info)
-      DEALLOCATE(cw, rw, iw)
-      IF (info /= 0) THEN
-        !$omp atomic write
-        nfail = ik
-        DEALLOCATE(a, lam)
-        CYCLE
-      ENDIF
-      ! assembly check: every computed band m <= nbnd at k+q has an eigenvalue of A~ at e_m + alpha [m <= nocc]
-      DO m = 1, nbnd
-        eexp = h_etkq(m, ik) - cbsr_v0
-        IF (m <= nocc) eexp = eexp + alpha_pv
-        de = MINVAL(ABS(lam - eexp))
-        demax = MAX(demax, de)
-      ENDDO
-      DO i = 1, h_nock(ik)
-        gmin = MIN(gmin, lam(1) - (h_etk(i, ik) - cbsr_v0))
-      ENDDO
-      ALLOCATE(hul(npwx, npwx))
-      hul = (0.0_dp, 0.0_dp)
-      hul(1:nq, 1:nq) = a
-      hlam(1:nq, ik) = lam
-      !$omp critical (cbsr_copy)
-      IF (cbsr_stream) THEN
-        h_cu(:, :, ik) = hul
-      ELSE
-        d_cu(:, :, ik) = hul
-      ENDIF
-      !$omp end critical (cbsr_copy)
-      DEALLOCATE(a, lam, hul)
     ENDDO
-    !$omp end parallel do
-    teig = wtime() - te
-    IF (nfail > 0) THEN
-      WRITE(*, '(A,I6,A)') '     rtsc cbsr: zheevd failed at k+q ', nfail, '; CG kept'
-      DEALLOCATE(vg, m3, dm, hlam, hu)
-      IF (w_staged) DEALLOCATE(h_W)
-      CALL cbsr_free()
-      RETURN
+    cb_ntmp = ntmp
+    IF (ntmp > 0) THEN
+      ALLOCATE(cb_tmp(ntmp), h_cbtlam(cb_n0, ntmp))
+      DO i = 1, ntmp
+        s = s + 1
+        cb_qs(s) = -i
+        h_ckq(tmpk(i)) = s
+      ENDDO
     ENDIF
-    ALLOCATE(d_clam(npwx, nksq))
-    d_clam = hlam
-    DEALLOCATE(vg, m3, dm, hlam, hu)
-    IF (w_staged) DEALLOCATE(h_W)
+    ! build the missing bases
+    ndone = 0
+    DO s = 1, cb_nqs
+      r = cb_qs(s)
+      IF (r > 0) THEN
+        IF (ALLOCATED(cb_rep(r)%u)) CYCLE
+        ALLOCATE(cb_rep(r)%u(cb_n0, cb_n0))
+        jk = first(r)
+        CALL cb_build_one(jk, cb_rep(r)%u, h_cblam(:, r), d_ckmap(1, jk), d_ckph(1, jk), h_cktr(jk))
+        cb_nres = cb_nres + 1
+        cb_nbuilt = cb_nbuilt + 1
+      ELSE
+        i = -r
+        jk = tmpk(i)
+        ALLOCATE(cb_tmp(i)%u(cb_n0, cb_n0))
+        CALL cb_build_one(jk, cb_tmp(i)%u, h_cbtlam(:, i), d_ckmap(1, jk), d_ckph(1, jk), h_cktr(jk))
+      ENDIF
+      ndone = ndone + 1
+    ENDDO
+    ! Lambda of every basis of this q on the device; assembly check for EVERY k+q (the eigenvalues of its basis against
+    ! its own nscf eigenvalues e_m + alpha [m <= nocc_kq], m = 1..nbnd: occupied and empty bands reported apart)
+    ALLOCATE(d_cqlam(cb_n0, cb_nqs), lam1(cb_nqs))
+    BLOCK
+      REAL(dp), ALLOCATABLE :: hl(:,:)
+      ALLOCATE(hl(cb_n0, cb_nqs))
+      DO s = 1, cb_nqs
+        IF (cb_qs(s) > 0) THEN
+          hl(:, s) = h_cblam(:, cb_qs(s))
+        ELSE
+          hl(:, s) = h_cbtlam(:, -cb_qs(s))
+        ENDIF
+        lam1(s) = hl(1, s)
+      ENDDO
+      d_cqlam = hl
+      demo = 0.0_dp; deme = 0.0_dp; gmin = HUGE(1.0_dp)
+      DO ik = 1, nksq
+        s = h_ckq(ik)
+        nq = h_npwq(ik)
+        DO m = 1, nbnd
+          eexp = h_etkq(m, ik) - cbsr_v0
+          IF (m <= h_nockq(ik)) eexp = eexp + alpha_pv
+          de = ABS(hl(cb_bisect(hl(1:nq, s), nq, eexp), s) - eexp)
+          IF (m <= h_nockq(ik)) THEN
+            demo = MAX(demo, de)
+          ELSE
+            deme = MAX(deme, de)
+          ENDIF
+        ENDDO
+        DO i = 1, h_nock(ik)
+          gmin = MIN(gmin, lam1(s) - (h_etk(i, ik) - cbsr_v0))
+        ENDDO
+      ENDDO
+      DEALLOCATE(hl)
+    END BLOCK
+    DEALLOCATE(d_ca, d_cvg, d_cw, d_cinfo, d_cx1)
+    IF (ALLOCATED(d_cwork)) DEALLOCATE(d_cwork)
+    cb_lwork = 0
+    DEALLOCATE(first, need, tmpk, lam1)
     CALL tsync()
+    CALL sth_mem_sample()
     sth_t_cbuild = wtime() - t0
     cbsr_q = .TRUE.
-    WRITE(*, '(A,I6,A,I6,A,ES10.3,A,F9.4,A,F9.2,A,F9.2,A,I5,A,L1)') '     rtsc cbsr: k+q ', nksq, ', npwx ', npwx, &
-         ', assembly check max|dE| ', demax, ' Ry, min(Lambda1 - e~_n) ', gmin, ' Ry, build ', sth_t_cbuild, &
-         ' s (assembly + zheevd loop, OpenMP over k+q: ', teig, ' s), k chunk ', cbsr_kc, ', streamed ', cbsr_stream
+    cb_npl = -1
+    WRITE(*, '(A,I6,A,I6,A,I5,A,I5,A,I5,A,I5,A,ES10.3,A,ES10.3,A,F9.4,A,F8.2,A,F8.2,A,F7.2,A)') &
+         '     rtsc cbsr: k+q ', nksq, ', npwx ', cb_n0, ', bases ', cb_nqs, ' (reps ', cb_nqs - ntmp, ', built ', ndone - ntmp, &
+         ', per-q ', ntmp, '), assembly check max|dE| occ ', demo, ' empty ', deme, ' Ry, min(Lambda1 - e~_n) ', gmin, &
+         ' Ry, build ', sth_t_cbuild, ' s (zheevd ', sth_t_ceig, ' s), resident ', REAL(sbytes * cb_nres, dp) / 1024.0_dp**3, ' GiB'
   END SUBROUTINE cbsr_build
   !
+  SUBROUTINE cbsr_plan()
+    !! per irrep (npert): gathered columns grouped by basis (padded to 16), bases of equal width in one batched GEMM
+    INTEGER :: s, ik, ip, n, c, g, i, nb, w, istat
+    INTEGER, ALLOCATABLE :: ncol(:), wid(:), ord(:), co(:), hsc(:), hgl(:), cnt(:)
+    TYPE(c_devptr), ALLOCATABLE :: hA(:), hX(:), hY(:)
+    INTEGER :: ncolk
+    ncolk = nslot * npert
+    ALLOCATE(ncol(cb_nqs), wid(cb_nqs), ord(cb_nqs), co(cb_nqs))
+    ncol = 0
+    DO ik = 1, nksq
+      s = h_ckq(ik)
+      ncol(s) = ncol(s) + npert * h_nock(ik)
+    ENDDO
+    wid = 16 * ((ncol + 15) / 16)
+    ! order bases by width (counting sort over the distinct widths)
+    w = MAXVAL(wid)
+    ALLOCATE(cnt(0:w / 16))
+    cnt = 0
+    DO s = 1, cb_nqs
+      cnt(wid(s) / 16) = cnt(wid(s) / 16) + 1
+    ENDDO
+    cb_ngrp = COUNT(cnt(1:) > 0)
+    IF (ALLOCATED(cb_gN)) DEALLOCATE(cb_gN, cb_gnb, cb_goff)
+    ALLOCATE(cb_gN(cb_ngrp), cb_gnb(cb_ngrp), cb_goff(cb_ngrp))
+    g = 0; i = 0
+    DO w = 1, UBOUND(cnt, 1)
+      IF (cnt(w) == 0) CYCLE
+      g = g + 1
+      cb_gN(g) = 16 * w; cb_gnb(g) = cnt(w); cb_goff(g) = i
+      DO s = 1, cb_nqs
+        IF (wid(s) == 16 * w) THEN
+          i = i + 1
+          ord(i) = s
+        ENDIF
+      ENDDO
+    ENDDO
+    nb = i     ! bases with at least one column
+    cb_ctot = 0
+    DO i = 1, nb
+      co(ord(i)) = cb_ctot
+      cb_ctot = cb_ctot + wid(ord(i))
+    ENDDO
+    ALLOCATE(hsc(cb_ctot), hgl(cb_ctot))
+    hsc = 0
+    DO i = 1, nb
+      hgl(co(ord(i)) + 1:co(ord(i)) + wid(ord(i))) = ord(i)
+    ENDDO
+    ! columns: for each basis, its member k+q in k order, then pert, then band
+    ncol = 0
+    DO ik = 1, nksq
+      s = h_ckq(ik)
+      DO ip = 1, npert
+        DO n = 1, h_nock(ik)
+          ncol(s) = ncol(s) + 1
+          hsc(co(s) + ncol(s)) = n + nslot * ((ip - 1) + npert * (ik - 1))
+        ENDDO
+      ENDDO
+    ENDDO
+    IF (ALLOCATED(d_cgsc)) DEALLOCATE(d_cgsc, d_cgl)
+    ALLOCATE(d_cgsc(cb_ctot), d_cgl(cb_ctot))
+    d_cgsc = hsc; d_cgl = hgl
+    IF (ALLOCATED(d_cx)) THEN
+      IF (SIZE(d_cx, 2) < cb_ctot) DEALLOCATE(d_cx, d_cy)
+    ENDIF
+    IF (.NOT. ALLOCATED(d_cx)) ALLOCATE(d_cx(cb_n0, cb_ctot), d_cy(cb_n0, cb_ctot))
+    IF (ALLOCATED(d_pA)) DEALLOCATE(d_pA, d_pX, d_pY)
+    ALLOCATE(d_pA(nb), d_pX(nb), d_pY(nb), hA(nb), hX(nb), hY(nb))
+    DO i = 1, nb
+      s = ord(i)
+      IF (cb_qs(s) > 0) THEN
+        hA(i) = c_devloc(cb_rep(cb_qs(s))%u)
+      ELSE
+        hA(i) = c_devloc(cb_tmp(-cb_qs(s))%u)
+      ENDIF
+      hX(i) = c_devloc(d_cx(1, co(s) + 1))
+      hY(i) = c_devloc(d_cy(1, co(s) + 1))
+    ENDDO
+    d_pA = hA; d_pX = hX; d_pY = hY
+    DEALLOCATE(ncol, wid, ord, co, hsc, hgl, cnt, hA, hX, hY)
+    cb_npl = npert
+    istat = 0
+  END SUBROUTINE cbsr_plan
+  !
   SUBROUTINE cbsr_solve()
-    !! d_dpsi(:, s) = U_k diag(1/(Lambda - e~_n)) U_k^H d_d0(:, s) for every slot (FP64 batched GEMMs per k chunk)
-    INTEGER :: c0, nk, istat, ncolk
-    INTEGER(8) :: off
+    !! d_dpsi(:, s) = U diag(1/(Lambda - e~_n)) U^H d_d0(:, s) on every valid slot, batched per shared basis
+    INTEGER :: g, istat, ncolk, ny
     REAL(dp) :: ta
     CALL tsync(); ta = wtime()
+    IF (cb_npl /= npert) CALL cbsr_plan()
     ncolk = nslot * npert
-    IF (ALLOCATED(d_cc)) THEN
-      IF (SIZE(d_cc, 2) /= nsl) DEALLOCATE(d_cc)
-    ENDIF
-    IF (.NOT. ALLOCATED(d_cc)) ALLOCATE(d_cc(npwx, nsl))
-    DO c0 = 0, nksq - 1, cbsr_kc
-      nk = MIN(cbsr_kc, nksq - c0)
-      off = INT(c0, 8) * ncolk + 1
-      IF (cbsr_stream) THEN
-        istat = cudaMemcpyAsync(d_cu, h_cu(:, :, c0 + 1:c0 + nk), INT(npwx, 8) * npwx * nk, strm)
-        CALL chk(istat, 'cudaMemcpyAsync (cbsr chunk)')
-        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
-             d_cu, npwx, INT(npwx, 8) * npwx, d_d0(1, off), npwx, INT(npwx, 8) * ncolk, (0.0_dp, 0.0_dp), &
-             d_cc(1, off), npwx, INT(npwx, 8) * ncolk, nk)
-      ELSE
-        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
-             d_cu(1, 1, c0 + 1), npwx, INT(npwx, 8) * npwx, d_d0(1, off), npwx, INT(npwx, 8) * ncolk, &
-             (0.0_dp, 0.0_dp), d_cc(1, off), npwx, INT(npwx, 8) * ncolk, nk)
-      ENDIF
-      CALL chk(istat, 'cublasZgemmStridedBatched (cbsr UHb)')
-      CALL k_cbsr_scale<<<4096, TPB, 0, strm>>>(d_cc, d_clam, d_etk, npwx, nbnd, nslot, ncolk, c0, &
-           INT(npwx, 8) * ncolk * nk, cbsr_v0)
-      CALL kerr('cbsr_scale')
-      IF (cbsr_stream) THEN
-        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
-             d_cu, npwx, INT(npwx, 8) * npwx, d_cc(1, off), npwx, INT(npwx, 8) * ncolk, (0.0_dp, 0.0_dp), &
-             d_dpsi(1, off), npwx, INT(npwx, 8) * ncolk, nk)
-      ELSE
-        istat = cublasZgemmStridedBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, npwx, ncolk, npwx, (1.0_dp, 0.0_dp), &
-             d_cu(1, 1, c0 + 1), npwx, INT(npwx, 8) * npwx, d_cc(1, off), npwx, INT(npwx, 8) * ncolk, &
-             (0.0_dp, 0.0_dp), d_dpsi(1, off), npwx, INT(npwx, 8) * ncolk, nk)
-      ENDIF
-      CALL chk(istat, 'cublasZgemmStridedBatched (cbsr Uc)')
+    ny = MIN(cb_ctot, 65535)
+    CALL k_cb_gather<<<dim3(nblk(cb_n0, TPB), ny, 1), TPB, 0, strm>>>(d_cx, d_d0, d_cgsc, d_ckmap, d_ckph, d_cktr, &
+         d_npwq, cb_n0, npwx, ncolk, cb_ctot)
+    CALL kerr('cb_gather')
+    DO g = 1, cb_ngrp
+      istat = cublasZgemmBatched(hblas, CUBLAS_OP_C, CUBLAS_OP_N, cb_n0, cb_gN(g), cb_n0, (1.0_dp, 0.0_dp), &
+           d_pA(cb_goff(g) + 1:), cb_n0, d_pX(cb_goff(g) + 1:), cb_n0, (0.0_dp, 0.0_dp), d_pY(cb_goff(g) + 1:), cb_n0, cb_gnb(g))
+      CALL chk(istat, 'cublasZgemmBatched (cbsr U^H b)')
     ENDDO
+    CALL k_cb_scale<<<dim3(nblk(cb_n0, TPB), ny, 1), TPB, 0, strm>>>(d_cy, d_cqlam, d_cgl, d_cgsc, d_etk, cbsr_v0, &
+         cb_n0, nbnd, nslot, ncolk, cb_ctot)
+    CALL kerr('cb_scale')
+    DO g = 1, cb_ngrp
+      istat = cublasZgemmBatched(hblas, CUBLAS_OP_N, CUBLAS_OP_N, cb_n0, cb_gN(g), cb_n0, (1.0_dp, 0.0_dp), &
+           d_pA(cb_goff(g) + 1:), cb_n0, d_pY(cb_goff(g) + 1:), cb_n0, (0.0_dp, 0.0_dp), d_pX(cb_goff(g) + 1:), cb_n0, cb_gnb(g))
+      CALL chk(istat, 'cublasZgemmBatched (cbsr U c)')
+    ENDDO
+    CALL zero_c(d_dpsi, INT(npwx, 8) * nsl)
+    CALL k_cb_scatter<<<dim3(nblk(cb_n0, TPB), ny, 1), TPB, 0, strm>>>(d_dpsi, d_cx, d_cgsc, d_ckmap, d_ckph, d_cktr, &
+         d_npwq, cb_n0, npwx, ncolk, cb_ctot)
+    CALL kerr('cb_scatter')
     CALL tsync()
     sth_t_csolve = wtime() - ta
-    IF (sth_timing) WRITE(*, '(A,F9.3,A,I8,A)') '     rtsc cbsr solve ', sth_t_csolve, ' s, ', nvalid, ' valid columns'
+    IF (sth_timing) WRITE(*, '(A,F9.4,A,I8,A,I8,A,I5,A,I5,A,F8.1)') '     rtsc cbsr solve ', sth_t_csolve, ' s, ', nvalid, &
+         ' valid columns, ', cb_ctot, ' gathered, ', cb_nqs, ' bases, ', cb_ngrp, ' GEMM groups, mean width ', &
+         REAL(cb_ctot, dp) / MAX(1, cb_nqs)
   END SUBROUTINE cbsr_solve
   !
   SUBROUTINE apply_op(x, y, list, nl)
@@ -3942,6 +4387,7 @@ CONTAINS
   SUBROUTINE sth_engine_shutdown()
     INTEGER :: istat
     CALL sth_engine_free()
+    CALL cbsr_release()
     IF (ALLOCATED(d_vrs)) DEALLOCATE(d_vrs, d_dmat)
     CALL destroy_plans()
     IF (have_handles) THEN
