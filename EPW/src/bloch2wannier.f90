@@ -34,6 +34,24 @@
     END FUNCTION b2w_gemm
     !
     !--------------------------------------------------------------------------
+    LOGICAL FUNCTION b2w_gpu()
+    !--------------------------------------------------------------------------
+    !! rtsc epw4: RTSC_EPW_B2WG=1 (with RTSC_EPW_B2W=1): ephbloch2wane step 2's ZGEMMs on the device
+    !! (groups/compute/EPW4-LOG.md). Default off.
+    LOGICAL, SAVE :: rd = .FALSE., on = .FALSE.
+    CHARACTER(LEN = 16) :: ev
+    IF (.NOT. rd) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_B2WG', ev)
+      on = TRIM(ev) == '1'
+#if !defined (__CUDA)
+      on = .FALSE.
+#endif
+      rd = .TRUE.
+    ENDIF
+    b2w_gpu = on
+    END FUNCTION b2w_gpu
+    !
+    !--------------------------------------------------------------------------
     SUBROUTINE hambloch2wan(nbnd, nbndsub, nks, nkstot, et, xk, cu, &
        lwin, exband, nrr, irvec, wslen, chw)
     !--------------------------------------------------------------------------
@@ -1350,6 +1368,10 @@
     USE input,         ONLY : lpolar
     USE longrange,     ONLY : rgd_blk_epw
     USE input,         ONLY : nqc1, nqc2, nqc3, lsda
+#if defined (__CUDA)
+    USE cublas
+    USE cudafor, ONLY : cudaDeviceSynchronize
+#endif
     !
     IMPLICIT NONE
     !
@@ -1497,10 +1519,25 @@
           cf(ik, ir) = EXP(-ci * rdotk) / DBLE(nkstot)
         ENDDO
       ENDDO
+      IF (b2w_gpu()) THEN
+#if defined (__CUDA)
+        ! rtsc epw4 (RTSC_EPW_B2WG=1): the same ZGEMMs with cuBLAS on the device
+        !$acc data copyin(epmats, cf) copyout(epmatw)
+        !$acc host_data use_device(epmats, cf, epmatw)
+        DO imode = 1, nmodes
+          CALL CUBLASZGEMM('n', 'n', nbndsub * nbndsub, nrr, nks, cone, epmats(1, 1, 1, imode), nbndsub * nbndsub, &
+                           cf, nks, czero, epmatw(1, 1, 1, imode), nbndsub * nbndsub)
+        ENDDO
+        !$acc end host_data
+        ierr = cudaDeviceSynchronize()
+        !$acc end data
+#endif
+      ELSE
       DO imode = 1, nmodes
         CALL ZGEMM('n', 'n', nbndsub * nbndsub, nrr, nks, cone, epmats(1, 1, 1, imode), nbndsub * nbndsub, &
                    cf, nks, czero, epmatw(1, 1, 1, imode), nbndsub * nbndsub)
       ENDDO
+      ENDIF
       DEALLOCATE(cf)
       CALL start_clock('ep: step 2r') ! rtsc epw4 profiling clock (the inter-pool reduction)
       CALL mp_sum(epmatw, inter_pool_comm)
