@@ -364,7 +364,7 @@ MODULE sth_engine
   LOGICAL, SAVE :: cb_xch = .FALSE., cb_host = .FALSE., cb_strict = .FALSE.
   INTEGER, SAVE :: cb_hs(CB_MAXREP) = 0, cb_nh = 0, cb_nhcap = 0
   INTEGER(8), SAVE :: cb_hcopy = 0
-  INTEGER, SAVE :: cb_stg_cur = 0
+  INTEGER, SAVE :: cb_stg_cur = 0, cb_hostn = 0
   COMPLEX(dp), PINNED, ALLOCATABLE, SAVE :: h_cbh(:,:,:)
   COMPLEX(dp), DEVICE, ALLOCATABLE :: d_cstg(:,:)
   INTEGER, ALLOCATABLE, SAVE :: cb_bhs(:)        ! per GEMM batch: host slot of its (single) basis, 0 = device-resident
@@ -2224,7 +2224,7 @@ CONTAINS
     rg = 1.5_dp
     CALL get_environment_variable('RTSC_STH_PSIR_RES', sv, STATUS=istat)
     IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) rg
-    res = INT(rg * 1024.0_dp**3, 8) + 8_8 * 16_8 * npwx * nslot * sth_npmax * nksq
+    res = INT(rg * 1024.0_dp**3, 8) + MERGE(6_8, 8_8, cb_lean()) * 16_8 * npwx * nslot * sth_npmax * nksq
     IF (cbsr_q .AND. cbsr_rf) res = res + 48_8 * cb_n0 * cb_cmax
     IF (cbsr_q .AND. .NOT. cbsr_rf .AND. .NOT. cb_xch) res = res + 2_8 * 16_8 * cb_n0 * nslot * sth_npmax * nksq
     IF (cbsr_q .AND. .NOT. cbsr_rf .AND. cb_xch) res = res + 32_8 * cb_n0 * MIN(cb_cmax, nslot * sth_npmax * nksq)
@@ -3529,6 +3529,12 @@ CONTAINS
     DEALLOCATE(d_inv2, d_dv, d_op, d_rp)
   END SUBROUTINE cb_maps_dev
   !
+  LOGICAL FUNCTION cb_lean()
+    !! b2x (RTSC_STH_CBSR_XCH): the exact CBSR solve never touches the CG arrays d_g / d_h (no CG, no rf, no dpsi history),
+    !! so they are allocated with one element; the reserves count 6 column arrays instead of 8. Memory only (class B).
+    cb_lean = cbsr_q .AND. cb_xch .AND. .NOT. cbsr_rf .AND. .NOT. mp_q .AND. .NOT. lift_q .AND. sth_xp_m == 0
+  END FUNCTION cb_lean
+  !
   SUBROUTINE cb_decline_check()
     !! rtsc b2x: RTSC_STRICT=1 (scored runs): a CBSR decline at q /= Gamma ("CG kept") stops the run
     IF (cb_strict) CALL errore_stop('cbsr (declined under RTSC_STRICT=1; see the rtsc cbsr line above)', 1)
@@ -3555,6 +3561,9 @@ CONTAINS
       CALL get_environment_variable('RTSC_STH_CBSR_HOST', sv, STATUS=istat)
       cb_host = istat == 0 .AND. TRIM(sv) == '1'
       IF (cb_host) cb_xch = .TRUE.
+      ! test knob: at least this many new bases go to pinned host memory (exercises the staging where everything fits)
+      CALL get_environment_variable('RTSC_STH_CBSR_HOSTN', sv, STATUS=istat)
+      IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) cb_hostn
     ENDIF
     IF (sth_cbsr_skip) THEN
       WRITE(*, '(A)') '     rtsc cbsr: off at q = Gamma (RTSC_STH_CBSR_GAMMA unset); CG kept'
@@ -3641,7 +3650,8 @@ CONTAINS
     rgib = 2.0_dp
     CALL get_environment_variable('RTSC_STH_CBSR_RESERVE', sv, STATUS=istat)
     IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) rgib
-    reserve = INT(rgib * 1024.0_dp**3, 8) + 8_8 * 16_8 * npwx * nslot * npert * nksq
+    reserve = INT(rgib * 1024.0_dp**3, 8) + MERGE(6_8, 8_8, cb_xch .AND. .NOT. cbsr_rf .AND. .NOT. mp_q .AND. &
+              .NOT. lift_q .AND. sth_xp_m == 0) * 16_8 * npwx * nslot * npert * nksq
     ! rf: the chunk buffers (2 FP64 + 2 FP32 arrays of cb_cmax columns) and the build's FP64 staging copy
     IF (cbsr_rf) reserve = reserve + 48_8 * cb_n0 * cb_cmax + 16_8 * cb_n0 * cb_n0
     ! b2x: the exact chunk buffers (2 FP64 arrays of cb_cmax columns) and, with host staging, the staging slot
@@ -3650,7 +3660,7 @@ CONTAINS
     nhost = 0
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
-    IF (sbytes * (nnew + ntmp) + reserve > freeb) THEN
+    IF (sbytes * (nnew + ntmp) + reserve > freeb .OR. (cb_host .AND. cb_hostn > 0 .AND. nnew > 0)) THEN
       ! evict resident bases this q does not use, least recently used first
       DO WHILE (sbytes * (nnew + ntmp) + reserve > freeb)
         m = 0
@@ -3670,10 +3680,11 @@ CONTAINS
         CALL sth_mem_trim()
         istat = cudaMemGetInfo(freeb, totb)
       ENDDO
-      IF (sbytes * (nnew + ntmp) + reserve > freeb .AND. cb_host .AND. .NOT. cbsr_rf .AND. &
+      IF ((sbytes * (nnew + ntmp) + reserve > freeb .OR. cb_hostn > 0) .AND. cb_host .AND. .NOT. cbsr_rf .AND. &
           sbytes * ntmp + reserve <= freeb) THEN
         ! b2x host staging: the new bases that do not fit stay in pinned host memory
         nhost = nnew - INT(MIN(INT(nnew, 8), (freeb - reserve - sbytes * ntmp) / sbytes))
+        nhost = MAX(nhost, MIN(nnew, cb_hostn))
         IF (cb_nh + nhost > cb_nhcap) THEN
           BLOCK
             COMPLEX(dp), PINNED, ALLOCATABLE :: hold(:,:,:)
@@ -3690,7 +3701,7 @@ CONTAINS
             ENDIF
           END BLOCK
         ENDIF
-        WRITE(*, '(A,I5,A,I5,A,F8.2,A)') '     rtsc cbsr host: ', nhost, ' of ', nnew, &
+        IF (nhost > 0) WRITE(*, '(A,I5,A,I5,A,F8.2,A)') '     rtsc cbsr host: ', nhost, ' of ', nnew, &
              ' new bases kept in pinned host memory (free after the reserve ', REAL(freeb - reserve, dp) / 1024.0_dp**3, ' GiB)'
       ELSE IF (sbytes * (nnew + ntmp) + reserve > freeb) THEN
         WRITE(*, '(A,I6,A,F8.2,A,F8.2,A)') '     rtsc cbsr: ', nnew + ntmp, ' new bases need ', &
@@ -5318,6 +5329,7 @@ CONTAINS
     reuse = .FALSE.
     IF (qc_q .AND. ALLOCATED(d_dvb) .AND. ALLOCATED(d_valid) .AND. ALLOCATED(h_dpsi)) THEN
       reuse = SIZE(d_dvb, 2) == nsl .AND. SIZE(d_dv, 2) == npert .AND. (ALLOCATED(d_xp) .EQV. (sth_xp_m > 0)) &
+              .AND. ((SIZE(d_g) == 1) .EQV. cb_lean()) &
               .AND. (ALLOCATED(s_e) .EQV. mp_q)
     ENDIF
     IF (.NOT. reuse) THEN
@@ -5329,6 +5341,7 @@ CONTAINS
     CALL irrep_free_mp()
     IF (ALLOCATED(d_xp)) DEALLOCATE(d_xp)
     need = 16_8 * npwx * nsl * (7 + MIN(sth_xp_m, 1))
+    IF (cb_lean()) need = need - 2_8 * 16_8 * npwx * nsl
     IF (mp_q) need = need + (8_8 * npwx * 4 + 16_8 * nproj + 12_8) * nsl
     CALL sth_mem_trim()
     istat = cudaMemGetInfo(freeb, totb)
@@ -5341,7 +5354,11 @@ CONTAINS
     IF (sth_timing) THEN
       t1 = wtime(); sth_t_commit(1) = t1 - t0; t0 = t1
     ENDIF
-    ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
+    IF (cb_lean()) THEN
+      ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(1, 1), d_h(1, 1))
+    ELSE
+      ALLOCATE(d_dvb(npwx, nsl), d_d0(npwx, nsl), d_dpsi(npwx, nsl), d_g(npwx, nsl), d_h(npwx, nsl))
+    ENDIF
     ALLOCATE(d_t(npwx, nsl), d_cf(nproj, nsl), d_cf2(nproj, nsl), d_ps(nbnd, nsl))
     ALLOCATE(d_rho(nsl), d_conv(nsl), d_cnt(ngrp), d_kter(ngrp), d_nact(1), d_av(nsl), d_cv(nsl), d_r0(nsl), d_nst(nsl))
     ALLOCATE(d_dv(nnr, npert), d_drho(nnr, npert))
@@ -5403,8 +5420,8 @@ CONTAINS
     istat = cudaDeviceSynchronize()
     ! zero the work arrays (invalid slots must stay zero; stale values must be finite)
     CALL zero_c(d_d0, INT(npwx, 8) * nsl)
-    CALL zero_c(d_g, INT(npwx, 8) * nsl)
-    CALL zero_c(d_h, INT(npwx, 8) * nsl)
+    IF (SIZE(d_g) > 1) CALL zero_c(d_g, INT(npwx, 8) * nsl)
+    IF (SIZE(d_h) > 1) CALL zero_c(d_h, INT(npwx, 8) * nsl)
     CALL zero_c(d_t, INT(npwx, 8) * nsl)
     CALL zero_c(d_cf, INT(nproj, 8) * nsl)
     CALL zero_c(d_cf2, INT(nproj, 8) * nsl)
