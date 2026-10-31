@@ -506,6 +506,126 @@ static int run_inv(cplx<double>* box, const cplx<double>* x, const int* list, in
   return 0;
 }
 
+
+// rtsc b2x (RTSC_STH_DRF, class E): incdrhoscf fused into the inverse plane transform. One block per (z-plane, group of
+// G consecutive columns of the chunk): each column's plane is built as in kxy_inv, then A += w_k conj(psi_kn(r)) P is
+// accumulated in shared memory (per run of equal pert); the full box is never written. Partial sums per (group, pert)
+// go to part (exclusive per block: deterministic), and krho_reduce adds them to drho in group order.
+template <class T, int N1, int N2>
+__global__ void kxy_inv_rho(const cplx<T>* __restrict__ S, const cplx<T>* __restrict__ psir,
+                            const int* __restrict__ list, int s0, int nslot, int npert, int nnr, int pj, int jb, int m,
+                            int G, const double* __restrict__ wgt, cplx<T>* __restrict__ part, int nst, int nzst,
+                            const int* __restrict__ sx, const int* __restrict__ sy, const int* __restrict__ xa,
+                            int nxa) {
+  constexpr int LD = (N1 % 2 == 0) ? N1 + 1 : N1;
+  constexpr int NP = N1 * N2;
+  extern __shared__ __align__(16) unsigned char smraw[];
+  cplx<T>* P = reinterpret_cast<cplx<T>*>(smraw);
+  cplx<T>* A = P + LD * N2;
+  const int z = blockIdx.x, gr = blockIdx.y, tid = threadIdx.x, nt = blockDim.x;
+  const int j0 = gr * G, j1 = min(j0 + G, m);
+  int pcur = -1;
+  for (int q = tid; q < NP; q += nt) A[q] = cplx<T>{0, 0};
+  for (int j = j0; j < j1; j++) {
+    const int col = list[s0 + j] - 1;
+    const int k = col / (nslot * npert), n = col % nslot, p = (col / nslot) % npert;
+    if (p != pcur) {
+      __syncthreads();
+      if (pcur >= 0) {
+        cplx<T>* dst = part + ((size_t)gr * npert + pcur) * nnr + (size_t)NP * z;
+        for (int q = tid; q < NP; q += nt) { cplx<T> a = dst[q]; dst[q] = {a.x + A[q].x, a.y + A[q].y}; A[q] = cplx<T>{0, 0}; }
+      }
+      pcur = p;
+    }
+    const cplx<T>* Sj = S + (size_t)nzst * j + (size_t)nst * z;
+    for (int q = tid; q < LD * N2; q += nt) P[q] = cplx<T>{0, 0};
+    __syncthreads();
+    for (int q = tid; q < nst; q += nt) P[sy[q] * LD + sx[q]] = Sj[q];
+    __syncthreads();
+    for (int c = tid; c < nxa; c += nt) {         // inverse y on occupied x-columns
+      const int xx = xa[c];
+      cplx<T> v[N2];
+#pragma unroll
+      for (int y = 0; y < N2; y++) v[y] = P[y * LD + xx];
+      Line<T, N2, true>::run(v);
+#pragma unroll
+      for (int y = 0; y < N2; y++) P[y * LD + xx] = v[y];
+    }
+    __syncthreads();
+    for (int r = tid; r < N2; r += nt) {          // inverse x on every row
+      cplx<T> v[N1];
+#pragma unroll
+      for (int xx = 0; xx < N1; xx++) v[xx] = P[r * LD + xx];
+      Line<T, N1, true>::run(v);
+#pragma unroll
+      for (int xx = 0; xx < N1; xx++) P[r * LD + xx] = v[xx];
+    }
+    __syncthreads();
+    const size_t b = pj ? (size_t)(jb + j) : (size_t)n + (size_t)nslot * k;
+    const cplx<T>* ps = psir + (size_t)nnr * b + (size_t)NP * z;
+    const T w = (T)wgt[k];
+    for (int q = tid; q < NP; q += nt) {
+      const cplx<T> c = ps[q], d = P[(q / N1) * LD + (q % N1)];
+      const cplx<T> t = {c.x * d.x + c.y * d.y, c.x * d.y - c.y * d.x};   // conj(psi) * dpsi
+      A[q] = {A[q].x + w * t.x, A[q].y + w * t.y};
+    }
+  }
+  __syncthreads();
+  if (pcur >= 0) {
+    cplx<T>* dst = part + ((size_t)gr * npert + pcur) * nnr + (size_t)NP * z;
+    for (int q = tid; q < NP; q += nt) { cplx<T> a = dst[q]; dst[q] = {a.x + A[q].x, a.y + A[q].y}; }
+  }
+}
+
+// drho(r, p) += sum over groups (ascending) of part(r, p, group)
+template <class T>
+__global__ void krho_reduce(cplx<T>* __restrict__ drho, const cplx<T>* __restrict__ part, int nnr, int npert, int ngr) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)nnr * npert) return;
+  const size_t r = i % nnr, p = i / nnr;
+  cplx<T> a = {0, 0};
+  for (int g2 = 0; g2 < ngr; g2++) { cplx<T> v = part[((size_t)g2 * npert + p) * nnr + r]; a = {a.x + v.x, a.y + v.y}; }
+  cplx<T> d = drho[i];
+  drho[i] = {d.x + a.x, d.y + a.y};
+}
+
+static void* g_part = nullptr; static size_t g_partb = 0;
+
+template <int N1, int N2, int N3>
+static int run_inv_rho(cplx<double>* drho, const cplx<double>* x, const cplx<double>* psir, const int* list, int s0,
+                       int nb, int nslot, int npert, int npwx, int nnr, int pj, const double* wgt, cudaStream_t st,
+                       int tpb) {
+  static bool attr = false;
+  constexpr int shm = plane_bytes<double, N1, N2>() + (int)sizeof(cplx<double>) * N1 * N2;
+  if (!attr) {
+    if (cudaFuncSetAttribute(kxy_inv_rho<double, N1, N2>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm) != cudaSuccess)
+      return 5;
+    attr = true;
+  }
+  int G = 16;
+  if (const char* e = getenv("FDX_RHO_G")) G = std::max(1, atoi(e));
+  cplx<double>* S = reinterpret_cast<cplx<double>*>(g.S);
+  const int chunk = (int)std::min<size_t>(g.chunk, g.Sbytes / (sizeof(cplx<double>) * (size_t)g.nzst));
+  const int ngmax = (std::min(chunk, nb) + G - 1) / G;
+  const size_t pb = sizeof(cplx<double>) * (size_t)nnr * npert * ngmax;
+  if (pb > g_partb) { cudaFree(g_part); g_partb = 0; if (cudaMalloc(&g_part, pb)) return 3; g_partb = pb; }
+  cplx<double>* part = reinterpret_cast<cplx<double>*>(g_part);
+  for (int c0 = 0; c0 < nb; c0 += chunk) {
+    int m = std::min(chunk, nb - c0);
+    int ngr = (m + G - 1) / G;
+    cudaMemsetAsync(part, 0, sizeof(cplx<double>) * (size_t)nnr * npert * ngr, st);
+    kz_inv<double, N3><<<dim3((g.nst + TPB_Z - 1) / TPB_Z, m), TPB_Z, 0, st>>>(S, x, list, s0 + c0, nslot, npert, npwx,
+                                                                             g.nst, g.zmap, g.nzst);
+    kxy_inv_rho<double, N1, N2><<<dim3(N3, ngr), tpb, shm, st>>>(S, psir, list, s0 + c0, nslot, npert, nnr, pj, c0, m, G,
+                                                                wgt, part, g.nst, g.nzst, g.sx, g.sy, g.xa, g.nxa);
+    const size_t nr = (size_t)nnr * npert;
+    krho_reduce<double><<<(unsigned)((nr + 255) / 256), 256, 0, st>>>(drho, part, nnr, npert, ngr);
+  }
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) { fprintf(stderr, "fdx inv_rho: launch failed: %s\n", cudaGetErrorString(e)); return 6; }
+  return 0;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // supported grids and dispatch
 // ---------------------------------------------------------------------------------------------------------------
@@ -587,6 +707,7 @@ extern "C" {
 
 void fdx_free() {
   cudaFree(g.zmap); cudaFree(g.sx); cudaFree(g.sy); cudaFree(g.xa); cudaFree(g.S);
+  cudaFree(g_part); g_part = nullptr; g_partb = 0;
   g = Geo();
 }
 
@@ -726,6 +847,23 @@ int fdx_inv_d(void* box, const void* x, const int* list, int s0, int nb, int nsl
 #define X(id, a, b, c) \
   case id: return run_inv<a, b, c>((cplx<double>*)box, (const cplx<double>*)x, list, s0, nb, nslot, npert, npwx, nnr, \
                                    st, tpb);
+    FDX_GRIDS(X)
+#undef X
+  }
+  return 7;
+}
+
+// RTSC_STH_DRF: drho(:, p) += sum_j wgt(k_j) conj(psir(:, b_j)) FFT_inv(x on the k+q sphere)(:, j) for the nb columns
+// list(s0+1 .. s0+nb), without the full box (b_j = the (k, n) slot of the cache, pj = 0, or the chunk column, pj = 1)
+int fdx_inv_rho_d(void* drho, const void* x, const void* psir, const int* list, int s0, int nb, int nslot, int npert,
+                  int npwx, int nnr, int pj, const double* wgt, cudaStream_t st) {
+  if (nnr != g.n1 * g.n2 * g.n3) return 8;
+  int tpb = tpb_xy_default();
+  if (const char* e = getenv("FDX_RHO_TPB")) tpb = atoi(e);
+  switch (g.gid) {
+#define X(id, a, b, c) \
+  case id: return run_inv_rho<a, b, c>((cplx<double>*)drho, (const cplx<double>*)x, (const cplx<double>*)psir, list, s0, \
+                                       nb, nslot, npert, npwx, nnr, pj, wgt, st, tpb);
     FDX_GRIDS(X)
 #undef X
   }

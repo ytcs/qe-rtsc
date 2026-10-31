@@ -119,6 +119,15 @@ MODULE sth_engine
       INTEGER(c_int), VALUE :: s0, nb, nslot, npert, npwx, nnr
       INTEGER(cuda_stream_kind), VALUE :: strm
     END FUNCTION fdx_inv_d
+    INTEGER(c_int) FUNCTION fdx_inv_rho_d(drho, x, psir, list, s0, nb, nslot, npert, npwx, nnr, pj, wgt, strm) &
+                                          BIND(C, name='fdx_inv_rho_d')
+      IMPORT :: c_int, c_double, cuda_stream_kind
+      COMPLEX(c_double), DEVICE :: drho(*), x(*), psir(*)
+      INTEGER(c_int), DEVICE :: list(*)
+      INTEGER(c_int), VALUE :: s0, nb, nslot, npert, npwx, nnr, pj
+      REAL(c_double), DEVICE :: wgt(*)
+      INTEGER(cuda_stream_kind), VALUE :: strm
+    END FUNCTION fdx_inv_rho_d
   END INTERFACE
   INTEGER(8), SAVE :: mem_hw = 0
   !
@@ -363,6 +372,7 @@ MODULE sth_engine
   ! - Under RTSC_STRICT=1, a CBSR decline ("CG kept") at q /= Gamma stops ph.x (the pre-flight rule of MILESTONE-2).
   LOGICAL, SAVE :: cb_xch = .FALSE., cb_host = .FALSE., cb_strict = .FALSE.
   LOGICAL, SAVE :: sth_drho2 = .FALSE., sth_drho2_read = .FALSE.   ! RTSC_STH_DRHO2 (k_drho2)
+  LOGICAL, SAVE :: sth_drf = .FALSE.                                 ! RTSC_STH_DRF (fdx_inv_rho_d; FDXDP path only)
   INTEGER, SAVE :: cb_hs(CB_MAXREP) = 0, cb_nh = 0, cb_nhcap = 0
   INTEGER(8), SAVE :: cb_hcopy = 0
   INTEGER, SAVE :: cb_stg_cur = 0, cb_hostn = 0
@@ -5533,6 +5543,8 @@ CONTAINS
         INTEGER :: ios
         CALL get_environment_variable('RTSC_STH_DRHO2', sv, STATUS=ios)
         sth_drho2 = ios == 0 .AND. TRIM(sv) == '1'
+        CALL get_environment_variable('RTSC_STH_DRF', sv, STATUS=ios)
+        sth_drf = ios == 0 .AND. TRIM(sv) == '1'
         sth_drho2_read = .TRUE.
       END BLOCK
     ENDIF
@@ -5744,6 +5756,18 @@ CONTAINS
       ip = plan_for(nb)
       nb = 2**ip
       np = 2**ip
+      IF (dp_on .AND. sth_drf) THEN
+        ! b2x RTSC_STH_DRF: inverse transform and incdrhoscf fused (no box); then the next chunk
+        IF (s0 < psir_nv) THEN
+          istat = fdx_inv_rho_d(d_drho, d_dpsi, d_psir, d_valid, s0, nb, nslot, npert, npwx, nnr, 0, d_wgt, strm)
+        ELSE
+          CALL psir_chunk(s0, nb, ip)
+          istat = fdx_inv_rho_d(d_drho, d_dpsi, d_box2, d_valid, s0, nb, nslot, npert, npwx, nnr, 1, d_wgt, strm)
+        ENDIF
+        IF (istat /= 0) CALL errore_stop('fdx_inv_rho_d', istat)
+        s0 = s0 + nb
+        CYCLE
+      ENDIF
       IF (dp_on) THEN
         istat = fdx_inv_d(d_box, d_dpsi, d_valid, s0, nb, nslot, npert, npwx, nnr, strm)
         IF (istat /= 0) CALL errore_stop('fdx_inv_d', istat)

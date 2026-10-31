@@ -11,4 +11,5 @@ int fdx_local_d(void) { return 99; }
 int fdx_local_s(void) { return 99; }
 int fdx_dpot_d(void) { return 99; }
 int fdx_inv_d(void) { return 99; }
+int fdx_inv_rho_d(void) { return 99; }
 int fdx_geom1(void) { return 99; }
