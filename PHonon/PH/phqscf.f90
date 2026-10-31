@@ -40,6 +40,7 @@ SUBROUTINE phqscf
   USE control_flags,    ONLY : iverbosity
   USE control_lr,       ONLY : convt, rec_code
   USE dfpt_type,        ONLY : dfpt_data_type, allocate_dfpt_data, deallocate_dfpt_data
+  USE sth_engine,       ONLY : sth_engine_set_npmax   ! rtsc b2r: the q's largest irrep (partial psi(r) cache reserve)
   USE write_hub
 
   IMPLICIT NONE
@@ -58,6 +59,7 @@ SUBROUTINE phqscf
   ! the change of density due to perturbations
 
   CALL start_clock ('phqscf')
+  IF (nirr > 0) CALL sth_engine_set_npmax(MAXVAL(npert(1:nirr)))
   !
   ! DFPT+U
   !

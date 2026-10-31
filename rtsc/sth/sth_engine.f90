@@ -49,7 +49,8 @@ MODULE sth_engine
             sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set, &
             sth_engine_set_nlk, sth_engine_build_dvb, sth_engine_dvb_check, &
             sth_engine_kqg_ready, sth_engine_set_kqg, sth_engine_set_wdev, sth_engine_wdev, sth_engine_cbsr_map, &
-            sth_engine_rwf_count, sth_engine_rwf_put, sth_engine_kdev_map, sth_engine_set_wdev_n, sth_engine_kdev_op, sth_engine_cbsr_op
+            sth_engine_rwf_count, sth_engine_rwf_put, sth_engine_kdev_map, sth_engine_set_wdev_n, sth_engine_kdev_op, sth_engine_cbsr_op, &
+            sth_engine_set_npmax
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -234,6 +235,11 @@ MODULE sth_engine
   ! psi_k(r) cache (nnr x nslot*nksq) or, when it does not fit (or RTSC_STH_NOPSIR=1), psi_k(r)
   ! rebuilt per column chunk from evc into d_box2 (one extra batched inverse FFT per chunk)
   LOGICAL, SAVE :: psir_cached = .TRUE.
+  ! rtsc b2r (P5 memory, RTSC_STH_PSIR_PART=1; off by default): a partial psi(r) cache. psi_kn(r) is cached for the first
+  ! psir_kc k-points (as many as fit after everything else of the q, CBSR bases included) and recomputed per chunk for the
+  ! rest. psir_nv = the valid slots (k-major) whose k is cached. Full cache: psir_kc = nksq; none: psir_kc = 0.
+  LOGICAL, SAVE :: psir_part = .FALSE.
+  INTEGER, SAVE :: psir_kc = 0, psir_nv = 0, sth_npmax = 3
   COMPLEX(dp), DEVICE, ALLOCATABLE :: d_box2(:,:)
   INTEGER, PINNED, ALLOCATABLE, SAVE :: h_nact(:)
   !
@@ -2191,6 +2197,48 @@ CONTAINS
     plan_nr = nr
   END SUBROUTINE make_plans
   !
+  SUBROUTINE psir_part_build()
+    !! RTSC_STH_PSIR_PART: cache psi_kn(r) for the first psir_kc k-points, as many as fit after a reserve for the irrep
+    !! arrays (8 column arrays at sth_npmax), the CBSR chunk buffers and RTSC_STH_PSIR_RES GiB (default 1.5)
+    INTEGER(8) :: freeb, totb, res, per
+    INTEGER :: istat, b0, nb, ip, nbx
+    REAL(dp) :: rg
+    CHARACTER(LEN=16) :: sv
+    rg = 1.5_dp
+    CALL get_environment_variable('RTSC_STH_PSIR_RES', sv, STATUS=istat)
+    IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) rg
+    res = INT(rg * 1024.0_dp**3, 8) + 8_8 * 16_8 * npwx * nslot * sth_npmax * nksq
+    IF (cbsr_q .AND. cbsr_rf) res = res + 48_8 * cb_n0 * cb_cmax
+    IF (cbsr_q .AND. .NOT. cbsr_rf) res = res + 2_8 * 16_8 * cb_n0 * nslot * sth_npmax * nksq
+    CALL sth_mem_trim()
+    istat = cudaMemGetInfo(freeb, totb)
+    per = 16_8 * nnr * nslot
+    psir_kc = INT(MAX(0_8, MIN(INT(nksq, 8), (freeb - res) / per)))
+    IF (psir_kc > 0) THEN
+      nbx = nslot * psir_kc
+      ALLOCATE(d_psir(nnr, nbx))
+      CALL zero_c(d_psir, INT(nnr, 8) * nbx)
+      CALL k_scatter_evc<<<dim3(nblk(npwx, TPB), nbx, 1), TPB, 0, strm>>>(d_psir, d_evc, nnr, npwx, &
+           nslot, psir_kc, d_npw, d_nock, d_idxk)
+      CALL kerr('scatter_evc (part)')
+      b0 = 0
+      DO WHILE (b0 < nbx)
+        nb = MIN(sth_bmax, nbx - b0)
+        ip = nplan - 1
+        DO WHILE (2**ip > nb)
+          ip = ip - 1
+        ENDDO
+        CALL fft_exec(ip, d_psir(:, b0 + 1:b0 + 2**ip), CUFFT_INVERSE)
+        b0 = b0 + 2**ip
+      ENDDO
+      CALL tsync()
+    ENDIF
+    CALL sth_mem_sample()
+    WRITE(*, '(A,I6,A,I6,A,F8.2,A,F8.2,A,I2,A)') '     rtsc psir part: psi(r) cached for ', psir_kc, ' of ', nksq, &
+         ' k (', REAL(per * psir_kc, dp) / 1024.0_dp**3, ' GiB; free before ', REAL(freeb, dp) / 1024.0_dp**3, &
+         ' GiB, reserve at npert ', sth_npmax, ')'
+  END SUBROUTINE psir_part_build
+  !
   SUBROUTINE psir_chunk(s0, nb, ip)
     !! no-cache mode: psi_kn(r) of the nb = 2**ip columns list(s0+1 .. s0+nb) into d_box2
     INTEGER, INTENT(IN) :: s0, nb, ip
@@ -2636,7 +2684,7 @@ CONTAINS
     INTEGER, INTENT(IN) :: s0, nb, ip
     REAL(dp), INTENT(IN) :: scale
     INTEGER :: istat
-    IF (psir_cached) THEN
+    IF (s0 < psir_nv) THEN
       istat = fdx_dpot_d(d, d_psir, d_dv, d_valid, s0, nb, nslot, npert, npwx, nnr, 0, scale, strm)
     ELSE
       CALL psir_chunk(s0, nb, ip)
@@ -4255,6 +4303,12 @@ CONTAINS
   ! public API
   !=================================================================================================
   !
+  SUBROUTINE sth_engine_set_npmax(n)
+    !! the largest irrep dimension of the coming q (sizes the irrep arrays' reserve of the partial psi(r) cache)
+    INTEGER, INTENT(IN) :: n
+    sth_npmax = MAX(1, n)
+  END SUBROUTINE sth_engine_set_npmax
+  !
   LOGICAL FUNCTION sth_engine_qready()
     sth_engine_qready = qready
   END FUNCTION sth_engine_qready
@@ -4481,13 +4535,17 @@ CONTAINS
     istat = cudaDeviceSynchronize()
     s0 = 0
     DO WHILE (s0 < nvalid)
-      nb = MIN(sth_bmax, nvalid - s0)
+      IF (s0 < psir_nv) THEN
+        nb = MIN(sth_bmax, psir_nv - s0)
+      ELSE
+        nb = MIN(sth_bmax, nvalid - s0)
+      ENDIF
       ip = plan_for(nb)
       nb = 2**ip
       IF (dp_on) THEN
         CALL dpot_fdx(d_dvb, s0, nb, ip, scale)
       ELSE
-      IF (psir_cached) THEN
+      IF (s0 < psir_nv) THEN
         CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
              nnr, nslot, npert, 0)
       ELSE
@@ -4647,6 +4705,10 @@ CONTAINS
       ! without the psi(r) cache: evc stays on the device and one more FFT box holds a chunk's psi(r)
       need_nc = need - 16_8 * nnr * nbox + 16_8 * npwx * nbox + 16_8 * nnr * sth_bmax
       psir_cached = .NOT. (ios == 0 .AND. TRIM(sv) == '1')
+      CALL get_environment_variable('RTSC_STH_PSIR_PART', sv, STATUS=ios)
+      psir_part = psir_cached .AND. ios == 0 .AND. TRIM(sv) == '1'
+      IF (psir_part) psir_cached = .FALSE.     ! start without the cache; the partial cache is sized at the end of setup
+      CALL get_environment_variable('RTSC_STH_NOPSIR', sv, STATUS=ios)
       IF (psir_cached .AND. need > freeb - 1024_8**3 .AND. need_nc <= freeb - 1024_8**3) THEN
         WRITE(*, '(A,F8.2,A,F8.2,A,F8.2,A)') 'sth_engine: psi(r) cache needs ', REAL(need) / 1024.0**3, &
              ' GiB, free ', REAL(freeb) / 1024.0**3, ' GiB: psi(r) recomputed per chunk (', &
@@ -4775,6 +4837,9 @@ CONTAINS
       ENDDO
       CALL tsync()
       DEALLOCATE(d_evc)
+      psir_kc = nksq
+    ELSE
+      psir_kc = 0
     ENDIF
     ! LIFT-F factor (needs h_W; the box is free here)
     IF (sth_lift > 0.0_dp .AND. .NOT. mp_q) THEN
@@ -4790,6 +4855,7 @@ CONTAINS
       CALL cbsr_free()
       IF (sth_cbsr) WRITE(*, '(A)') '     rtsc cbsr: ignored (RTSC_STH_MP or LIFT-F on)'
     ENDIF
+    IF (psir_part) CALL psir_part_build()
     IF (ALLOCATED(h_evc)) DEALLOCATE(h_evc)
     IF (ALLOCATED(h_W)) DEALLOCATE(h_W)
     IF (sth_timing) THEN
@@ -5031,6 +5097,10 @@ CONTAINS
     ENDDO
     d_valid = h_valid
     ENDIF
+    psir_nv = 0
+    DO ik = 1, MIN(psir_kc, nksq)
+      psir_nv = psir_nv + npert * h_nock(ik)
+    ENDDO
     istat = cudaDeviceSynchronize()
     ! zero the work arrays (invalid slots must stay zero; stale values must be finite)
     CALL zero_c(d_d0, INT(npwx, 8) * nsl)
@@ -5102,13 +5172,18 @@ CONTAINS
     IF (.NOT. first_iter) THEN
       s0 = 0
       DO WHILE (s0 < nvalid)
-        nb = MIN(sth_bmax, nvalid - s0)
+        ! chunks never straddle the cached / recomputed boundary psir_nv (= nvalid or 0 unless RTSC_STH_PSIR_PART)
+        IF (s0 < psir_nv) THEN
+          nb = MIN(sth_bmax, psir_nv - s0)
+        ELSE
+          nb = MIN(sth_bmax, nvalid - s0)
+        ENDIF
         ip = plan_for(nb)
         nb = 2**ip
         IF (dp_on) THEN
           CALL dpot_fdx(d_d0, s0, nb, ip, scale)
         ELSE
-        IF (psir_cached) THEN
+        IF (s0 < psir_nv) THEN
           CALL k_dvpsir<<<dim3(nblk(nnr, TPB), nb, 1), TPB, 0, strm>>>(d_box, d_psir, d_dv, d_valid, s0, &
                nnr, nslot, npert, 0)
         ELSE
@@ -5279,7 +5354,11 @@ CONTAINS
     ! incdrhoscf
     s0 = 0
     DO WHILE (s0 < nvalid)
-      nb = MIN(sth_bmax, nvalid - s0)
+      IF (s0 < psir_nv) THEN
+        nb = MIN(sth_bmax, psir_nv - s0)
+      ELSE
+        nb = MIN(sth_bmax, nvalid - s0)
+      ENDIF
       ip = plan_for(nb)
       nb = 2**ip
       np = 2**ip
@@ -5292,7 +5371,7 @@ CONTAINS
       CALL kerr('scatter (drho)')
       CALL fft_exec(ip, d_box, CUFFT_INVERSE)
       ENDIF
-      IF (psir_cached) THEN
+      IF (s0 < psir_nv) THEN
         CALL k_drho<<<nblk(nnr, TPB), TPB, 0, strm>>>(d_drho, d_box, d_psir, d_valid, s0, nb, nnr, nslot, &
              npert, d_wgt, 0)
       ELSE
