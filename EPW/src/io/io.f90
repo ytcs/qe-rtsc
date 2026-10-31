@@ -33,6 +33,25 @@
     rtsc_nowrite = on
     END FUNCTION rtsc_nowrite
     !
+    !------------------------------------------------------------
+    LOGICAL FUNCTION rtsc_novme()
+    !------------------------------------------------------------
+    !! rtsc epw4: RTSC_EPW_NOVME=1 (groups/compute/EPW4-LOG.md). In an ephwrite + Eliashberg run whose fine
+    !! stage is the fused GPU path, nothing reads the Wannier velocity / dipole / position matrices, so the
+    !! dipole matrix elements (compute_pmn_para), the formatted .mmn file, vmebloch2wan / dmebloch2wan and the
+    !! vmedata / dmedata files are skipped. use_wannier stops (errore) if the fused path is not taken or a
+    !! velocity consumer is active. Default off.
+    USE input, ONLY : ephwrite, eliashberg, lpolar, epwread
+    LOGICAL, SAVE :: rd = .FALSE., on = .FALSE.
+    CHARACTER(LEN = 16) :: ev
+    IF (.NOT. rd) THEN
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_NOVME', ev)
+      on = TRIM(ev) == '1' .AND. ephwrite .AND. eliashberg .AND. .NOT. lpolar .AND. .NOT. epwread
+      rd = .TRUE.
+    ENDIF
+    rtsc_novme = on
+    END FUNCTION rtsc_novme
+    !
     !-----------------------------------------------------------------
     SUBROUTINE rwepmatw(epmatw, nbnd, np, nmodes, nrec, iun, iop)
     !-----------------------------------------------------------------
@@ -257,12 +276,15 @@
           DO irk = 1, nrr_k
             WRITE (epwdata,*) chw(ibnd, jbnd, irk)
             IF (eig_read) WRITE (iunksdata,*) chw_ks(ibnd, jbnd, irk)
+            ! rtsc epw4 (RTSC_EPW_NOVME=1): velocities not computed, files left empty (a later epwread fails loudly)
+            IF (.NOT. rtsc_novme()) THEN
             DO ipol = 1, 3
               WRITE(iunvmedata,*) cvmew(ipol, ibnd, jbnd, irk)
               WRITE(iunvmedata,*) crrw(ipol, ibnd, jbnd, irk)
               !
               WRITE(iundmedata,*) cdmew(ipol, ibnd, jbnd, irk)
             ENDDO
+            ENDIF
           ENDDO
         ENDDO
       ENDDO

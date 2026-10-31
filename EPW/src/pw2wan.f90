@@ -60,6 +60,36 @@
 #endif
     END SUBROUTINE rtsc_sleepy_barrier
     !
+    !-----------------------------------------------------------------------
+    SUBROUTINE rtsc_gowait()
+    !-----------------------------------------------------------------------
+    !! rtsc epw4 (groups/compute/EPW4-LOG.md): RTSC_EPW_GOFILE=<path>. A run script may start epw.x while the
+    !! previous stage still runs: every rank has done MPI_Init and created its CUDA context (mp_startup); here
+    !! the ranks wait (5 ms sleeps) until <path> exists, then meet at a barrier and EPW proceeds as usual.
+    !! No arithmetic changes. Unset (default): returns at once.
+    USE iso_c_binding, ONLY : c_int
+    USE mp,            ONLY : mp_barrier
+    USE mp_world,      ONLY : world_comm
+    INTERFACE
+      INTEGER(c_int) FUNCTION usleep(us) BIND(C, name = 'usleep')
+        IMPORT :: c_int
+        INTEGER(c_int), VALUE :: us
+      END FUNCTION usleep
+    END INTERFACE
+    CHARACTER(LEN = 512) :: gf
+    LOGICAL :: ex
+    INTEGER :: rc
+    CALL GET_ENVIRONMENT_VARIABLE('RTSC_EPW_GOFILE', gf)
+    IF (LEN_TRIM(gf) == 0) RETURN
+    !$acc init
+    DO
+      INQUIRE(FILE = TRIM(gf), EXIST = ex)
+      IF (ex) EXIT
+      rc = usleep(5000_c_int)
+    ENDDO
+    CALL mp_barrier(world_comm)
+    END SUBROUTINE rtsc_gowait
+    !
     !------------------------------------------------------------------------
     SUBROUTINE pw2wan90epw
     !------------------------------------------------------------------------
@@ -1998,6 +2028,7 @@
                                 excluded_band, write_mmn, zerophase, ispinw
     USE ep_constants,    ONLY : czero, cone, twopi, zero
     USE io_var,          ONLY : iummn
+    USE io,              ONLY : rtsc_novme
 #if defined(__NAG)
     USE f90_unix_io,     ONLY : flush
 #endif
@@ -2483,6 +2514,8 @@
     ! RM - write mmn to file (file needed with vme = true)
     IF (meta_ionode) THEN
       write_mmn = .TRUE.
+      ! rtsc epw4 (RTSC_EPW_NOVME=1): the .mmn file is read only by vmebloch2wan, which that switch skips
+      IF (rtsc_novme()) write_mmn = .FALSE.
       IF (write_mmn) THEN
         !
         filmmn = TRIM(prefix)//'.mmn'

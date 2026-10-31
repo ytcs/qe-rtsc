@@ -99,7 +99,8 @@
     USE kinds,         ONLY : DP
     USE io_files,      ONLY : prefix
     USE io_var,        ONLY : iuwinfil
-    USE io_global,     ONLY : meta_ionode
+    USE io_global,     ONLY : meta_ionode, stdout
+    USE io,            ONLY : rtsc_novme
     USE input,         ONLY : nbndsub, nwanxx, proj, iprint, dis_win_min, &
                               dis_win_max, dis_froz_min, dis_froz_max, num_iter, &
                               bands_skipped, wdata, auto_projections, lsda
@@ -126,6 +127,14 @@
     !! Position in strings
     INTEGER :: pos2
     !! Position in strings
+    CHARACTER(LEN = 32) :: rtsc_ev
+    !! rtsc epw4: environment value
+    INTEGER :: rtsc_niter
+    !! rtsc epw4: num_iter written to the .win (RTSC_W90_NITER)
+    INTEGER :: rtsc_ios
+    !! rtsc epw4: read status
+    LOGICAL :: rtsc_nohr
+    !! rtsc epw4: RTSC_W90_NOHR=1, do not force write_hr
     !
     fnm = TRIM(prefix) // ".win"
     IF (TRIM(lsda) == 'down') fnm = TRIM(prefix) // ".down.win"
@@ -165,7 +174,15 @@
       IF (dis_win_max  <  9000) WRITE(iuwinfil, '("dis_win_max = ", f18.12)')  dis_win_max
       IF (dis_froz_min > -9000) WRITE(iuwinfil, '("dis_froz_min = ", f18.12)') dis_froz_min
       IF (dis_froz_max <  9000) WRITE(iuwinfil, '("dis_froz_max = ", f18.12)') dis_froz_max
-      WRITE(iuwinfil, '("num_iter = ", i7)')         num_iter
+      ! rtsc epw4 (groups/compute/EPW4-LOG.md): RTSC_W90_NITER=n overrides num_iter (default: the input's num_iter)
+      rtsc_niter = num_iter
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_W90_NITER', rtsc_ev)
+      IF (LEN_TRIM(rtsc_ev) > 0) THEN
+        READ(rtsc_ev, *, IOSTAT = rtsc_ios) rtsc_niter
+        IF (rtsc_ios /= 0 .OR. rtsc_niter < 0) rtsc_niter = num_iter
+        WRITE(stdout, '(5x,a,i7,a,i7)') 'rtsc: RTSC_W90_NITER, num_iter ', num_iter, ' -> ', rtsc_niter
+      ENDIF
+      WRITE(iuwinfil, '("num_iter = ", i7)')         rtsc_niter
       WRITE(iuwinfil, '(a)') "write_bvec = .true."
       !
       ! HL 11/2020: The code block below is necessary
@@ -202,7 +219,16 @@
         IF (wdata(i) /= ' ') WRITE(iuwinfil, *) TRIM(wdata(i))
       ENDDO
       !
-      IF (notfound) WRITE(iuwinfil, *) "write_hr = .true."
+      ! rtsc epw4 (groups/compute/EPW4-LOG.md): RTSC_W90_NOHR=1 does not add write_hr when the input does not set it,
+      ! so wannier90 skips its plotting stage (H(R) and the _hr.dat, which EPW never reads). Default off.
+      ! Without write_hr wannier90 also leaves the .bvec file empty, which vmebloch2wan reads: NOHR acts only
+      ! together with RTSC_EPW_NOVME (which skips vmebloch2wan), and is ignored otherwise.
+      CALL GET_ENVIRONMENT_VARIABLE('RTSC_W90_NOHR', rtsc_ev)
+      rtsc_nohr = TRIM(rtsc_ev) == '1' .AND. rtsc_novme()
+      IF (TRIM(rtsc_ev) == '1' .AND. .NOT. rtsc_nohr) &
+        WRITE(stdout, '(5x,a)') 'rtsc: RTSC_W90_NOHR ignored (needs RTSC_EPW_NOVME=1: the .bvec file is written with write_hr)'
+      IF (rtsc_nohr .AND. notfound) WRITE(stdout, '(5x,a)') 'rtsc: RTSC_W90_NOHR, write_hr not set'
+      IF (notfound .AND. .NOT. rtsc_nohr) WRITE(iuwinfil, *) "write_hr = .true."
       !
       CLOSE(iuwinfil)
       !

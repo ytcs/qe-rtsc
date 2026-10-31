@@ -43,6 +43,7 @@
   USE wannier,          ONLY : build_wannier
   USE check_stop,       ONLY : check_stop_init
   USE tdbe_driver,      ONLY : tdbe
+  USE pw2wan,           ONLY : rtsc_gowait
   !
   IMPLICIT NONE
   !
@@ -99,6 +100,9 @@
 #endif
   !
   CALL mp_startup(start_images = .TRUE.)
+  !
+  ! rtsc epw4: RTSC_EPW_GOFILE (prewarmed launch; default unset = no wait)
+  CALL rtsc_gowait()
   !
   ! Display the logo
   IF (meta_ionode) THEN
