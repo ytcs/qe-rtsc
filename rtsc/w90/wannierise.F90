@@ -5,7 +5,8 @@
 ! while the other ranks wait). Each k writes only its own blocks with the same BLAS/LAPACK calls and no reduction
 ! over k is reordered; the threaded copies can still round differently in the last bit (compiler code generation
 ! of the outlined loop bodies). With RTSC_W90_WNT unset the original serial loops run unchanged
-! (groups/compute/AMDAHL-LOG.md).
+! (groups/compute/AMDAHL-LOG.md). Also: RTSC_W90_DUMP=1 calls rtsc_socw_dump (rtsc/w90/rtsc_socw.F90) at the start and
+! end of wann_main (read-only; groups/compute/SOCW-LOG.md).
 !-*- mode: F90 -*-!
 !------------------------------------------------------------!
 ! This file is distributed as part of the Wannier90 code and !
@@ -112,6 +113,7 @@ contains
     use w90_utility, only: utility_frac_to_cart, utility_zgemm
     use w90_parameters, only: lsitesymmetry                !RS:
     use w90_sitesym, only: sitesym_symmetrize_gradient  !RS:
+    use rtsc_w90_socw, only: rtsc_socw_dump  ! rtsc socw
 
     !ivo
     use w90_hamiltonian, only: hamiltonian_setup, hamiltonian_get_hr, ham_r, &
@@ -283,6 +285,7 @@ contains
     end do
     call comms_scatterv(m_matrix_loc, num_wann*num_wann*nntot*counts(my_node_id), &
                         m_matrix, num_wann*num_wann*nntot*counts, num_wann*num_wann*nntot*displs)
+    call rtsc_socw_dump(0)  ! rtsc socw: RTSC_W90_DUMP=1 writes the starting state
 
     allocate (cdq_loc(num_wann, num_wann, max(1, counts(my_node_id))), stat=ierr)
     if (ierr /= 0) call io_error('Error in allocating cdq_loc in wann_main')
@@ -669,6 +672,7 @@ contains
     call comms_gatherv(u_matrix_loc, num_wann*num_wann*counts(my_node_id), &
                        u_matrix, num_wann*num_wann*counts, num_wann*num_wann*displs)
     call comms_bcast(u_matrix(1, 1, 1), num_wann*num_wann*num_kpts)
+    call rtsc_socw_dump(1)  ! rtsc socw: RTSC_W90_DUMP=1 writes the final state
 
     ! Evaluate the penalty functional
     if (selective_loc .and. slwf_constrain) then

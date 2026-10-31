@@ -9,7 +9,8 @@ hdr = """! rtsc: copy of external/wannier90/src/wannierise.F90 (wannier90 3.1, 1
 ! while the other ranks wait). Each k writes only its own blocks with the same BLAS/LAPACK calls and no reduction
 ! over k is reordered; the threaded copies can still round differently in the last bit (compiler code generation
 ! of the outlined loop bodies). With RTSC_W90_WNT unset the original serial loops run unchanged
-! (groups/compute/AMDAHL-LOG.md).
+! (groups/compute/AMDAHL-LOG.md). Also: RTSC_W90_DUMP=1 calls rtsc_socw_dump (rtsc/w90/rtsc_socw.F90) at the start and
+! end of wann_main (read-only; groups/compute/SOCW-LOG.md).
 """
 s = hdr + s
 
@@ -77,5 +78,16 @@ d = dup(d, "    do nkp_loc = 1, counts(my_node_id)\n      nkp = nkp_loc + displs
         "      enddo\n    enddo\n    cdodq_loc = cdodq_loc/real(num_kpts, dp)*4.0_dp\n".replace("    cdodq_loc = cdodq_loc/real(num_kpts, dp)*4.0_dp\n", ""),
         "!$omp parallel do num_threads(rtsc_wnt) schedule(static) private(nkp, nn, n, m, mnn) firstprivate(cr, crt)\n")
 s = s[:a] + d + s[b:]
+# rtsc socw (groups/compute/SOCW-LOG.md): RTSC_W90_DUMP=1 hooks in wann_main (rtsc/w90/rtsc_socw.F90); read-only, bitwise
+s = sub(s, "    use w90_sitesym, only: sitesym_symmetrize_gradient  !RS:\n",
+        "    use w90_sitesym, only: sitesym_symmetrize_gradient  !RS:\n    use rtsc_w90_socw, only: rtsc_socw_dump  ! rtsc socw\n")
+s = sub(s, "    call comms_scatterv(m_matrix_loc, num_wann*num_wann*nntot*counts(my_node_id), &\n"
+           "                        m_matrix, num_wann*num_wann*nntot*counts, num_wann*num_wann*nntot*displs)\n",
+        "    call comms_scatterv(m_matrix_loc, num_wann*num_wann*nntot*counts(my_node_id), &\n"
+        "                        m_matrix, num_wann*num_wann*nntot*counts, num_wann*num_wann*nntot*displs)\n"
+        "    call rtsc_socw_dump(0)  ! rtsc socw: RTSC_W90_DUMP=1 writes the starting state\n")
+s = sub(s, "    call comms_bcast(u_matrix(1, 1, 1), num_wann*num_wann*num_kpts)\n",
+        "    call comms_bcast(u_matrix(1, 1, 1), num_wann*num_wann*num_kpts)\n"
+        "    call rtsc_socw_dump(1)  ! rtsc socw: RTSC_W90_DUMP=1 writes the final state\n")
 open(sys.argv[2], 'w').write(s)
 print("patched")
