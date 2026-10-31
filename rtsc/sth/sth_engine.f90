@@ -49,7 +49,7 @@ MODULE sth_engine
             sth_engine_becs, sth_mem_trim, sth_mem_sample, sth_mem_take_hw, sth_engine_xp_set, &
             sth_engine_set_nlk, sth_engine_build_dvb, sth_engine_dvb_check, &
             sth_engine_kqg_ready, sth_engine_set_kqg, sth_engine_set_wdev, sth_engine_wdev, sth_engine_cbsr_map, &
-            sth_engine_rwf_count, sth_engine_rwf_put, sth_engine_kdev_map, sth_engine_set_wdev_n, sth_engine_kdev_op
+            sth_engine_rwf_count, sth_engine_rwf_put, sth_engine_kdev_map, sth_engine_set_wdev_n, sth_engine_kdev_op, sth_engine_cbsr_op
   !
   ! Device memory. The NVHPC runtime (CUDA Fortran and OpenACC, NVCOMPILER_ACC_MEM_MANAGE, on by
   ! default) does not return a DEALLOCATEd device block to the driver: it keeps it on a free list and
@@ -305,7 +305,7 @@ MODULE sth_engine
   REAL(dp), ALLOCATABLE, SAVE :: h_cblam(:,:), h_cbtlam(:,:)
   INTEGER, SAVE :: cb_n0 = 0, cb_nres = 0, cb_nbuilt = 0, cb_qcount = 0, cb_lastq(CB_MAXREP) = 0
   ! per-q map of every k+q onto its basis (sth_engine_cbsr_map): rep id (0: per-q basis), time reversal, G map, phase
-  INTEGER, ALLOCATABLE, SAVE :: h_ckrep(:), h_cktr(:), h_ckmap(:,:), h_ckq(:)
+  INTEGER, ALLOCATABLE, SAVE :: h_ckrep(:), h_cktr(:), h_ckmap(:,:), h_ckq(:), h_ckdev(:), h_ckop(:,:)
   COMPLEX(dp), ALLOCATABLE, SAVE :: h_ckph(:,:)
   INTEGER, DEVICE, ALLOCATABLE :: d_ckmap(:,:), d_cktr(:)
   COMPLEX(dp), DEVICE, ALLOCATABLE :: d_ckph(:,:)
@@ -1014,6 +1014,27 @@ CONTAINS
       j = j + gridDim%y
     ENDDO
   END SUBROUTINE k_kd_clr
+  !
+  ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_mapdev(map, rmill, rep, tr, op, dv, inv, npwq, k0, nk, npwx, ldr, nnr, nr1, nr2, nr3)
+    ! CBSR: map(ig, k) = position in k+q's sphere of tr S m_ig - G0 (m: Miller indices of the cache entry), for dv(k) = 1
+    INTEGER, VALUE :: k0, nk, npwx, ldr, nnr, nr1, nr2, nr3
+    INTEGER :: map(npwx, *), rmill(3, ldr, *), rep(*), tr(*), op(12, *), dv(*), inv(nnr, *), npwq(*)
+    INTEGER :: ig, j, k, r, t, m1, m2, m3, a1, a2, a3
+    ig = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    j = blockIdx%y
+    DO WHILE (j <= nk)
+      k = k0 + j
+      IF (dv(k) == 1 .AND. ig <= npwq(k)) THEN
+        r = rep(k); t = tr(k)
+        m1 = rmill(1, ig, r); m2 = rmill(2, ig, r); m3 = rmill(3, ig, r)
+        a1 = t * (op(1, k) * m1 + op(4, k) * m2 + op(7, k) * m3) - op(10, k)
+        a2 = t * (op(2, k) * m1 + op(5, k) * m2 + op(8, k) * m3) - op(11, k)
+        a3 = t * (op(3, k) * m1 + op(6, k) * m2 + op(9, k) * m3) - op(12, k)
+        map(ig, k) = MAX(1, inv(1 + MODULO(a1, nr1) + nr1 * (MODULO(a2, nr2) + nr2 * MODULO(a3, nr3)), j))
+      ENDIF
+      j = j + gridDim%y
+    ENDDO
+  END SUBROUTINE k_cb_mapdev
   !
   ATTRIBUTES(GLOBAL) SUBROUTINE k_cb_scal(a, f, n)
     INTEGER(8), VALUE :: n
@@ -2975,6 +2996,42 @@ CONTAINS
     ENDIF
   END SUBROUTINE cbsr_release
   !
+  SUBROUTINE cb_map_alloc(ik)
+    INTEGER, INTENT(IN) :: ik
+    IF (ALLOCATED(h_ckrep)) THEN
+      IF (SIZE(h_ckrep) /= nksq .OR. SIZE(h_ckmap, 1) /= npwx) DEALLOCATE(h_ckrep, h_cktr, h_ckmap, h_ckph, h_ckq, h_ckdev, h_ckop)
+    ENDIF
+    IF (.NOT. ALLOCATED(h_ckrep)) ALLOCATE(h_ckrep(nksq), h_cktr(nksq), h_ckmap(npwx, nksq), h_ckph(npwx, nksq), &
+                                           h_ckq(nksq), h_ckdev(nksq), h_ckop(12, nksq))
+    IF (ik == 1) THEN
+      h_ckrep = -1; h_ckdev = 0
+    ENDIF
+  END SUBROUTINE cb_map_alloc
+  !
+  SUBROUTINE sth_engine_cbsr_op(ik, irep, tr, sop, g0)
+    !! as sth_engine_cbsr_map, for a rotation without a fractional translation: only the operation (S, tr, G0) is passed;
+    !! the G map is built on the device from the SYMROT cache's Miller indices (d_rmill; sth_engine_rwf_put)
+    INTEGER, INTENT(IN) :: ik, irep, tr, sop(3, 3), g0(3)
+    INTEGER :: n
+    CALL cb_map_alloc(ik)
+    n = h_npwq(ik)
+    IF (irep < 1 .OR. irep > MIN(CB_MAXREP, rwf_n)) THEN
+      h_ckrep(ik) = 0; h_cktr(ik) = 1; h_ckdev(ik) = 0
+      DO n = 1, h_npwq(ik)
+        h_ckmap(n, ik) = n
+      ENDDO
+      h_ckph(:, ik) = (0.0_dp, 0.0_dp)
+      h_ckph(1:h_npwq(ik), ik) = (1.0_dp, 0.0_dp)
+      h_ckmap(h_npwq(ik) + 1:npwx, ik) = 1
+      RETURN
+    ENDIF
+    h_ckrep(ik) = irep; h_cktr(ik) = tr; h_ckdev(ik) = 1
+    h_ckop(1:9, ik) = RESHAPE(sop, (/ 9 /)); h_ckop(10:12, ik) = g0
+    h_ckmap(:, ik) = 1
+    h_ckph(:, ik) = (0.0_dp, 0.0_dp)
+    h_ckph(1:n, ik) = (1.0_dp, 0.0_dp)
+  END SUBROUTINE sth_engine_cbsr_op
+  !
   SUBROUTINE sth_engine_cbsr_map(ik, irep, ngs, tr, imap, ph)
     !! (after sth_engine_init, before sth_engine_setup) k+q of column block ik is the image of RTSC_NSCF_SYMROT cache
     !! entry irep: evq_ik(imap(ig)) = ph(ig) psi_irep(ig) (tr = 1) or conj(ph(ig) psi_irep(ig)) (tr = -1), ig = 1..ngs.
@@ -2982,12 +3039,8 @@ CONTAINS
     INTEGER, INTENT(IN) :: ik, irep, ngs, tr, imap(*)
     COMPLEX(dp), INTENT(IN) :: ph(*)
     INTEGER :: ig
-    IF (ALLOCATED(h_ckrep)) THEN
-      IF (SIZE(h_ckrep) /= nksq .OR. SIZE(h_ckmap, 1) /= npwx) DEALLOCATE(h_ckrep, h_cktr, h_ckmap, h_ckph, h_ckq)
-    ENDIF
-    IF (.NOT. ALLOCATED(h_ckrep)) ALLOCATE(h_ckrep(nksq), h_cktr(nksq), h_ckmap(npwx, nksq), h_ckph(npwx, nksq), &
-                                           h_ckq(nksq))
-    IF (ik == 1) h_ckrep = -1
+    CALL cb_map_alloc(ik)
+    h_ckdev(ik) = 0
     IF (irep > 0 .AND. irep <= CB_MAXREP .AND. ngs == h_npwq(ik)) THEN
       h_ckrep(ik) = irep
       h_cktr(ik) = tr
@@ -3074,6 +3127,32 @@ CONTAINS
     hlam = 1.0e30_dp
     hlam(1:nq) = d_cw(1:nq)
   END SUBROUTINE cb_build_one
+  !
+  SUBROUTINE cb_maps_dev()
+    !! CBSR: the G maps of the k+q passed as operations (sth_engine_cbsr_op), built on the device through the inverse of
+    !! each k+q sphere's FFT index list (the same integers symrot_kmap computes on the host)
+    INTEGER, DEVICE, ALLOCATABLE :: d_inv2(:,:), d_dv(:), d_op(:,:), d_rp(:)
+    INTEGER :: kc, k0, nk
+    kc = MAX(1, MIN(nksq, INT(2_8 * 1024_8**3 / (4_8 * nnr))))
+    kc = MIN(kc, 512)
+    ALLOCATE(d_inv2(nnr, kc), d_dv(nksq), d_op(12, nksq), d_rp(nksq))
+    d_inv2 = 0
+    d_dv = h_ckdev; d_op = h_ckop; d_rp = h_ckrep
+    DO k0 = 0, nksq - 1, kc
+      nk = MIN(kc, nksq - k0)
+      CALL k_kd_inv<<<dim3(nblk(npwx, TPB), MIN(nk, 65535), 1), TPB, 0, strm>>>(d_inv2, d_idxk, d_idxkq, d_npw, d_npwq, &
+           2, k0, nk, nnr, npwx)
+      CALL kerr('kd_inv (cbsr)')
+      CALL k_cb_mapdev<<<dim3(nblk(npwx, TPB), MIN(nk, 65535), 1), TPB, 0, strm>>>(d_ckmap, d_rmill, d_rp, d_cktr, d_op, &
+           d_dv, d_inv2, d_npwq, k0, nk, npwx, rwf_ld, nnr, nr(1), nr(2), nr(3))
+      CALL kerr('cb_mapdev')
+      CALL k_kd_clr<<<dim3(nblk(npwx, TPB), MIN(nk, 65535), 1), TPB, 0, strm>>>(d_inv2, d_idxk, d_idxkq, d_npw, d_npwq, &
+           2, k0, nk, nnr, npwx)
+      CALL kerr('kd_clr (cbsr)')
+    ENDDO
+    CALL tsync()
+    DEALLOCATE(d_inv2, d_dv, d_op, d_rp)
+  END SUBROUTINE cb_maps_dev
   !
   SUBROUTINE cbsr_build()
     !! per q: the basis of every k+q (resident rep bases reused; missing ones built), the assembly check, the device maps
@@ -3193,6 +3272,7 @@ CONTAINS
     END BLOCK
     ALLOCATE(d_ckmap(npwx, nksq), d_cktr(nksq), d_ckph(npwx, nksq))
     d_ckmap = h_ckmap; d_cktr = h_cktr; d_ckph = h_ckph
+    IF (ANY(h_ckdev == 1)) CALL cb_maps_dev()
     !
     ! per-q basis list: the reps this q uses, then the per-q bases
     cb_nqs = COUNT(need) + ntmp

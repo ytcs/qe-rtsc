@@ -634,7 +634,7 @@ CONTAINS
                                  sth_engine_set_nlk, sth_qcache, sth_engine_wdev, sth_engine_set_wdev, &
                                  sth_lift, sth_lift_kchunk, sth_lift_fb, sth_cbsr, sth_cbsr_skip, &
                                  sth_engine_cbsr_map, sth_engine_rwf_count, sth_engine_rwf_put, sth_engine_kdev_map, &
-                                 sth_engine_set_wdev_n, sth_engine_kdev_op
+                                 sth_engine_set_wdev_n, sth_engine_kdev_op, sth_engine_cbsr_op
     USE sth_nscf_symrot,  ONLY : symrot_kmap, symrot_cache_n, symrot_cache_get, symrot_kop
     USE rtsc_vkb,         ONLY : vkb_batch
     USE lrus,             ONLY : becp1
@@ -911,10 +911,28 @@ CONTAINS
         sth_cbsr_skip = .NOT. (ios == 0 .AND. TRIM(sv) == '1')
       ENDIF
       ALLOCATE(imap(npwx), ph(npwx))
+      ! the SYMROT cache entries (Miller indices for the device maps) not yet on the device
+      IF (.NOT. lgamma .AND. symrot_cache_n() > sth_engine_rwf_count()) THEN
+        ALLOCATE(wtmp(npwx, nbnd), mil(3, npwx))
+        DO j = sth_engine_rwf_count() + 1, symrot_cache_n()
+          CALL symrot_cache_get(j, ngs, ich, wtmp, mil)
+          CALL sth_engine_rwf_put(j, ngs, ich, wtmp, mil)
+        ENDDO
+        DEALLOCATE(wtmp, mil)
+      ENDIF
       nmap = 0
       DO ik = 1, nksq
         ok = .FALSE.
-        IF (.NOT. lgamma) CALL symrot_kmap(ikqs(ik), i0, ngs, tr, imap, ph, ok)
+        IF (.NOT. lgamma) THEN
+          ! operation only (G map built on the device); a fractional translation takes the host map
+          CALL symrot_kop(ikqs(ik), i0, sk, tr, g0k, fk, ok)
+          IF (ok .AND. .NOT. fk .AND. i0 <= sth_engine_rwf_count()) THEN
+            nmap = nmap + 1
+            CALL sth_engine_cbsr_op(ik, i0, tr, sk, g0k)
+            CYCLE
+          ENDIF
+          CALL symrot_kmap(ikqs(ik), i0, ngs, tr, imap, ph, ok)
+        ENDIF
         IF (ok) THEN
           nmap = nmap + 1
         ELSE
