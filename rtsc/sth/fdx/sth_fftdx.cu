@@ -569,8 +569,8 @@ __global__ void kxy_inv_rho(const cplx<T>* __restrict__ S, const cplx<T>* __rest
       const cplx<T> t = {c.x * d.x + c.y * d.y, c.x * d.y - c.y * d.x};   // conj(psi) * dpsi
       A[q] = {A[q].x + w * t.x, A[q].y + w * t.y};
     }
+    __syncthreads();                                // P is rewritten by the next column
   }
-  __syncthreads();
   if (pcur >= 0) {
     cplx<T>* dst = part + ((size_t)gr * npert + pcur) * nnr + (size_t)NP * z;
     for (int q = tid; q < NP; q += nt) { cplx<T> a = dst[q]; dst[q] = {a.x + A[q].x, a.y + A[q].y}; }
