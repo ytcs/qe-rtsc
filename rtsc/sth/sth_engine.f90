@@ -2287,7 +2287,7 @@ CONTAINS
     rg = 1.5_dp
     CALL get_environment_variable('RTSC_STH_PSIR_RES', sv, STATUS=istat)
     IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) rg
-    res = INT(rg * 1024.0_dp**3, 8) + MERGE(6_8, 8_8, cb_lean()) * 16_8 * npwx * nslot * sth_npmax * nksq
+    res = INT(rg * 1024.0_dp**3, 8) + MERGE(5_8, 8_8, cb_lean()) * 16_8 * npwx * nslot * sth_npmax * nksq
     IF (cbsr_q .AND. cbsr_rf) res = res + 48_8 * cb_n0 * cb_cmax
     IF (cbsr_q .AND. .NOT. cbsr_rf .AND. .NOT. cb_xch) res = res + 2_8 * 16_8 * cb_n0 * nslot * sth_npmax * nksq
     IF (cbsr_q .AND. .NOT. cbsr_rf .AND. cb_xch) res = res + 32_8 * cb_n0 * MIN(cb_cmax, nslot * sth_npmax * nksq)
@@ -3594,7 +3594,8 @@ CONTAINS
   !
   LOGICAL FUNCTION cb_lean()
     !! b2x (RTSC_STH_CBSR_XCH): the exact CBSR solve never touches the CG arrays d_g / d_h (no CG, no rf, no dpsi history),
-    !! so they are allocated with one element; the reserves count 6 column arrays instead of 8. Memory only (class B).
+    !! so they are allocated with one element; the reserves count 5 column arrays instead of 8 (4 allocated + 1 spare;
+    !! d_cf/d_cf2/d_ps add ~3 %). Memory only (class B). At H100 q5 (npmax 2) the spare is ~4.9 GiB of margin, not ~1.2 with 6.
     cb_lean = cbsr_q .AND. cb_xch .AND. .NOT. cbsr_rf .AND. .NOT. mp_q .AND. .NOT. lift_q .AND. sth_xp_m == 0
   END FUNCTION cb_lean
   !
@@ -3715,7 +3716,7 @@ CONTAINS
     IF (istat == 0 .AND. LEN_TRIM(sv) > 0) READ(sv, *, IOSTAT=istat) rgib
     ! b2x: the irrep arrays at the q's LARGEST irrep (sth_npmax, set by phqscf), not the first one's npert: with the bases
     ! filling the device, a later 2-dim irrep otherwise declines (seen at B2 frozen q2, A40)
-    reserve = INT(rgib * 1024.0_dp**3, 8) + MERGE(6_8, 8_8, cb_xch .AND. .NOT. cbsr_rf .AND. .NOT. mp_q .AND. &
+    reserve = INT(rgib * 1024.0_dp**3, 8) + MERGE(5_8, 8_8, cb_xch .AND. .NOT. cbsr_rf .AND. .NOT. mp_q .AND. &
               .NOT. lift_q .AND. sth_xp_m == 0) * 16_8 * npwx * nslot * MAX(npert, sth_npmax) * nksq
     ! rf: the chunk buffers (2 FP64 + 2 FP32 arrays of cb_cmax columns) and the build's FP64 staging copy
     IF (cbsr_rf) reserve = reserve + 48_8 * cb_n0 * cb_cmax + 16_8 * cb_n0 * cb_n0
