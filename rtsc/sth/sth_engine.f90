@@ -1914,9 +1914,14 @@ CONTAINS
     IF (ALLOCATED(s_W)) bsp = 8_8 * (SIZE(s_W, KIND=8) + SIZE(s_box, KIND=8)) + 4_8 * (SIZE(s_hd, KIND=8) + SIZE(s_g2, KIND=8))
     IF (ALLOCATED(s_e)) bsp = bsp + 8_8 * (SIZE(s_e, KIND=8) + SIZE(s_g, KIND=8) + SIZE(s_h, KIND=8) + SIZE(s_t, KIND=8) &
                                            + SIZE(s_cf, KIND=8) + SIZE(s_cf2, KIND=8))
-    IF (ALLOCATED(d_cu)) bcb = 16_8 * SIZE(d_cu, KIND=8)
-    IF (ALLOCATED(d_cc)) bcb = bcb + 16_8 * SIZE(d_cc, KIND=8)
-    IF (ALLOCATED(d_clam)) bcb = bcb + 8_8 * SIZE(d_clam, KIND=8)
+    DO istat = 1, CB_MAXREP
+      IF (ALLOCATED(cb_rep(istat)%u)) bcb = bcb + 16_8 * SIZE(cb_rep(istat)%u, KIND=8)
+    ENDDO
+    IF (ALLOCATED(cb_tmp)) THEN
+      DO istat = 1, SIZE(cb_tmp)
+        IF (ALLOCATED(cb_tmp(istat)%u)) bcb = bcb + 16_8 * SIZE(cb_tmp(istat)%u, KIND=8)
+      ENDDO
+    ENDIF
     bsum = bw + bev + bps + bbx + bhd + bix + binv + bkq + bg2 + bnl + bcol + bcf + bpsx + bdv + bxp + bsp + bcb
     WRITE(*, '(A,A,A,8I8,I10)') '     rtsc memlog ', tag, ' dims npwx nslot npert nksq nnr nproj nbnd bmax nbox:', &
          npwx, nslot, npert, nksq, nnr, nproj, nbnd, sth_bmax, nbox
