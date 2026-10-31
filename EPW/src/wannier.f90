@@ -49,6 +49,7 @@
                                  ephbloch2wanp_mem
     USE wigner,           ONLY : wigner_seitz_wrap, wigner_divide_ndegen,            &
                                  wigner_divide_ndegen_epmat, ws_indexes_distribution
+    USE io,               ONLY : rtsc_novme
     USE io,               ONLY : rwepmatw, epw_read, epw_write, loadumat,            &
                                  epw_read_ws_data, epw_write_ws_data
     USE mp,               ONLY : mp_bcast, mp_barrier
@@ -326,10 +327,13 @@
       !
       A(:, :, :, :) = czero
       ! Transform of position matrix elements - PRB 74 195118  (2006)
+      ! rtsc epw4 (RTSC_EPW_NOVME=1): cvmew, crrw, cdmew stay zero (not read in this run; A is zero unless qrpl)
+      IF (.NOT. rtsc_novme()) THEN
       CALL vmebloch2wan(dims, nbnd, nbndsub, nk_loc, nkpts, xk_loc, cu, nrr_k, irvec_k, wslen_k, lwin, exband, &
                         A(:, :, :, :), w_centers, ndegen_k)
       ! Transform of velocity matrix elements (dH/dk)
       CALL dmebloch2wan(nbnd, nbndsub, nk_loc, nkpts, dmec, xk_loc, cu, nrr_k, irvec_k, wslen_k, lwin, exband, cdmew)
+      ENDIF
       !
       ! Dynamical Matrix
       !

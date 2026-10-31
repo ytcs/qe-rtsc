@@ -63,6 +63,7 @@
                             gmap, qrpl, Qmat, L, do_cutoff_2D_epw, alph, nbndskip,&
                             wf_temp, wf, nk_loc, nkpts, ldfptu                                       
                             ! ZD: last line for ex-plrn
+  USE global_var,    ONLY : dmec
   USE input,         ONLY : et_loc, et_all, xk_all
   USE ep_constants,  ONLY : ryd2ev, zero, two, czero, eps6, eps8
   USE fft_base,      ONLY : dffts
@@ -76,7 +77,7 @@
   USE kfold,         ONLY : createkmap_pw2, createkmap
   USE low_lvl,       ONLY : set_ndnmbr, eqvect_strict, copy_sym_epw, fix_sym
   USE ph_restart,    ONLY : read_disp_pattern_only
-  USE io,            ONLY : read_ifc_epw, readgmap, dynmat_asr, loadumat, readdnsbare, rtsc_nowrite
+  USE io,            ONLY : read_ifc_epw, readgmap, dynmat_asr, loadumat, readdnsbare, rtsc_nowrite, rtsc_novme
   USE parallelism,   ONLY : poolgather
   USE symmetry,      ONLY : rotate_epmat, rotate_eigenm, star_q2, gmap_sym, &
                             setup_rotate_wavefunction, write_qmap,          &
@@ -300,8 +301,16 @@
   IF (epwread .AND. .NOT. epbread) THEN
     CONTINUE
   ELSE
+    ! rtsc epw4 (RTSC_EPW_NOVME=1): dmec is never read in this run; keep it allocated (zero) for build_wannier
+    IF (rtsc_novme() .AND. .NOT. lwfpt) THEN
+      ALLOCATE(dmec(3, nbndep, nbndep, nk_loc), STAT = ierr)
+      IF (ierr /= 0) CALL errore('ep_coarse_unfolding', 'Error allocating dmec', 1)
+      dmec = czero
+      WRITE(stdout, '(5x,a)') 'rtsc: RTSC_EPW_NOVME, dipole matrix elements not computed (not read in this run)'
+    ELSE
     CALL compute_pmn_para(include_nonlocal = .TRUE.)
     IF (lwfpt) CALL compute_pmn_para(include_nonlocal = .FALSE.)
+    ENDIF
     !
     ! Regenerate qpoint list
     !

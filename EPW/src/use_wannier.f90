@@ -67,6 +67,7 @@
                                s_bztoibz, spin_fac
   USE global_setups,    ONLY : use_wannier_setup, lsda_setup
   USE wannier2bloch,    ONLY : rtsc_ephwan2blochp_batch
+  USE io,               ONLY : rtsc_novme
 #if defined(__CUDA)
   USE epw_gpu_fine,     ONLY : ef_free
 #endif
@@ -1121,6 +1122,10 @@
           rtsc_nqb = 0
         ENDIF
         rtsc_fused = rtsc_fine_ok()
+        ! rtsc epw4: RTSC_EPW_NOVME left the velocity / dipole matrices at zero; only the fused path without any
+        ! velocity consumer may run on them
+        IF (rtsc_novme() .AND. (rtsc_need_vme .OR. .NOT. rtsc_fused)) &
+          CALL errore('use_wannier', 'RTSC_EPW_NOVME=1 needs the fused fine path and no velocity consumer', 1)
         rtsc_fset = .FALSE.
         rtsc_fq0 = iq_restart
         rtsc_fnqb = 0

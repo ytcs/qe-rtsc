@@ -1998,6 +1998,7 @@
                                 excluded_band, write_mmn, zerophase, ispinw
     USE ep_constants,    ONLY : czero, cone, twopi, zero
     USE io_var,          ONLY : iummn
+    USE io,              ONLY : rtsc_novme
 #if defined(__NAG)
     USE f90_unix_io,     ONLY : flush
 #endif
@@ -2483,6 +2484,8 @@
     ! RM - write mmn to file (file needed with vme = true)
     IF (meta_ionode) THEN
       write_mmn = .TRUE.
+      ! rtsc epw4 (RTSC_EPW_NOVME=1): the .mmn file is read only by vmebloch2wan, which that switch skips
+      IF (rtsc_novme()) write_mmn = .FALSE.
       IF (write_mmn) THEN
         !
         filmmn = TRIM(prefix)//'.mmn'
